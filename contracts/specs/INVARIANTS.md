@@ -102,3 +102,23 @@ together:
 - **Arithmetic is idealised.** TLA+ integers are unbounded; Rust's `i128` is
   not, and the specs do not model overflow. The implementation uses checked
   arithmetic on every multiply that could realistically overflow.
+
+## Storage growth and budget policy
+
+The model checks above cover logical state transitions; they do not measure
+Soroban ledger-entry bytes. The following high-growth keys are intentionally
+not assigned invented byte limits. Their cardinality and retention policy must
+be reviewed when their schema or write paths change:
+
+| Contract key family | Growth shape | Current policy |
+|---|---|---|
+| `AxToken::Balance(Address)` | One persistent entry per address that has held tokens; cardinality is open-ended. | Retain balances, including zero balances, because they are the canonical token ledger. Do not apply a TTL to balances. |
+| `StakingManager::Stake(tournament, address)` | One entry per active participant/tournament. | Remove principal entries on withdrawal or slashing. Keep the terminal marker for replay protection; any retention change must preserve that guarantee. |
+| `VirtualEconomy::MarketplaceOrder(id)` | One persistent entry per order ID. | Apply the configured order TTL and remove the active-order pointer when an order is closed. |
+| `VirtualEconomy::OraclePriceHistory(pair)` | One history per asset pair. | Keep this as a bounded ring buffer; do not replace it with an append-only series. |
+
+`contracts/specs/verify.sh` is a blocking CI check for the bounded state
+invariants. It is not a footprint benchmark: byte budgets must be measured
+against representative release-Wasm workloads before numerical limits are
+committed, then checked against those reviewed baselines. A model bound must
+not be presented as a storage-byte budget.

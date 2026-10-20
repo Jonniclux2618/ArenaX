@@ -1,6 +1,7 @@
 const { describe, it, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventParserService, UnknownEventError } = require('../dist/services/event-parser.service');
+const { escrowDepositV1 } = require('../dist/services/event-schemas/escrow');
 const { buildV0Topics, buildV1Topics, buildEventData } = require('./helpers/event-fixtures');
 const { scValToNative, nativeToScVal } = require('@stellar/stellar-sdk');
 
@@ -132,5 +133,35 @@ describe('EventParserService', () => {
         assert.equal(result.namespace, 'ArenaXSlash');
         assert.equal(result.version, 'v1');
         assert.equal(result.eventType, 'CASE_OPEN');
+    });
+
+    it('rejects accounting events missing required fields', () => {
+        parser.register(escrowDepositV1);
+
+        assert.throws(
+            () => parser.parseEvent(
+                buildV1Topics('ArenaXEscrow', 'DEPOSIT'),
+                buildEventData({ match_id: 'match-1', player: 'player-1', asset: 'asset-1' }),
+            ),
+            /missing required fields amount/,
+        );
+    });
+
+    it('preserves unknown optional fields on accounting events', () => {
+        parser.register(escrowDepositV1);
+
+        const result = parser.parseEvent(
+            buildV1Topics('ArenaXEscrow', 'DEPOSIT'),
+            buildEventData({
+                match_id: 'match-1',
+                player: 'player-1',
+                amount: 500,
+                asset: 'asset-1',
+                memo: 'optional-field',
+            }),
+        );
+
+        assert.equal(result.version, 'v1');
+        assert.equal(result.data.memo, 'optional-field');
     });
 });

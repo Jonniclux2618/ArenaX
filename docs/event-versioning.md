@@ -38,13 +38,30 @@ The namespace and version are combined in the first topic using `_v` as separato
 - **Removing/renaming a field** → bump version
 - **Reordering fields** → bump version (XDR is order-dependent)
 - **Adding a new event type** → same version (new event, not schema change)
+- **Adding an optional consumer field** → consumers must preserve it; do not
+   discard fields they do not recognize.
+
+## Accounting Event Requirements
+
+Events that affect balances or settlement must include a stable subject or
+operation identifier, the actor (or all counterparties), the amount in the
+contract's integer base units, the asset address, and the version in the topic.
+These are required fields: a consumer must reject a payload missing one instead
+of persisting a partial accounting event. Unknown optional fields are retained
+in the parsed payload.
+
+For example, `ArenaXEscrow_v1/DEPOSIT` is defined by
+`contracts/arenax-events/src/escrow.rs` and requires `match_id`, `player`,
+`amount`, and `asset`. The server parser regression test exercises this
+contract-shaped payload and verifies that optional fields survive parsing.
 
 ## How to Add a New Event
 
 1. Define the event struct in `contracts/arenax-events/src/{domain}.rs` with `#[contractevent(topics = ["Namespace_v1", "EVENT_TYPE"])]`
 2. Add an `emit_*` helper function
 3. Register v0 + v1 server-side parsers in `server/src/services/event-schemas/{domain}.ts`
-4. Add test coverage
+4. Add a consumer fixture based on the Rust event definition and exercise it
+   through the registered parser in CI.
 
 ## How to Evolve an Event Schema
 

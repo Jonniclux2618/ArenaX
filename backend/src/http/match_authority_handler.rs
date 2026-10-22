@@ -37,6 +37,7 @@ pub struct CreateMatchRequest {
 #[derive(Debug, Deserialize)]
 pub struct CompleteMatchRequest {
     pub winner: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,20 +104,28 @@ pub async fn complete_match(
     signer_secret: web::Data<SignerSecret>,
     path: web::Path<Uuid>,
     req: web::Json<CompleteMatchRequest>,
+    http_req: HttpRequest,
 ) -> Result<impl Responder, ApiError> {
     let match_id = path.into_inner();
+
+    let claims = http_req
+        .claims()
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    let actor = claims.sub.clone();
 
     info!(
         match_id = %match_id,
         winner = %req.winner,
+        actor = %actor,
         "Received complete match request"
     );
 
     let dto = CompleteMatchDTO {
         winner: req.winner.clone(),
+        reason: req.reason.clone(),
     };
 
-    let result = svc.complete_match(match_id, dto, &signer_secret).await?;
+    let result = svc.complete_match(match_id, dto, &actor, &signer_secret).await?;
 
     Ok(HttpResponse::Ok().json(result))
 }
@@ -185,7 +194,7 @@ pub async fn finalize_match(
         "Received finalize match request"
     );
 
-    let result = svc.finalize_match(match_id, &signer_secret).await?;
+    let result = svc.finalize_match(match_id, &caller_id, &signer_secret).await?;
 
     Ok(HttpResponse::Ok().json(result))
 }

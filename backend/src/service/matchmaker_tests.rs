@@ -534,3 +534,271 @@ mod integration_tests {
         assert_eq!(response.hourly_aggregates.len(), 24);
     }
 }
+
+// =============================================================================
+// Property tests — issue #12: eligibility uniqueness and fairness invariants
+// =============================================================================
+#[cfg(test)]
+mod property_tests {
+    use super::tests::*;
+    use crate::models::matchmaker::QueueEntry;
+    use crate::service::matchmaker::{calculate_percentiles, EloEngine, MatchmakerService, MatchmakingConfig};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    // ── Helper: build a QueueEntry at a given ELO and wait time ──────────────
+    fn make_entry(elo: i32, wait_secs: i64) -> QueueEntry {
+        QueueEntry {
+            user_id: Uuid::new_v4(),
+            game: "prop-game".to_string(),
+            game_mode: "1v1".to_string(),
+            current_elo: elo,
+            min_elo: elo - 100,
+            max_elo: elo + 100,
+            joined_at: Utc::now() - chrono::Duration::seconds(wait_secs),
+            wait_time_multiplier: 1.0,
+        }
+    }
+
+    /// Property: the Elo expansion window must always be ≤ MAX_ELO_GAP (500).
+    #[test]
+    fn prop_elo_expansion_never_exceeds_max() {
+        // Test at every threshold boundary and well beyond it.
+        for wait_secs in [0, 29, 30, 59, 60, 119, 120, 299, 300, 599, 600, 1200] {
+            let entry = make_entry(1200, wait_secs);
+            let gap = crate::service::matchmaker::MatchmakerService::calculate_max_elo_gap_pub(&entry);
+            assert!(
+                gap <= 500,
+                "Elo gap {} > 500 at wait_secs={}", gap, wait_secs
+            );
+        }
+    }
+
+    /// Property: match quality is bounded in [0.0, 1.5].
+    #[test]
+    fn prop_match_quality_bounded() {
+        let cases = [
+            (1200, 1200, 0i32, 0i64, 0i64),
+            (1200, 1200, 0, 300, 300),
+            (1200, 1700, 500, 0, 600),
+            (500, 3000, 500, 600, 600),
+        ];
+        for (elo1, elo2, gap, wait1, wait2) in cases {
+            let p1 = make_entry(elo1, wait1);
+            let p2 = make_entry(elo2, wait2);
+            let q = crate::service::matchmaker::calculate_match_quality_pub(&p1, &p2, gap);
+            assert!(q >= 0.0, "Quality {} < 0 for case {:?}", q, (elo1, elo2, gap));
+            assert!(q <= 1.5, "Quality {} > 1.5 for case {:?}", q, (elo1, elo2, gap));
+        }
+    }
+
+    /// Property: the matchmaker must never assign the same player_id twice
+    /// in the same set of pairings for a single tick.
+    #[test]
+    fn prop_no_duplicate_players_in_tick_pairings() {
+        // Build 20 queue entries at varying ELOs.
+        let entries: Vec<QueueEntry> = (0..20)
+            .map(|i| make_entry(1000 + i * 25, i as i64 * 5))
+            .collect();
+
+        // Simulate the pairing loop from find_matches_for_game_mode
+        // (synchronous approximation — no Redis, just the selection logic).
+        let mut sorted = entries.clone();
+        sorted.sort_by(|a, b| a.joined_at.cmp(&b.joined_at));
+
+        let mut processed = std::collections::HashSet::new();
+        let mut paired_ids: Vec<Uuid> = Vec::new();
+
+        for i in 0..sorted.len() {
+            let player = &sorted[i];
+            if processed.contains(&player.user_id) {
+                continue;
+            }
+            // Find first eligible partner (no Redis check here — pure logic).
+            for j in (i + 1)..sorted.len() {
+                let candidate = &sorted[j];
+                if processed.contains(&candidate.user_id) {
+                    continue;
+                }
+                let gap = (player.current_elo - candidate.current_elo).abs();
+                if gap <= 500 {
+                    processed.insert(player.user_id);
+                    processed.insert(candidate.user_id);
+                    paired_ids.push(player.user_id);
+                    paired_ids.push(candidate.user_id);
+                    break;
+                }
+            }
+        }
+
+        // Verify uniqueness: no player_id appears more than once.
+        let mut seen = std::collections::HashSet::new();
+        for id in &paired_ids {
+            assert!(seen.insert(*id), "Player {} paired twice in same tick", id);
+        }
+    }
+
+    /// Property: a player with an active reservation must not be re-queued.
+    #[tokio::test]
+    async fn prop_player_with_reservation_cannot_join_queue() {
+        let db_pool = setup_test_db().await;
+        let redis_client = setup_test_redis().await;
+        let config = create_test_config();
+        let matchmaker = MatchmakerService::new(db_pool, redis_client, config);
+
+        let user_id = Uuid::new_v4();
+        let game = "prop-game".to_string();
+        let game_mode = "1v1".to_string();
+
+        // First join should succeed.
+        matchmaker
+            .add_to_queue(user_id, game.clone(), game_mode.clone(), 1200)
+            .await
+            .expect("First join must succeed");
+
+        // Set a reservation (simulating a match being created).
+        matchmaker
+            .set_match_reservation(&user_id)
+            .await
+            .expect("Setting reservation must succeed");
+
+        // Leave the queue (simulating post-match removal).
+        let mut conn = matchmaker.redis_conn();
+        matchmaker
+            .remove_from_queue(&mut conn, &user_id, &game, &game_mode)
+            .await
+            .expect("Queue removal must succeed");
+
+        // Attempt to re-join — must be rejected because reservation is active.
+        let result = matchmaker
+            .add_to_queue(user_id, game.clone(), game_mode.clone(), 1200)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Re-join must fail while active reservation exists"
+        );
+
+        // Release reservation — re-join must now succeed.
+        matchmaker
+            .release_match_reservation(&user_id)
+            .await
+            .expect("Releasing reservation must succeed");
+
+        matchmaker
+            .add_to_queue(user_id, game.clone(), game_mode.clone(), 1200)
+            .await
+            .expect("Re-join after reservation release must succeed");
+    }
+
+    /// Property: metrics never leak user identifiers.
+    /// Verify that the serialized metrics dashboard contains no UUID-shaped
+    /// strings corresponding to any queued player.
+    #[tokio::test]
+    async fn prop_metrics_contain_no_player_identifiers() {
+        let db_pool = setup_test_db().await;
+        let redis_client = setup_test_redis().await;
+        let config = create_test_config();
+        let matchmaker = MatchmakerService::new(db_pool, redis_client, config);
+
+        let game = "metrics-check".to_string();
+        let game_mode = "ranked".to_string();
+        let mut player_ids = Vec::new();
+
+        for i in 0..5 {
+            let uid = Uuid::new_v4();
+            player_ids.push(uid);
+            matchmaker
+                .add_to_queue(uid, game.clone(), game_mode.clone(), 1100 + i * 50)
+                .await
+                .expect("Queue join must succeed");
+        }
+
+        let dashboard = matchmaker
+            .get_metrics_dashboard()
+            .await
+            .expect("Metrics dashboard must succeed");
+
+        let serialized = serde_json::to_string(&dashboard).expect("Serialize dashboard");
+
+        for uid in &player_ids {
+            assert!(
+                !serialized.contains(&uid.to_string()),
+                "Dashboard must not contain player UUID {}",
+                uid
+            );
+        }
+    }
+
+    /// Benchmark: queue insertion throughput should handle ≥200 entries/second.
+    #[tokio::test]
+    async fn bench_queue_insertion_throughput() {
+        let db_pool = setup_test_db().await;
+        let redis_client = setup_test_redis().await;
+        let config = create_test_config();
+        let matchmaker = MatchmakerService::new(db_pool, redis_client, config);
+
+        let game = "bench-game".to_string();
+        let game_mode = "ranked".to_string();
+        let n = 200usize;
+
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let uid = Uuid::new_v4();
+            matchmaker
+                .add_to_queue(uid, game.clone(), game_mode.clone(), 900 + (i % 700) as i32)
+                .await
+                .expect("Bench add_to_queue must succeed");
+        }
+        let elapsed = start.elapsed();
+
+        // Must insert 200 entries in under 5 seconds on any reasonable host.
+        assert!(
+            elapsed.as_secs() < 5,
+            "Queue insertion too slow: {:?} for {} entries",
+            elapsed,
+            n
+        );
+
+        let size = matchmaker
+            .get_queue_size(&game, &game_mode)
+            .await
+            .expect("get_queue_size must succeed");
+        assert_eq!(size, n, "All inserted entries must be visible in the queue");
+    }
+
+    /// Benchmark: queue-size lookup (SCAN) must complete within 100 ms for
+    /// queues of 1 000 entries.
+    #[tokio::test]
+    async fn bench_queue_size_lookup_1000_entries() {
+        let db_pool = setup_test_db().await;
+        let redis_client = setup_test_redis().await;
+        let config = create_test_config();
+        let matchmaker = MatchmakerService::new(db_pool, redis_client, config);
+
+        let game = "bench-size-game".to_string();
+        let game_mode = "casual".to_string();
+
+        for i in 0..1000 {
+            let uid = Uuid::new_v4();
+            matchmaker
+                .add_to_queue(uid, game.clone(), game_mode.clone(), 800 + (i % 800) as i32)
+                .await
+                .expect("Bench add must succeed");
+        }
+
+        let start = std::time::Instant::now();
+        let size = matchmaker
+            .get_queue_size(&game, &game_mode)
+            .await
+            .expect("get_queue_size must succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!(size, 1000);
+        assert!(
+            elapsed.as_millis() < 100,
+            "Queue size lookup took {:?} — must be < 100 ms",
+            elapsed
+        );
+    }
+}

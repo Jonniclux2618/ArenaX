@@ -151,6 +151,9 @@ pub struct CreateMatchDTO {
 pub struct CompleteMatchDTO {
     #[validate(length(min = 56, max = 56))]
     pub winner: String,
+    /// Optional human-readable reason recorded in the transition audit log.
+    /// Examples: `"player_submitted_score"`, `"admin_override"`.
+    pub reason: Option<String>,
 }
 
 /// Match Response DTO

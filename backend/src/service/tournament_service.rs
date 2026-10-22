@@ -88,6 +88,7 @@ impl JobQueue {
     }
 
     pub async fn claim_next_job(&self) -> Result<Option<JobRecord>, ApiError> {
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
         let job: Option<JobRecord> = sqlx::query_as(
             r#"
             SELECT id, job_type, payload, status, attempts, max_attempts, next_run_at, result, error, created_at, updated_at, started_at, completed_at
@@ -100,11 +101,11 @@ impl JobQueue {
             FOR UPDATE SKIP LOCKED
             "#,
         )
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
-        if let Some(job) = job.clone() {
+        let claimed = if let Some(mut job) = job {
             sqlx::query!(
                 r#"
                 UPDATE jobs
@@ -113,12 +114,21 @@ impl JobQueue {
                 "#,
                 job.id
             )
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
-        }
+            job.status = "running".to_string();
+            job.attempts += 1;
+            job.started_at = Some(Utc::now());
+            job.updated_at = Utc::now();
+            Some(job)
+        } else {
+            None
+        };
 
-        Ok(job)
+        tx.commit().await.map_err(ApiError::database_error)?;
+
+        Ok(claimed)
     }
 
     pub async fn mark_done(
@@ -696,10 +706,25 @@ impl TournamentService {
             return self.cancel_tournament(tournament_id).await;
         }
 
-        let current_tournament = self.get_tournament_by_id(tournament_id).await?;
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
+        let current_tournament = sqlx::query_as!(
+            Tournament,
+            "SELECT * FROM tournaments WHERE id = $1 FOR UPDATE",
+            tournament_id
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or(ApiError::not_found("Tournament not found".to_string()))?;
         let old_status = current_tournament.status;
 
         if old_status == new_status {
+            tx.commit().await.map_err(ApiError::database_error)?;
+            match new_status {
+                TournamentStatus::InProgress => self.start_tournament(tournament_id).await?,
+                TournamentStatus::Completed => self.complete_tournament(tournament_id).await?,
+                _ => {}
+            }
             return Ok(current_tournament);
         }
 
@@ -722,8 +747,6 @@ impl TournamentService {
                 old_status, new_status
             )));
         }
-
-        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
 
         let tournament = sqlx::query_as!(
             Tournament,
@@ -1294,83 +1317,11 @@ impl TournamentService {
     async fn generate_single_elimination_bracket(
         &self,
         tournament_id: Uuid,
-        participants: Vec<TournamentParticipant>,
+        _participants: Vec<TournamentParticipant>,
     ) -> Result<(), ApiError> {
-        let participant_count = participants.len();
-        if participant_count < 2 {
-            return Err(ApiError::bad_request("Not enough participants for bracket"));
-        }
-
-        // Calculate number of rounds needed
-        let rounds = (participant_count as f64).log2().ceil() as i32;
-
-        // Create rounds
-        for round_num in 1..=rounds {
-            let round = sqlx::query_as!(
-                TournamentRound,
-                r#"
-                INSERT INTO tournament_rounds (
-                    id, tournament_id, round_number, round_type, status, created_at
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6
-                ) RETURNING *
-                "#,
-                Uuid::new_v4(),
-                tournament_id,
-                round_num,
-                if round_num == rounds {
-                    RoundType::Final
-                } else {
-                    RoundType::Elimination
-                } as _,
-                RoundStatus::Pending as _,
-                Utc::now()
-            )
-            .fetch_one(&self.db_pool)
+        crate::orchestrator::SeedingEngine::new(self.db_pool.clone())
+            .seed_and_generate_bracket(tournament_id)
             .await
-            .map_err(|e| ApiError::database_error(e))?;
-
-            // Create matches for this round
-            let matches_in_round = if round_num == 1 {
-                participant_count / 2
-            } else {
-                (participant_count as u32 / 2_u32.pow(round_num as u32)) as usize
-            };
-
-            for match_num in 1..=matches_in_round {
-                let player1_idx = (match_num - 1) * 2;
-                let player2_idx = player1_idx + 1;
-
-                sqlx::query!(
-                    r#"
-                    INSERT INTO tournament_matches (
-                        id, tournament_id, round_id, match_number, player1_id, player2_id,
-                        status, created_at, updated_at
-                    ) VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9
-                    )
-                    "#,
-                    Uuid::new_v4(),
-                    tournament_id,
-                    round.id,
-                    match_num as i32,
-                    participants[player1_idx].user_id,
-                    if player2_idx < participants.len() {
-                        Some(participants[player2_idx].user_id)
-                    } else {
-                        None
-                    },
-                    MatchStatus::Pending as _,
-                    Utc::now(),
-                    Utc::now()
-                )
-                .execute(&self.db_pool)
-                .await
-                .map_err(|e| ApiError::database_error(e))?;
-            }
-        }
-
-        Ok(())
     }
 
     // Additional helper methods would be implemented here...
@@ -1700,7 +1651,21 @@ impl TournamentService {
     /// Sets status to `Cancelled`, then issues a wallet refund for every
     /// participant who paid an entry fee.
     pub async fn cancel_tournament(&self, tournament_id: Uuid) -> Result<Tournament, ApiError> {
-        let tournament = self.get_tournament_by_id(tournament_id).await?;
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
+        let tournament = sqlx::query_as!(
+            Tournament,
+            "SELECT * FROM tournaments WHERE id = $1 FOR UPDATE",
+            tournament_id
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or(ApiError::not_found("Tournament not found".to_string()))?;
+
+        if tournament.status == TournamentStatus::Cancelled {
+            tx.commit().await.map_err(ApiError::database_error)?;
+            return Ok(tournament);
+        }
 
         // Only non-terminal statuses can be cancelled (before InProgress)
         if matches!(
@@ -1718,7 +1683,7 @@ impl TournamentService {
             "SELECT * FROM tournament_participants WHERE tournament_id = $1 AND entry_fee_paid = true",
             tournament_id,
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| ApiError::database_error(e))?;
 
@@ -1731,7 +1696,7 @@ impl TournamentService {
                         tournament.entry_fee,
                         participant.user_id,
                     )
-                    .execute(&self.db_pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| ApiError::database_error(e))?;
                 }
@@ -1742,20 +1707,34 @@ impl TournamentService {
                         tournament.entry_fee,
                         participant.user_id,
                     )
-                    .execute(&self.db_pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| ApiError::database_error(e))?;
                 }
             }
 
-            self.create_transaction(
+            let reference = format!("tournament-refund-{tournament_id}-{}", participant.user_id);
+            sqlx::query!(
+                r#"
+                INSERT INTO transactions (
+                    id, user_id, transaction_type, amount, currency, status,
+                    reference, description, created_at, updated_at, completed_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9)
+                ON CONFLICT (reference) DO NOTHING
+                "#,
+                Uuid::new_v4(),
                 participant.user_id,
-                TransactionType::Refund,
-                tournament.entry_fee,
-                tournament.entry_fee_currency.clone(),
+                TransactionType::Refund as _,
+                rust_decimal::Decimal::from(tournament.entry_fee),
+                tournament.entry_fee_currency,
+                TransactionStatus::Completed as _,
+                reference,
                 format!("Refund for cancelled tournament: {}", tournament.name),
+                Utc::now(),
             )
-            .await?;
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
         }
 
         // Update tournament status
@@ -1766,7 +1745,7 @@ impl TournamentService {
             Utc::now(),
             tournament_id,
         )
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::database_error(e))?;
 
@@ -1785,9 +1764,11 @@ impl TournamentService {
             tournament_id,
             details as _
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::database_error(e))?;
+
+        tx.commit().await.map_err(ApiError::database_error)?;
 
         tracing::info!(
             tournament_id = %tournament_id,

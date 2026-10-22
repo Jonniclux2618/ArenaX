@@ -73,6 +73,9 @@ pub struct MatchDispute {
     /// S3 object key the evidence file was stored under, namespaced
     /// `{user_id}/{match_id}/{hash}.{ext}`.
     pub evidence_s3_key: Option<String>,
+    pub evidence_legal_hold: bool,
+    pub evidence_retention_until: Option<DateTime<Utc>>,
+    pub evidence_deleted_at: Option<DateTime<Utc>>,
     pub status: DisputeStatus,
     pub admin_reviewer_id: Option<Uuid>,
     pub admin_notes: Option<String>,

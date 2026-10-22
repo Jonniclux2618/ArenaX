@@ -272,10 +272,31 @@ async fn main() -> io::Result<()> {
 
     // Tamper-evident dispute evidence storage (#1081, #1076).
     let evidence_store: Arc<dyn EvidenceStore> = Arc::new(S3EvidenceStore::new(&config.storage));
+    {
+        let evidence_db = db_pool.clone();
+        let retention_store = evidence_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = crate::service::evidence_storage::sweep_expired_evidence(
+                    &evidence_db,
+                    retention_store.as_ref(),
+                )
+                .await
+                {
+                    tracing::error!(%error, "Dispute evidence retention sweep failed");
+                }
+            }
+        });
+    }
 
     let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::PayloadConfig::new(
+                crate::service::evidence_storage::MAX_EVIDENCE_BYTES,
+            ))
             .app_data(web::Data::new(redis_conn.clone()))
             .app_data(web::Data::new(Arc::new(redis_client.clone())))
             .app_data(web::Data::new(auth_service.clone()))
@@ -287,6 +308,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(address_book.clone()))
             .app_data(web::Data::new(jwt_service.clone()))
             .app_data(web::Data::new(auth_guard.clone()))
+            .app_data(web::Data::new(evidence_store.clone()))
             .app_data(web::Data::new(std::sync::Arc::new(redis_conn.clone())))
             .app_data(web::Data::new(matchmaker_service.clone()))
             .app_data(web::Data::new(elo_engine.clone()))
@@ -424,6 +446,8 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::tournament_handler::configure_routes)
                     // Match authority endpoints — on-chain match FSM
                     .configure(crate::http::match_authority_handler::configure_routes)
+                    // Private dispute evidence upload and retrieval.
+                    .configure(crate::http::dispute_evidence_handler::configure_routes)
                     // Dispute resolution endpoints — ticketed, escalatable disputes (Issue #909)
                     .configure(crate::http::dispute_handler::configure_routes)
                     // Gas endpoints

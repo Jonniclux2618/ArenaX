@@ -296,6 +296,11 @@ impl MatchService {
         .map_err(|e| ApiError::database_error(e))?;
 
         if let Some(dispute) = existing {
+            if dispute.status == DisputeStatus::Resolved {
+                return Err(ApiError::conflict(
+                    "cannot add evidence to a resolved dispute",
+                ));
+            }
             let updated = sqlx::query_as!(
                 MatchDispute,
                 r#"
@@ -1994,7 +1999,8 @@ impl MatchService {
             MatchDispute,
             r#"
             UPDATE match_disputes
-            SET status = $1, admin_reviewer_id = $2, resolution = $3, resolved_at = $4
+            SET status = $1, admin_reviewer_id = $2, resolution = $3, resolved_at = $4,
+                evidence_retention_until = $4 + INTERVAL '90 days'
             WHERE id = $5
             RETURNING *
             "#,

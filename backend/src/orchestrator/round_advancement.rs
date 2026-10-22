@@ -22,6 +22,8 @@ impl RoundAdvancementWorker {
         tournament_id: Uuid,
         round_id: Uuid,
     ) -> Result<(), ApiError> {
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
+
         // Step 1: Count pending matches in the round (status NOT IN completed, cancelled).
         let pending_row = sqlx::query(
             r#"
@@ -32,7 +34,7 @@ impl RoundAdvancementWorker {
             "#,
         )
         .bind(round_id)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -46,10 +48,10 @@ impl RoundAdvancementWorker {
 
         // Step 2: Fetch the current round to get the round_number.
         let round_row = sqlx::query(
-            "SELECT round_number FROM tournament_rounds WHERE id = $1",
+            "SELECT round_number FROM tournament_rounds WHERE id = $1 FOR UPDATE",
         )
         .bind(round_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::database_error)?
         .ok_or_else(|| ApiError::not_found("Round not found"))?;
@@ -69,7 +71,7 @@ impl RoundAdvancementWorker {
         )
         .bind(tournament_id)
         .bind(current_round_number)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -87,7 +89,7 @@ impl RoundAdvancementWorker {
         )
         .bind(round_id)
         .bind(Utc::now())
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -102,7 +104,7 @@ impl RoundAdvancementWorker {
             "#,
         )
         .bind(round_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -147,9 +149,11 @@ impl RoundAdvancementWorker {
             )
             .bind(tournament_id)
             .bind(Utc::now())
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
+
+            tx.commit().await.map_err(ApiError::database_error)?;
 
             // Trigger payout finalization
             let payout = crate::orchestrator::PayoutSettler::new(self.db_pool.clone());
@@ -176,7 +180,7 @@ impl RoundAdvancementWorker {
         // Create the next round.
         let new_round_row = sqlx::query(
             r#"
-            INSERT INTO tournament_rounds (
+        .fetch_one(&mut *tx)
                 id, tournament_id, round_number, round_type, status, created_at, updated_at
             ) VALUES ($1, $2, $3, $4, 'in_progress', $5, $5)
             RETURNING id
@@ -228,7 +232,7 @@ impl RoundAdvancementWorker {
             .bind(next_match_number)
             .bind(bye_player)
             .bind(now)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
 
@@ -254,13 +258,14 @@ impl RoundAdvancementWorker {
             .bind(player1)
             .bind(player2)
             .bind(now)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
 
             next_match_number += 1;
         }
 
+        tx.commit().await.map_err(ApiError::database_error)?;
         Ok(())
     }
 

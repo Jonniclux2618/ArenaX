@@ -8,8 +8,10 @@
 
 use crate::api_error::ApiError;
 use crate::config::StorageConfig;
+use crate::db::DbPool;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use uuid::Uuid;
 
 /// Actix `PayloadConfig` limit for evidence uploads (#1076).
@@ -103,6 +105,63 @@ pub fn evidence_object_key(user_id: Uuid, match_id: Uuid, content_type: &str, ha
 #[async_trait::async_trait]
 pub trait EvidenceStore: Send + Sync {
     async fn put(&self, key: &str, content_type: &str, bytes: &[u8]) -> Result<(), ApiError>;
+    async fn get(&self, key: &str) -> Result<Vec<u8>, ApiError>;
+    async fn delete(&self, key: &str) -> Result<(), ApiError>;
+}
+
+/// Delete expired private objects while retaining their hashes and audit trail.
+/// The dispute row stays locked during the object deletion so a concurrent
+/// legal hold cannot race past the retention check.
+pub async fn sweep_expired_evidence(
+    db_pool: &DbPool,
+    store: &dyn EvidenceStore,
+) -> Result<u64, ApiError> {
+    let mut deleted = 0;
+    loop {
+        let mut tx = db_pool.begin().await.map_err(ApiError::database_error)?;
+        let evidence = sqlx::query(
+            r#"
+            SELECT id, evidence_s3_key
+            FROM match_disputes
+            WHERE evidence_s3_key IS NOT NULL
+              AND evidence_retention_until <= NOW()
+              AND evidence_legal_hold = FALSE
+              AND evidence_deleted_at IS NULL
+            ORDER BY evidence_retention_until
+            LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+
+        let Some(evidence) = evidence else {
+            tx.rollback().await.map_err(ApiError::database_error)?;
+            break;
+        };
+        let id: Uuid = evidence.try_get("id").map_err(ApiError::database_error)?;
+        let key: String = evidence
+            .try_get("evidence_s3_key")
+            .map_err(ApiError::database_error)?;
+
+        store.delete(&key).await?;
+        sqlx::query(
+            r#"
+            UPDATE match_disputes
+            SET evidence_s3_key = NULL, evidence_deleted_at = NOW()
+            WHERE id = $1 AND evidence_s3_key = $2 AND evidence_legal_hold = FALSE
+            "#,
+        )
+        .bind(id)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        tx.commit().await.map_err(ApiError::database_error)?;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 /// Real S3/MinIO-compatible store: a single-shot `PUT` signed with AWS
@@ -131,11 +190,14 @@ impl S3EvidenceStore {
             http: reqwest::Client::new(),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl EvidenceStore for S3EvidenceStore {
-    async fn put(&self, key: &str, content_type: &str, bytes: &[u8]) -> Result<(), ApiError> {
+    async fn request_object(
+        &self,
+        method: &str,
+        key: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, ApiError> {
         let url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
         let host = url
             .split("//")
@@ -143,18 +205,27 @@ impl EvidenceStore for S3EvidenceStore {
             .and_then(|rest| rest.split('/').next())
             .unwrap_or_default()
             .to_string();
-
         let now = Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let payload_hash = hex::encode(Sha256::digest(bytes));
-
-        let canonical_headers = format!(
-            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-        );
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let (canonical_headers, signed_headers) = if method == "PUT" {
+            (
+                format!(
+                    "host:{host}\nx-amz-acl:private\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+                ),
+                "host;x-amz-acl;x-amz-content-sha256;x-amz-date",
+            )
+        } else {
+            (
+                format!(
+                    "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+                ),
+                "host;x-amz-content-sha256;x-amz-date",
+            )
+        };
         let canonical_request = format!(
-            "PUT\n/{}/{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            "{method}\n/{}/{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
             self.bucket, key
         );
         let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
@@ -164,31 +235,67 @@ impl EvidenceStore for S3EvidenceStore {
         );
         let signing_key = derive_signing_key(&self.secret_key, &date_stamp, &self.region, "s3");
         let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
             self.access_key
         );
 
-        let response = self
+        let mut request = self
             .http
-            .put(&url)
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
+                    ApiError::internal_error(format!("Invalid evidence storage method: {e}"))
+                })?,
+                &url,
+            )
             .header("host", host)
             .header("x-amz-content-sha256", payload_hash)
             .header("x-amz-date", amz_date)
-            .header("Authorization", authorization)
-            .header("Content-Type", content_type)
-            .body(bytes.to_vec())
-            .send()
-            .await
-            .map_err(|e| ApiError::ServiceUnavailable(format!("Evidence storage upload failed: {e}")))?;
+            .header("Authorization", authorization);
+        if method == "PUT" {
+            request = request.header("x-amz-acl", "private");
+        }
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
+        if !bytes.is_empty() {
+            request = request.body(bytes.to_vec());
+        }
 
-        if !response.status().is_success() {
+        let response = request.send().await.map_err(|e| {
+            ApiError::ServiceUnavailable(format!("Evidence storage request failed: {e}"))
+        })?;
+        if !response.status().is_success()
+            && !(method == "DELETE" && response.status() == reqwest::StatusCode::NOT_FOUND)
+        {
             return Err(ApiError::ServiceUnavailable(format!(
-                "Evidence storage rejected upload with status {}",
+                "Evidence storage rejected request with status {}",
                 response.status()
             )));
         }
+        response
+            .bytes()
+            .await
+            .map(|body| body.to_vec())
+            .map_err(|e| {
+                ApiError::ServiceUnavailable(format!("Evidence storage response failed: {e}"))
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl EvidenceStore for S3EvidenceStore {
+    async fn put(&self, key: &str, content_type: &str, bytes: &[u8]) -> Result<(), ApiError> {
+        self.request_object("PUT", key, Some(content_type), bytes).await?;
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, ApiError> {
+        self.request_object("GET", key, None, &[]).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ApiError> {
+        self.request_object("DELETE", key, None, &[]).await?;
         Ok(())
     }
 }
@@ -294,6 +401,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(key.to_string(), bytes.to_vec());
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, ApiError> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("Evidence not found"))
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ApiError> {
+            self.objects.lock().unwrap().remove(key);
             Ok(())
         }
     }

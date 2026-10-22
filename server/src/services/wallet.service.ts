@@ -1,5 +1,6 @@
 import { Decimal } from '@prisma/client/runtime/library';
 import { $Enums, Currency } from '@prisma/client';
+import { createHash } from 'crypto';
 const TransactionType = $Enums.TransactionType;
 import { getDatabaseClient } from './database.service';
 import { HttpError } from '../utils/http-error';
@@ -13,6 +14,10 @@ function balanceKey(currency: Currency): LedgerBalanceKey {
 
 function escrowKey(currency: Currency): LedgerEscrowKey {
     return `${currency.toLowerCase()}Escrowed` as LedgerEscrowKey;
+}
+
+function hashWalletRequest(payload: Record<string, string | null>): string {
+    return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
 export class WalletService {
@@ -66,8 +71,16 @@ export class WalletService {
         matchId: string,
         idempotencyKey: string,
     ) {
-        return this.db.$transaction(async (tx) => {
-            const existing = await (tx as any).walletTransaction.findUnique({ where: { idempotencyKey } });
+        const requestHash = hashWalletRequest({
+            type: TransactionType.ESCROW_LOCK,
+            userId,
+            currency,
+            amount: amount.toString(),
+            matchId,
+            note: null,
+        });
+        return this._runIdempotentTransaction(idempotencyKey, requestHash, async (tx) => {
+            const existing = await this._findReplay(tx, idempotencyKey, requestHash);
             if (existing) return existing;
 
             const ledger = await this._getOrCreateLedgerTx(tx, userId);
@@ -92,6 +105,7 @@ export class WalletService {
                 data: {
                     userId,
                     idempotencyKey,
+                    requestHash,
                     type: TransactionType.ESCROW_LOCK,
                     currency,
                     amount,
@@ -115,8 +129,16 @@ export class WalletService {
         matchId: string,
         idempotencyKey: string,
     ) {
-        return this.db.$transaction(async (tx) => {
-            const existing = await (tx as any).walletTransaction.findUnique({ where: { idempotencyKey } });
+        const requestHash = hashWalletRequest({
+            type: TransactionType.ESCROW_RELEASE,
+            userId,
+            currency,
+            amount: amount.toString(),
+            matchId,
+            note: null,
+        });
+        return this._runIdempotentTransaction(idempotencyKey, requestHash, async (tx) => {
+            const existing = await this._findReplay(tx, idempotencyKey, requestHash);
             if (existing) return existing;
 
             const ledger = await this._getOrCreateLedgerTx(tx, userId);
@@ -141,6 +163,7 @@ export class WalletService {
                 data: {
                     userId,
                     idempotencyKey,
+                    requestHash,
                     type: TransactionType.ESCROW_RELEASE,
                     currency,
                     amount,
@@ -165,8 +188,16 @@ export class WalletService {
         idempotencyKey: string,
         note?: string,
     ) {
-        return this.db.$transaction(async (tx) => {
-            const existing = await (tx as any).walletTransaction.findUnique({ where: { idempotencyKey } });
+        const requestHash = hashWalletRequest({
+            type: TransactionType.ESCROW_SLASH,
+            userId,
+            currency,
+            amount: amount.toString(),
+            matchId,
+            note: note ?? null,
+        });
+        return this._runIdempotentTransaction(idempotencyKey, requestHash, async (tx) => {
+            const existing = await this._findReplay(tx, idempotencyKey, requestHash);
             if (existing) return existing;
 
             const ledger = await this._getOrCreateLedgerTx(tx, userId);
@@ -190,6 +221,7 @@ export class WalletService {
                 data: {
                     userId,
                     idempotencyKey,
+                    requestHash,
                     type: TransactionType.ESCROW_SLASH,
                     currency,
                     amount,
@@ -218,19 +250,35 @@ export class WalletService {
         note?: string;
     }) {
         const { fromUserId, toUserId, currency, amount, type, idempotencyKey, note } = params;
+        const requestHash = hashWalletRequest({
+            type,
+            fromUserId,
+            toUserId,
+            currency,
+            amount: amount.toString(),
+            note: note ?? null,
+        });
 
-        return this.db.$transaction(async (tx) => {
+        return this._runIdempotentTransaction(
+            `${idempotencyKey}:debit`,
+            requestHash,
+            async (tx) => {
             // Idempotency: check if debit side already recorded
-            const existing = await (tx as any).walletTransaction.findUnique({
-                where: { idempotencyKey: `${idempotencyKey}:debit` },
-            });
-            if (existing) return existing;
+            const existing = await this._findReplay(tx, `${idempotencyKey}:debit`, requestHash);
+            if (existing) {
+                return (await tx.walletTransaction.findUnique({
+                    where: { idempotencyKey: `${idempotencyKey}:credit` },
+                })) ?? existing;
+            }
 
             const bKey = balanceKey(currency);
             const eKey = escrowKey(currency);
 
-            const fromLedger = await this._getOrCreateLedgerTx(tx, fromUserId);
-            const toLedger   = await this._getOrCreateLedgerTx(tx, toUserId);
+            const [firstUserId, secondUserId] = [fromUserId, toUserId].sort();
+            const firstLedger = await this._getOrCreateLedgerTx(tx, firstUserId);
+            const secondLedger = await this._getOrCreateLedgerTx(tx, secondUserId);
+            const fromLedger = fromUserId === firstUserId ? firstLedger : secondLedger;
+            const toLedger = toUserId === firstUserId ? firstLedger : secondLedger;
 
             const fromAvailable: Decimal = fromLedger[bKey];
             if (fromAvailable.lessThan(amount)) {
@@ -254,6 +302,7 @@ export class WalletService {
                 data: {
                     userId: fromUserId,
                     idempotencyKey: `${idempotencyKey}:debit`,
+                    requestHash,
                     type,
                     currency,
                     amount,
@@ -269,6 +318,7 @@ export class WalletService {
                 data: {
                     userId: toUserId,
                     idempotencyKey: `${idempotencyKey}:credit`,
+                    requestHash,
                     type: TransactionType.CREDIT,
                     currency,
                     amount,
@@ -279,7 +329,9 @@ export class WalletService {
                     note,
                 },
             });
-        });
+            },
+            `${idempotencyKey}:credit`,
+        );
     }
 
     /** Get full transaction history for a user. */
@@ -293,9 +345,13 @@ export class WalletService {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     private async _getOrCreateLedgerTx(tx: any, userId: string) {
-        const existing = await tx.ledger.findUnique({ where: { userId } });
-        if (existing) return existing;
-        return tx.ledger.create({ data: { userId } });
+        await tx.ledger.upsert({
+            where: { userId },
+            update: {},
+            create: { userId },
+        });
+        await tx.$queryRaw`SELECT "id" FROM "Ledger" WHERE "userId" = ${userId} FOR UPDATE`;
+        return tx.ledger.findUnique({ where: { userId } });
     }
 
     private async _applyTransaction(
@@ -306,8 +362,15 @@ export class WalletService {
         type: $Enums.TransactionType,
         note?: string,
     ) {
-        return this.db.$transaction(async (tx) => {
-            const existing = await (tx as any).walletTransaction.findUnique({ where: { idempotencyKey } });
+        const requestHash = hashWalletRequest({
+            type,
+            userId,
+            currency: currency,
+            amount: amount.toString(),
+            note: note ?? null,
+        });
+        return this._runIdempotentTransaction(idempotencyKey, requestHash, async (tx) => {
+            const existing = await this._findReplay(tx, idempotencyKey, requestHash);
             if (existing) return existing;
 
             const ledger = await this._getOrCreateLedgerTx(tx, userId);
@@ -333,6 +396,7 @@ export class WalletService {
                 data: {
                     userId,
                     idempotencyKey,
+                    requestHash,
                     type,
                     currency,
                     amount,
@@ -344,6 +408,40 @@ export class WalletService {
                 },
             });
         });
+    }
+
+    private async _findReplay(tx: any, idempotencyKey: string, requestHash: string) {
+        const existing = await tx.walletTransaction.findUnique({ where: { idempotencyKey } });
+        if (existing && existing.requestHash !== requestHash) {
+            throw new HttpError(409, 'Idempotency key was already used with a different wallet request');
+        }
+        return existing;
+    }
+
+    private async _runIdempotentTransaction<T>(
+        idempotencyKey: string,
+        requestHash: string,
+        operation: (tx: any) => Promise<T>,
+        replayKey = idempotencyKey,
+    ): Promise<T> {
+        try {
+            return await this.db.$transaction(operation);
+        } catch (error) {
+            const isUniqueConflict = typeof error === 'object'
+                && error !== null
+                && 'code' in error
+                && error.code === 'P2002';
+            if (!isUniqueConflict) throw error;
+
+            const existing = await (this.db as any).walletTransaction.findUnique({
+                where: { idempotencyKey: replayKey },
+            });
+            if (!existing) throw error;
+            if (existing.requestHash !== requestHash) {
+                throw new HttpError(409, 'Idempotency key was already used with a different wallet request');
+            }
+            return existing as T;
+        }
     }
 }
 

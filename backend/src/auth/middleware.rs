@@ -25,6 +25,8 @@ fn is_public_route(req: &ServiceRequest) -> bool {
             | (&Method::POST, "/api/auth/register")
             | (&Method::POST, "/api/auth/login")
             | (&Method::POST, "/api/auth/refresh")
+            | (&Method::POST, "/api/auth/otp/send")
+            | (&Method::POST, "/api/auth/otp/verify")
             | (&Method::GET, "/api/tournaments")
             | (&Method::GET, "/metrics")
     ) {

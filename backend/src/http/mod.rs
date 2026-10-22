@@ -19,6 +19,7 @@ pub mod cache_handler;
 pub mod email_handler;
 pub mod notification_handler;
 pub mod openapi_spec;
+pub mod otp_handler;
 pub mod suspension_handler;
 pub mod player_stats_handler;
 pub mod push_notification_handler;

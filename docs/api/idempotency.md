@@ -43,6 +43,7 @@ X-Idempotency-Cached: true
 - TTL: **24 hours** (configurable)
 - Max cached response size: **1 MB**
 - Keys are scoped to the authenticated user — the same UUID used by two different users is treated as two separate keys.
+- Wallet ledger idempotency keys and request hashes are stored on immutable wallet transactions and retained for the lifetime of those ledger records; the 24-hour middleware cache does not expire them.
 
 ## Conflict Types
 

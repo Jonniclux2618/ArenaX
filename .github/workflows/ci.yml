@@ -55,6 +55,17 @@ jobs:
     - name: Run tests
       run: npm test -- --ci --forceExit --passWithNoTests
 
+    - name: Enforce Performance Budgets (#48)
+      run: npm run check:perf-budgets
+
+    - name: Upload Playwright report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: playwright-report
+        path: frontend/playwright-report/
+        retention-days: 7
+
   # Smart Contracts CI — Reproducible & blocking builds (#51)
   contracts:
     name: Contracts (Soroban)
@@ -92,7 +103,10 @@ jobs:
       - name: Run workspace tests
         run: cargo test --locked --workspace
 
-      - name: Build Wasm contracts and generate release metadata
+      - name: Verify contract invariants
+        run: ./specs/verify.sh
+
+      - name: Build optimized Wasm contracts and generate release metadata
         env:
           SOURCE_REVISION: ${{ github.sha }}
         run: |
@@ -142,12 +156,8 @@ jobs:
           retention-days: 7
 
   server:
-    name: Server
+    name: Server (TypeScript)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    continue-on-error: true
     defaults:
       run:
         working-directory: ./server
@@ -159,7 +169,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version-file: .nvmrc
+        node-version: '20'
         cache: 'npm'
         cache-dependency-path: server/package-lock.json
 
@@ -175,15 +185,8 @@ jobs:
     - name: Type check (Lint)
       run: npm run lint
     
-    - name: Build
-      run: npm run build
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+    - name: Build and run tests
+      run: npm test
   # Backend database migration CI
   backend-migrations:
     name: Backend Migrations
@@ -453,17 +456,6 @@ jobs:
 
     - name: Run microbenchmarks
       run: cargo bench --locked -- --save-baseline current
-
-      - name: Enforce Performance Budgets (#48)
-        run: npm run check:perf-budgets
-
-      - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-report
-          path: frontend/playwright-report/
-          retention-days: 7
 
   # Transactional rollout/rollback gate (#96)
   deploy-gates:

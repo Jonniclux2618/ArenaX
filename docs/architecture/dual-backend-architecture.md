@@ -30,6 +30,29 @@ the resource it needs (see `frontend/src/lib/api.ts`).
 server. If a route family already exists on one side (see the table below), it
 belongs there; do not create a parallel family on the other side.
 
+## Caller and data authority
+
+The browser API client defaults to the relative `/api` base URL. There is no
+in-process router between these servers: deployment ingress or the configured
+API origin determines which server receives a request. Therefore identical
+paths on the two servers are not interchangeable and must not be combined into
+one undocumented route family.
+
+| Shared path family | Canonical owner | Caller and authoritative data | Other implementation / decision |
+|---|---|---|---|
+| `/api/auth` | Rust for credentials, JWT sessions, and account security; TypeScript for OAuth/SSO sessions. | Frontend auth flows must select the matching API origin and session type; each service owns its own auth records. | Separate capabilities, not a shared contract. Do not add aliases or silently proxy between them. |
+| `/api/wallet` | Rust for ledger balances, deposits, withdrawals, and transactions. | Game and finance clients; Rust/PostgreSQL ledger is authoritative. | TypeScript wallet routes are connector/session operations only. They must not write ledger balances. |
+| `/api/matches` | Rust for match state transitions and settlement. | Game clients; Rust match authority and contract state are authoritative. | TypeScript match routes are read/projection surfaces; migrate any write path to Rust before removal. |
+| `/api/tournaments` | Rust for registration, lifecycle, and prize settlement. | Game clients; Rust tournament records and Soroban settlement are authoritative. | TypeScript product routes must remain projections/integrations, not a second lifecycle writer. |
+| `/api/webhooks/{paystack,flutterwave}` | TypeScript, as the integrations/payment-webhook owner. | Payment providers call the TypeScript origin; its webhook verification and payment records are authoritative. | Rust currently also registers webhook routes. Keep them until signature, idempotency, and reconciliation parity is verified, then migrate traffic and retire the Rust routes. |
+| `/api/analytics` | Rust for operational/game analytics; TypeScript for product analytics. | Internal/game clients use Rust; product dashboards use TypeScript. Each owns its separate metric store and must name it in the API contract. | Split by data product, not by adding duplicate write endpoints. |
+
+Migration sequence for duplicated behavior: inventory callers and environment
+origins; establish parity and data reconciliation for the chosen canonical
+owner; move callers/ingress; observe the old route without writes; remove it only
+after the rollback window and migration checks pass. No environment variable or
+route is removed before those checks are defined.
+
 ## Current route ownership (as of this document)
 
 ### Rust backend — mounted under `/api` in `backend/src/main.rs` (+ `configure_routes` sub-scopes)

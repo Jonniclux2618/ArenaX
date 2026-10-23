@@ -58,22 +58,15 @@ export async function flushSyncQueue(
 
   for (const item of [...queue]) {
     try {
-      const token =
-        typeof localStorage !== "undefined"
-          ? (localStorage.getItem("auth_token") ??
-            sessionStorage.getItem("auth_token"))
-          : null;
-
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
-        ...item.headers,
       };
-      if (token) headers.Authorization = `Bearer ${token}`;
 
       const res = await fetch(item.url, {
         method: item.method,
         body: item.body,
         headers,
+        credentials: "include",
       });
 
       // 2xx or 409 (conflict already resolved server-side) → remove from queue

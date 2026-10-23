@@ -49,14 +49,10 @@ export default function UserManagement() {
     setError(null);
     try {
       const queryString = debouncedSearch ? `?search=${encodeURIComponent(debouncedSearch)}` : "";
-      const token =
-        typeof window !== "undefined"
-          ? localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token")
-          : null;
       const res = await fetch(`/api/admin/users${queryString}`, {
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -77,15 +73,11 @@ export default function UserManagement() {
     setActionLoading(user.id);
     try {
       const action = user.banned ? "unban" : "ban";
-      const token =
-        typeof window !== "undefined"
-          ? localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token")
-          : null;
       const res = await fetch(`/api/admin/users/${user.id}/${action}`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

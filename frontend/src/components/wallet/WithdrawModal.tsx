@@ -70,12 +70,7 @@ export function WithdrawModal({
   });
 
   const watchedAsset = form.watch("asset") as WalletAssetCode;
-  const selectedBalance = balances[watchedAsset] ?? {
-    available: 0,
-    locked: 0,
-    total: 0,
-    hasTrustline: false,
-  };
+  const selectedBalance = balances[watchedAsset];
 
   // Focus preservation and reset on open/close (#40)
   useEffect(() => {

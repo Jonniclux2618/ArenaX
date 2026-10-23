@@ -3,6 +3,7 @@ use crate::db::DbPool;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::Row;
+use std::str::FromStr;
 use uuid::Uuid;
 
 pub struct PayoutSettler {
@@ -96,11 +97,41 @@ impl PayoutSettler {
             .map_err(ApiError::database_error)?;
 
         // Step 6: Parse distribution_percentages from JSON string (e.g., "[50, 30, 20]").
-        let percentages: Vec<f64> = serde_json::from_str(&distribution_percentages_str)
+        let distribution_values: Vec<serde_json::Number> = serde_json::from_str(&distribution_percentages_str)
             .map_err(|e| ApiError::bad_request(format!("Invalid distribution_percentages JSON: {}", e)))?;
 
-        if percentages.is_empty() {
+        if distribution_values.is_empty() {
             return Err(ApiError::bad_request("distribution_percentages must not be empty"));
+        }
+        if total_amount <= 0 {
+            return Err(ApiError::bad_request("prize pool amount must be positive"));
+        }
+
+        let mut weights = Vec::with_capacity(distribution_values.len());
+        let mut total_weight = 0u32;
+        for value in distribution_values {
+            let percentage = Decimal::from_str(&value.to_string())
+                .map_err(|_| ApiError::bad_request("Invalid prize percentage"))?;
+            if percentage <= Decimal::ZERO || percentage > Decimal::from(100) {
+                return Err(ApiError::bad_request("Prize percentages must be between 0 and 100"));
+            }
+            if percentage.scale() > 2 {
+                return Err(ApiError::bad_request("Prize percentages support at most 2 decimals"));
+            }
+            let scaled_mantissa = percentage
+                .mantissa()
+                .checked_mul(100)
+                .ok_or_else(|| ApiError::bad_request("Prize percentage overflow"))?;
+            let scale_divisor = 10i128.pow(percentage.scale());
+            let weight = u32::try_from(scaled_mantissa / scale_divisor)
+                .map_err(|_| ApiError::bad_request("Invalid prize percentage"))?;
+            total_weight = total_weight
+                .checked_add(weight)
+                .ok_or_else(|| ApiError::bad_request("Prize weight sum overflow"))?;
+            weights.push(weight);
+        }
+        if total_weight != 10_000 {
+            return Err(ApiError::bad_request("Prize percentages must sum to exactly 100"));
         }
 
         // Step 7: Get ranked participants ordered by final_rank ASC.
@@ -119,18 +150,37 @@ impl PayoutSettler {
         .map_err(ApiError::database_error)?;
 
         let now = Utc::now();
-        let num_recipients = percentages.len().min(participant_rows.len());
+        if weights.len() > participant_rows.len() {
+            return Err(ApiError::bad_request("Not enough ranked participants for prize weights"));
+        }
+        let num_recipients = weights.len();
+        let mut payouts = Vec::with_capacity(num_recipients);
+        let mut allocated = 0i128;
+        for weight in &weights {
+            let amount = i128::from(total_amount)
+                .checked_mul(i128::from(*weight))
+                .ok_or_else(|| ApiError::bad_request("Prize payout calculation overflow"))?
+                / 10_000;
+            allocated = allocated
+                .checked_add(amount)
+                .ok_or_else(|| ApiError::bad_request("Prize payout total overflow"))?;
+            payouts.push(amount);
+        }
+        let remainder = i128::from(total_amount) - allocated;
+        // Integer dust goes to the last ranked recipient for deterministic reconciliation.
+        let final_payout = payouts
+            .last_mut()
+            .ok_or_else(|| ApiError::bad_request("Prize weights must not be empty"))?;
+        *final_payout = final_payout
+            .checked_add(remainder)
+            .ok_or_else(|| ApiError::bad_request("Final prize payout overflow"))?;
 
         for i in 0..num_recipients {
             let row = &participant_rows[i];
             let user_id: Uuid = row.try_get("user_id").map_err(ApiError::database_error)?;
             let rank: i32 = row.try_get("final_rank").map_err(ApiError::database_error)?;
-            let percentage = percentages[i];
-
-            let total_dec = rust_decimal::Decimal::from(total_amount);
-            let pct_dec = rust_decimal::Decimal::try_from(percentage).unwrap_or_default();
-            let prize_dec = total_dec * pct_dec / rust_decimal::Decimal::from(100);
-            let prize_amount = prize_dec.to_string().parse::<i64>().unwrap_or(0);
+            let prize_amount = i64::try_from(payouts[i])
+                .map_err(|_| ApiError::bad_request("Prize amount exceeds supported range"))?;
             let reference = format!("prize-{}-{}", tournament_id, user_id);
             let description = format!(
                 "Tournament prize payout tournament:{} rank:{}",

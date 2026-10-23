@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BracketMatchStatus, ScoreReport } from "@/types/bracket";
+import { MatchEventSequencer, mergeMatchUpdate } from "@/lib/matchEventSequencer";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -15,6 +16,8 @@ export interface MatchUpdate {
   status?: BracketMatchStatus;
   winnerId?: string;
   message?: string;
+  /** Monotonic per-match sequence number carried by the server (#33). */
+  version?: number;
   timestamp: number;
 }
 
@@ -43,6 +46,12 @@ export interface UseMatchWebSocketReturn {
   connectionRestored: boolean;
   /** True if reconnection was stopped due to permanent authorization failure. */
   isPermanentAuthFailure: boolean;
+  /**
+   * Epoch ms of the last successful synchronization — either an accepted live
+   * event or an adopted authoritative snapshot (#33). `null` before the first
+   * sync. Display-only; never gates user actions.
+   */
+  lastSyncedAt: number | null;
   /** Triggers an immediate authoritative state resync. */
   resyncAuthoritativeState: () => Promise<void>;
   reconnect: () => void;
@@ -92,6 +101,7 @@ export function useMatchWebSocket({
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [connectionRestored, setConnectionRestored] = useState(false);
   const [isPermanentAuthFailure, setIsPermanentAuthFailure] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -101,6 +111,7 @@ export function useMatchWebSocket({
   const retryCountRef = useRef(0);
   const closedRef = useRef(false);
   const isResyncingRef = useRef(false);
+  const sequencerRef = useRef(new MatchEventSequencer());
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -147,6 +158,20 @@ export function useMatchWebSocket({
       isResyncingRef.current = false;
     }
   }, [matchId, onResync, queryClient]);
+
+  // ── Sequence baseline (#33) ───────────────────────────────────────────────
+
+  /**
+   * Re-anchor the event sequencer on the authoritative snapshot currently in
+   * the query cache, re-opening the live stream after a gap or reconnect.
+   */
+  const adoptSnapshotBaseline = useCallback(() => {
+    const cached = queryClient.getQueryData(["match", matchId]) as
+      | { version?: number }
+      | undefined;
+    sequencerRef.current.adoptSnapshot(cached?.version);
+    setLastSyncedAt(Date.now());
+  }, [matchId, queryClient]);
 
   // ── Disconnect ────────────────────────────────────────────────────────────
 
@@ -274,6 +299,12 @@ export function useMatchWebSocket({
 
         // Always refresh authoritative match and tournament state on reconnect (#34)
         await resyncAuthoritativeState();
+        // Re-open the sequenced stream from the refreshed snapshot (#33)
+        adoptSnapshotBaseline();
+      } else {
+        // First connection: adopt the snapshot's version (if any) so the
+        // initial REST state and the live stream share one baseline (#33).
+        adoptSnapshotBaseline();
       }
     };
 
@@ -302,16 +333,64 @@ export function useMatchWebSocket({
           return;
         }
 
-        if (data.matchId) {
-          setLastUpdate({
-            matchId: data.matchId,
-            scorePlayer1: data.scorePlayer1,
-            scorePlayer2: data.scorePlayer2,
-            status: data.status,
-            winnerId: data.winnerId,
-            message: data.message,
-            timestamp: data.timestamp ?? Date.now(),
-          });
+        if (data.matchId ?? (data as Record<string, unknown>).match_id) {
+          // Tolerate both camelCase and the Rust backend's snake_case frames.
+          const raw = data as Record<string, unknown>;
+          const frameMatchId = String(raw.matchId ?? raw.match_id);
+          if (frameMatchId !== matchId) return;
+
+          const version =
+            typeof raw.version === "number" || typeof raw.version === "string"
+              ? raw.version
+              : undefined;
+
+          // Sequence check (#33): duplicates and stale/reordered frames are
+          // dropped before they can touch the cache; a gap suppresses the
+          // stream and refetches authoritative state instead of patching.
+          const verdict = sequencerRef.current.check(version);
+          if (verdict.action === "drop_stale") {
+            return;
+          }
+          if (verdict.action === "resync") {
+            void resyncAuthoritativeState().then(adoptSnapshotBaseline);
+            return;
+          }
+
+          const rawTimestamp = raw.timestamp;
+          const timestamp =
+            typeof rawTimestamp === "number"
+              ? rawTimestamp
+              : typeof rawTimestamp === "string" && !Number.isNaN(Date.parse(rawTimestamp))
+                ? Date.parse(rawTimestamp)
+                : Date.now();
+
+          const update: MatchUpdate = {
+            matchId: frameMatchId,
+            scorePlayer1: (raw.scorePlayer1 ?? raw.score_player1) as number | undefined,
+            scorePlayer2: (raw.scorePlayer2 ?? raw.score_player2) as number | undefined,
+            status: (raw.status ?? undefined) as BracketMatchStatus | undefined,
+            winnerId: (raw.winnerId ?? raw.winner_id) as string | undefined,
+            message: (raw.message ?? raw.detail) as string | undefined,
+            version: verdict.version ?? undefined,
+            timestamp,
+          };
+
+          // Patch the query cache so every consumer (hub, detail view,
+          // mobile view) converges on the same ordered state (#33).
+          queryClient.setQueryData<Record<string, unknown>>(
+            ["match", matchId],
+            (previous) =>
+              mergeMatchUpdate(previous as never, {
+                status: update.status,
+                scorePlayer1: update.scorePlayer1,
+                scorePlayer2: update.scorePlayer2,
+                winnerId: update.winnerId,
+                version: verdict.version ?? undefined,
+              }) as Record<string, unknown> | undefined,
+          );
+
+          setLastUpdate(update);
+          setLastSyncedAt(Date.now());
         }
       } catch {
         // Ignore malformed frames
@@ -363,6 +442,7 @@ export function useMatchWebSocket({
       } catch {}
     };
   }, [
+    adoptSnapshotBaseline,
     buildWsUrl,
     disconnect,
     enabled,
@@ -436,6 +516,9 @@ export function useMatchWebSocket({
   useEffect(() => {
     closedRef.current = false;
     setIsPermanentAuthFailure(false);
+    // New match view: forget any previous stream baseline (#33)
+    sequencerRef.current.reset();
+    setLastSyncedAt(null);
 
     if (enabled && matchId) {
       connect();
@@ -456,6 +539,7 @@ export function useMatchWebSocket({
     isReconnecting,
     connectionRestored,
     isPermanentAuthFailure,
+    lastSyncedAt,
     resyncAuthoritativeState,
     reconnect,
     disconnect,

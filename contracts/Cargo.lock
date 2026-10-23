@@ -93,6 +93,7 @@ name = "arenax-testing-infrastructure"
 version = "0.1.0"
 dependencies = [
  "access-control",
+ "auth-gateway",
  "composable-example",
  "contract-standards",
  "proptest",
@@ -2024,6 +2025,7 @@ dependencies = [
 name = "tournament-escrow"
 version = "0.1.0"
 dependencies = [
+ "arenax-events",
  "soroban-sdk",
 ]
 

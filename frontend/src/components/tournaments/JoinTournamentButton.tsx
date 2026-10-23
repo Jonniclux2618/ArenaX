@@ -8,6 +8,7 @@ import { useRouter } from "next/navigation";
 import { LogIn, CheckCircle, AlertCircle, Clock, Users, X, ShieldAlert, RefreshCw } from "lucide-react";
 import { useNotifications } from "@/contexts/NotificationContext";
 import { api } from "@/lib/api";
+import { useAuth } from "@/hooks/useAuth";
 import { handleFocusTrap, restoreFocus, announce } from "@/lib/accessibility";
 
 interface JoinTournamentButtonProps {
@@ -29,6 +30,7 @@ export function JoinTournamentButton({
 }: JoinTournamentButtonProps) {
   const router = useRouter();
   const { notify, addToast } = useNotifications();
+  const { user } = useAuth();
   const queryClient = useQueryClient();
   const [showModal, setShowModal] = useState(false);
   const [joinState, setJoinState] = useState<JoinState>("idle");
@@ -351,7 +353,7 @@ export function JoinTournamentButton({
                   <Users className="h-5 w-5 text-primary dark:text-primary/80" />
                 )}
                 <h2 id="join-tournament-dialog-title" className="font-semibold text-foreground text-base sm:text-lg">
-                  {!localStorage.getItem("auth_token")
+                  {!user
                     ? "Sign In Required"
                     : joinState === "pending"
                       ? "Reserving Seat…"
@@ -378,7 +380,7 @@ export function JoinTournamentButton({
             {/* Body */}
             <div id="join-tournament-dialog-desc" className="p-5 sm:p-6 space-y-4 overflow-y-auto">
               {/* Not Authenticated State */}
-              {!localStorage.getItem("auth_token") && (
+              {!user && (
                 <>
                   <p className="text-sm text-muted-foreground">
                     You need to be signed in to join a tournament. Create an
@@ -394,7 +396,7 @@ export function JoinTournamentButton({
               )}
 
               {/* Idle State with Fee Breakdown & Refund Terms (#31) */}
-              {localStorage.getItem("auth_token") && joinState === "idle" && (
+              {user && joinState === "idle" && (
                 <div className="space-y-4">
                   <p className="text-sm text-muted-foreground">
                     Confirm your registration for <strong className="text-foreground">{tournament.name}</strong>.
@@ -489,7 +491,7 @@ export function JoinTournamentButton({
 
             {/* Footer */}
             <div className="p-4 sm:p-5 border-t flex gap-3">
-              {!localStorage.getItem("auth_token") && (
+              {!user && (
                 <>
                   <Button
                     variant="secondary"
@@ -508,7 +510,7 @@ export function JoinTournamentButton({
                 </>
               )}
 
-              {localStorage.getItem("auth_token") && joinState === "idle" && (
+              {user && joinState === "idle" && (
                 <>
                   <Button
                     variant="secondary"

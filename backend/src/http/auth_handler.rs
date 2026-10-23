@@ -22,10 +22,10 @@ pub const REFRESH_TOKEN_COOKIE: &str = "auth_refresh_token";
 /// - `HttpOnly` — not readable by JavaScript.
 /// - `Secure`   — only sent over HTTPS (browsers ignore on localhost).
 /// - `SameSite=Strict` — never sent on cross-site requests.
-/// - `Path=/api` — scoped so it isn't sent for unrelated requests.
+/// - `Path=/` — available to the frontend middleware for protected page checks.
 fn build_access_cookie(token: &str, max_age_secs: i64) -> Cookie<'static> {
     Cookie::build(ACCESS_TOKEN_COOKIE, token.to_owned())
-        .path("/api")
+        .path("/")
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
@@ -50,7 +50,7 @@ fn build_refresh_cookie(token: &str, max_age_secs: i64) -> Cookie<'static> {
 /// Build expired (clearing) versions of both cookies.
 fn clear_access_cookie() -> Cookie<'static> {
     Cookie::build(ACCESS_TOKEN_COOKIE, "")
-        .path("/api")
+        .path("/")
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
@@ -342,10 +342,27 @@ pub async fn get_sessions(
         .user_id()
         .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
 
-    let sessions = auth_service.get_sessions(user_id).await?;
+    let mut sessions = auth_service.get_sessions(user_id).await?;
+    let current_session_id = req.claims().map(|claims| claims.session_id);
+    for session in &mut sessions {
+        session.is_current = current_session_id.as_deref() == Some(session.session_id.as_str());
+    }
     let total = sessions.len();
 
     Ok(HttpResponse::Ok().json(SessionsResponse { sessions, total }))
+}
+
+/// DELETE /api/auth/sessions/{session_id}
+pub async fn revoke_session(
+    auth_service: web::Data<AuthService>,
+    req: HttpRequest,
+    session_id: web::Path<String>,
+) -> Result<impl Responder, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+    auth_service.revoke_session(user_id, &session_id).await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 /// GET /api/auth/analytics  (admin only)
@@ -411,6 +428,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/change-password", web::post().to(change_password))
             .route("/revoke-sessions", web::post().to(revoke_all_sessions))
             .route("/sessions", web::get().to(get_sessions))
+            .route("/sessions/{session_id}", web::delete().to(revoke_session))
             .route("/analytics", web::get().to(get_analytics))
             .route("/ws-token", web::get().to(get_ws_token)),
     );

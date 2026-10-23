@@ -17,6 +17,8 @@ export function EmailVerification({ className }: EmailVerificationProps) {
   const router = useRouter();
   const [token, setToken] = useState('');
   const [resending, setResending] = useState(false);
+  const [resendCountdown, setResendCountdown] = useState(0);
+  const [resendMessage, setResendMessage] = useState('');
   const [success, setSuccess] = useState(false);
 
   const pendingEmail = user?.email || (typeof window !== 'undefined' ? localStorage.getItem('arenax_pending_email') || '' : '');
@@ -24,6 +26,14 @@ export function EmailVerification({ className }: EmailVerificationProps) {
   useEffect(() => {
     clearError();
   }, [clearError]);
+
+  useEffect(() => {
+    if (resendCountdown <= 0) return;
+    const timer = window.setTimeout(() => {
+      setResendCountdown((remaining) => Math.max(0, remaining - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [resendCountdown]);
 
   useEffect(() => {
     if (success) {
@@ -36,7 +46,7 @@ export function EmailVerification({ className }: EmailVerificationProps) {
 
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!token.trim()) return;
+    if (!token.trim() || loading) return;
 
     try {
       await verifyEmail(token.trim());
@@ -47,10 +57,13 @@ export function EmailVerification({ className }: EmailVerificationProps) {
   };
 
   const handleResend = async () => {
-    if (!pendingEmail) return;
+    if (!pendingEmail || loading || resending || resendCountdown > 0) return;
     setResending(true);
+    setResendCountdown(60);
+    setResendMessage('');
     try {
       await resendVerificationEmail(pendingEmail);
+      setResendMessage('A new verification email has been sent.');
     } catch (err) {
       // Error is handled by useAuth
     } finally {
@@ -82,7 +95,7 @@ export function EmailVerification({ className }: EmailVerificationProps) {
         )}
       </div>
 
-      <form onSubmit={handleVerify} className="space-y-6">
+      <form onSubmit={handleVerify} className="space-y-6" aria-busy={loading}>
         <div className="space-y-2">
           <label htmlFor="token" className="block text-sm font-medium text-foreground">
             Verification token
@@ -94,17 +107,19 @@ export function EmailVerification({ className }: EmailVerificationProps) {
             value={token}
             onChange={(e) => setToken(e.target.value)}
             error={!!error}
+            aria-invalid={!!error}
+            aria-describedby={error ? 'verification-error' : undefined}
           />
         </div>
         
         {error && (
-          <div className="flex gap-2 p-3 rounded-md bg-destructive/5 text-red-800 dark:bg-destructive/10/30 dark:text-red-200">
+          <div id="verification-error" role="alert" className="flex gap-2 p-3 rounded-md bg-destructive/5 text-red-800 dark:bg-destructive/10/30 dark:text-red-200">
             <AlertCircle className="h-5 w-5 flex-shrink-0 mt-0.5" />
             <p className="text-sm">{error}</p>
           </div>
         )}
         
-        <Button type="submit" size="lg" className="w-full" loading={loading}>
+        <Button type="submit" size="lg" className="w-full" loading={loading} disabled={loading || !token.trim()}>
           Verify email
         </Button>
       </form>
@@ -115,12 +130,17 @@ export function EmailVerification({ className }: EmailVerificationProps) {
           <button
             type="button"
             onClick={handleResend}
-            disabled={resending}
+            disabled={resending || loading || resendCountdown > 0 || !pendingEmail}
             className="text-primary hover:text-info font-medium disabled:opacity-50"
           >
-            {resending ? 'Sending...' : 'Resend verification email'}
+            {resending
+              ? 'Sending...'
+              : resendCountdown > 0
+                ? `Resend in ${resendCountdown}s`
+                : 'Resend verification email'}
           </button>
         </p>
+        {resendMessage && <p role="status" className="mt-2 text-sm text-success">{resendMessage}</p>}
       </div>
     </div>
   );

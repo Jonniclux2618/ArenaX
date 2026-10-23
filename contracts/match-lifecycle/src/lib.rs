@@ -10,6 +10,7 @@ pub enum MatchState {
     Started,
     Completed,
     Disputed,
+    DisputeResolved,
     Finalized,
 }
 
@@ -158,6 +159,7 @@ impl MatchLifecycleContract {
             panic!("match is not disputed");
         }
         Self::require_participant(&record, &winner);
+        record.state = MatchState::DisputeResolved;
         record.winner = Some(winner.clone());
         env.storage()
             .persistent()
@@ -168,7 +170,7 @@ impl MatchLifecycleContract {
     pub fn finalize_match(env: Env, operator: Address, match_id: BytesN<32>) {
         Self::require_admin(&env, &operator);
         let mut record = Self::load_match(&env, &match_id);
-        if record.state != MatchState::Completed && record.state != MatchState::Disputed {
+        if record.state != MatchState::Completed && record.state != MatchState::DisputeResolved {
             panic!("invalid match transition");
         }
         let winner = record.winner.clone().expect("match result is missing");

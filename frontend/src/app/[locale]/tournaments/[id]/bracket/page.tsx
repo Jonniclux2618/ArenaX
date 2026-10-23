@@ -6,8 +6,10 @@ import Link from "next/link";
 import { mockTournaments } from "@/data/mockTournaments";
 import { generateMockBracket } from "@/data/mockBracket";
 import { generateMockRoster } from "@/data/mockRoster";
-import { TournamentBracket } from "@/components/tournaments/TournamentBracket";
-import { BracketSeedingEditor } from "@/components/tournaments/BracketSeedingEditor";
+import {
+  DynamicTournamentBracket,
+  DynamicBracketSeedingEditor,
+} from "@/lib/dynamicImports";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/hooks/useAuth";
 import { ArrowLeft, Trophy } from "lucide-react";
@@ -73,7 +75,7 @@ export default function TournamentBracketPage() {
 
         {/* Bracket, seeding editor, or unavailable */}
         {bracketData ? (
-          <TournamentBracket bracketData={bracketData} currentUserId={currentUserId} />
+          <DynamicTournamentBracket bracketData={bracketData} currentUserId={currentUserId} />
         ) : isOrganizer ? (
           <div className="space-y-4">
             <div>
@@ -83,7 +85,7 @@ export default function TournamentBracketPage() {
                 Tab, Enter, and the arrow keys.
               </p>
             </div>
-            <BracketSeedingEditor
+            <DynamicBracketSeedingEditor
               tournamentId={tournament.id}
               tournamentStatus={tournament.status}
               players={roster}

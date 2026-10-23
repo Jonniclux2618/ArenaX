@@ -456,6 +456,49 @@ impl ApiKeyService {
         Ok(key)
     }
 
+    /// Authenticate a key for one explicit scope and atomically account for
+    /// its use. Callers must use this method instead of validating a key
+    /// without a required scope.
+    pub async fn authenticate_key_for_scope(
+        &self,
+        key_string: &str,
+        required_scope: &str,
+    ) -> Result<ApiKey, ApiError> {
+        let key = self.get_key_by_key_string(key_string).await?;
+        let scope_allowed = key.scopes.iter().any(|scope| {
+            scope == "*"
+                || scope == required_scope
+                || scope == &format!("{}:*", required_scope.split_once(':').map_or("", |(resource, _)| resource))
+                || scope == &format!("*:{}", required_scope.split_once(':').map_or("", |(_, action)| action))
+        });
+        if !scope_allowed {
+            return Err(ApiError::forbidden("API key does not grant the required scope"));
+        }
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET use_count = use_count + 1, last_used_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+              AND is_active = true
+              AND (expiration_date IS NULL OR expiration_date > NOW())
+              AND (max_uses IS NULL OR use_count < max_uses)
+            "#,
+        )
+        .bind(key.id)
+        .execute(&self.pool)
+        .await
+        .map_err(ApiError::database_error)?;
+
+        if updated.rows_affected() != 1 {
+            return Err(ApiError::unauthorized(
+                "API key is expired, revoked, or has reached its use limit",
+            ));
+        }
+
+        Ok(key)
+    }
+
     // ── Key Updates ──────────────────────────────────────────────────────────
 
     /// Update an API key

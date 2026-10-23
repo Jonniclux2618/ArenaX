@@ -8,6 +8,7 @@ import { EmptyState } from "@/components/common/EmptyState";
 import { Button } from "@/components/ui/Button";
 import { PersistentNotification } from "@/types/notification";
 import { cn } from "@/lib/utils";
+import { safeRedirectPath } from "@/lib/safeNavigation";
 
 function formatTime(iso: string) {
   const date = new Date(iso);
@@ -26,6 +27,9 @@ function NotificationItem({
 }) {
   const { markAsRead, removeNotification } = useNotifications();
   const isRead = notification.read;
+  const safeLink = notification.link
+    ? safeRedirectPath(notification.link, "")
+    : "";
 
   const handleMarkRead = () => {
     if (!isRead) markAsRead(notification.id);
@@ -83,11 +87,11 @@ function NotificationItem({
 
   return (
     <div className="group relative border-b border-border/50 last:border-0">
-      {notification.link ? (
+      {safeLink ? (
         // Link wraps only the readable content — delete button is a sibling
         <>
           <Link
-            href={notification.link}
+            href={safeLink}
             className={cn(
               "block p-4 rounded-lg transition-colors",
               !isRead && "bg-primary/5",

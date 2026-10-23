@@ -1,13 +1,63 @@
-use crate::auth::jwt_service::{Claims, JwtError, JwtService};
+use crate::auth::jwt_service::{Claims, JwtError, JwtService, TokenType};
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
     error::{ErrorForbidden, ErrorUnauthorized},
+    http::Method,
     Error, HttpMessage,
 };
 use futures::future::LocalBoxFuture;
 use std::future::{ready, Ready};
 use std::rc::Rc;
 use tracing::{debug, warn};
+
+fn is_public_route(req: &ServiceRequest) -> bool {
+    let path = req.path();
+    let method = req.method();
+    if method == Method::OPTIONS {
+        return true;
+    }
+    if matches!(
+        (method, path),
+        (&Method::GET, "/api/health")
+            | (&Method::GET, "/api/health/live")
+            | (&Method::GET, "/api/health/ready")
+            | (&Method::GET, "/api/csrf-token")
+            | (&Method::POST, "/api/auth/register")
+            | (&Method::POST, "/api/auth/login")
+            | (&Method::POST, "/api/auth/refresh")
+            | (&Method::POST, "/api/auth/otp/send")
+            | (&Method::POST, "/api/auth/otp/verify")
+            | (&Method::GET, "/api/tournaments")
+            | (&Method::GET, "/metrics")
+    ) {
+        return true;
+    }
+
+    (method == Method::GET
+        && (path.starts_with("/api/docs")
+            || path.starts_with("/api/leaderboards/")
+            || (path.starts_with("/api/tournaments/")
+                && path["/api/tournaments/".len()..].matches('/').count() == 0)))
+        || (method == Method::POST && path.starts_with("/api/webhooks/"))
+}
+
+fn required_roles(path: &str) -> Option<&'static [&'static str]> {
+    if path == "/api/auth/analytics"
+        || path.starts_with("/api/ip-list")
+        || path.starts_with("/api/feature-flags")
+        || path.starts_with("/api/cache")
+        || path.starts_with("/api/idempotency")
+        || path.starts_with("/api/reputation/bad-actors")
+    {
+        return Some(&["admin", "super_admin"]);
+    }
+
+    if path.starts_with("/api/suspensions") || path.starts_with("/api/disputes") {
+        return Some(&["admin", "super_admin", "moderator"]);
+    }
+
+    None
+}
 
 /// Authentication middleware for protecting routes
 pub struct AuthMiddleware {
@@ -81,6 +131,9 @@ where
             let token = match token_opt {
                 Some(t) => t,
                 None => {
+                    if is_public_route(&req) {
+                        return service.call(req).await;
+                    }
                     warn!("Missing authorization header and auth cookie");
                     return Err(ErrorUnauthorized("Authentication required"));
                 }
@@ -89,6 +142,17 @@ where
             // ── Token validation ─────────────────────────────────────────────
             match jwt_service.validate_token(&token).await {
                 Ok(claims) => {
+                    if claims.token_type != TokenType::Access {
+                        return Err(ErrorUnauthorized("Access token required"));
+                    }
+                    if let Some(allowed_roles) = required_roles(req.path()) {
+                        let has_role = claims.roles.iter().any(|role| {
+                            allowed_roles.iter().any(|allowed| role.eq_ignore_ascii_case(allowed))
+                        });
+                        if !has_role {
+                            return Err(ErrorForbidden("Insufficient permissions"));
+                        }
+                    }
                     debug!(user_id = %claims.sub, "Request authenticated");
                     req.extensions_mut().insert(claims);
                     service.call(req).await

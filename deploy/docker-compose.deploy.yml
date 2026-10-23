@@ -58,6 +58,7 @@ services:
     profiles: ["blue"]
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      ADMIN_JWT_SECRET: ${JWT_SECRET}
     networks:
       - deploy-network
 
@@ -66,6 +67,7 @@ services:
     profiles: ["green"]
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      ADMIN_JWT_SECRET: ${JWT_SECRET}
     networks:
       - deploy-network
 

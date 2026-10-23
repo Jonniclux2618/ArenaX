@@ -25,4 +25,5 @@ proptest = "1"
 quickcheck = "1"
 composable-example = { path = "../composable-example" }
 access-control = { path = "../access-control" }
+auth-gateway = { path = "../auth-gateway" }
 contract-standards = { path = "../contract-standards" }

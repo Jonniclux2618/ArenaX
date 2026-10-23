@@ -12,6 +12,7 @@ import { z } from "zod";
 import { loginSchema } from "@/lib/validations/auth";
 import { useFormAnalytics } from "@/hooks/useFormAnalytics";
 import { useAnalytics } from "@/hooks/useAnalytics";
+import { getSafeReturnPath } from "@/lib/safeReturnPath";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import {
@@ -60,13 +61,15 @@ export function LoginForm({ className }: LoginFormProps) {
   }, [form, analytics]);
 
   const onSubmit = async (data: z.output<typeof loginSchema>) => {
-    await login({ email: data.email, password: data.password, rememberMe: data.rememberMe });
-
-    if (!error) {
+    try {
+      await login({ email: data.email, password: data.password, rememberMe: data.rememberMe });
       analytics.trackSubmit({ success: true });
       track("auth_login", { method: "email" });
-      router.push("/");
-    } else {
+      const params = new URLSearchParams(window.location.search);
+      router.replace(
+        getSafeReturnPath(params.get("redirect") ?? params.get("returnTo")),
+      );
+    } catch {
       analytics.trackSubmit({ success: false });
     }
   };

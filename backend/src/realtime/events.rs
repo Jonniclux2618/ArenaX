@@ -26,6 +26,44 @@ pub enum RealtimeEvent {
         to_status: String,
         timestamp: String,
     },
+    /// Sequence-aware match state event (Issue #33).
+    ///
+    /// Carries the full authoritative slice of match state (status, scores,
+    /// winner) so a client can converge from a single ordered stream without
+    /// refetching per event.
+    ///
+    /// # Client merge contract
+    ///
+    /// The client tracks the last `version` applied for this `match_id`:
+    ///
+    /// 1. `version <= last_seen` — duplicate or stale delivery; discard.
+    ///    Reordered frames can never roll status, scores, or dispute state
+    ///    backwards.
+    /// 2. `version == last_seen + 1` — apply the payload onto the local
+    ///    query-cache snapshot.
+    /// 3. `version >  last_seen + 1` — one or more events were missed;
+    ///    discard the frame, suppress the live stream, and re-fetch the
+    ///    authoritative match snapshot from REST. The snapshot's `version`
+    ///    becomes the new baseline (see `MatchResponse::version`).
+    /// 4. `version == 0` — the sequencer could not be allocated (e.g. Redis
+    ///    unavailable); treat the event as unsequenced and apply without
+    ///    moving the baseline.
+    MatchStateSync {
+        match_id: Uuid,
+        /// Monotonic per-match sequence number. See the merge contract.
+        version: u64,
+        /// Domain event name, e.g. `score_reported`, `disputed`,
+        /// `conflict_detected`, `status_changed`.
+        event: String,
+        /// Match status after the change (`pending`, `in_progress`, ...).
+        status: String,
+        score_player1: Option<i32>,
+        score_player2: Option<i32>,
+        winner_id: Option<Uuid>,
+        /// Human-readable detail (dispute reason, conflict description, ...).
+        detail: Option<String>,
+        timestamp: String,
+    },
     Notification {
         id: Uuid,
         title: String,

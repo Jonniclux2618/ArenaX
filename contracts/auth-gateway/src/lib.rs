@@ -46,7 +46,7 @@ impl AuthGateway {
     /// # Panics
     /// * If contract is paused
     /// * If caller is not admin
-    /// * If trying to assign None role (use revoke_role instead)
+    /// * If assigning None or Admin directly (use revoke_role or transfer_admin)
     pub fn assign_role(env: Env, address: Address, role: Role) {
         Self::require_admin(&env);
         Self::require_not_paused(&env);
@@ -54,14 +54,14 @@ impl AuthGateway {
         if role == Role::None {
             panic!("use revoke_role to remove roles");
         }
+        if role == Role::Admin {
+            panic!("admin role can only be assigned through admin handoff");
+        }
+        if address == env.current_contract_address() {
+            panic!("contract cannot grant a role to itself");
+        }
 
-        let admin = env.current_contract_address();
-        let _current_role = env
-            .storage()
-            .instance()
-            .get(&DataKey::Role(address.clone()))
-            .unwrap_or(Role::None);
-
+        let admin = Self::get_admin(env.clone());
         env.storage()
             .instance()
             .set(&DataKey::Role(address.clone()), &role);
@@ -81,6 +81,10 @@ impl AuthGateway {
     pub fn revoke_role(env: Env, address: Address) {
         Self::require_admin(&env);
         Self::require_not_paused(&env);
+
+        if address == Self::get_admin(env.clone()) {
+            panic!("admin role can only be revoked through admin handoff");
+        }
 
         let current_role: Role = env
             .storage()
@@ -181,10 +185,19 @@ impl AuthGateway {
     /// # Returns
     /// The role of the address (Role::None if no role assigned)
     pub fn get_role(env: Env, address: Address) -> Role {
-        env.storage()
+        if address == Self::get_admin(env.clone()) {
+            return Role::Admin;
+        }
+        let role: Role = env
+            .storage()
             .instance()
             .get(&DataKey::Role(address))
-            .unwrap_or(Role::None)
+            .unwrap_or(Role::None);
+        if role == Role::Admin {
+            Role::None
+        } else {
+            role
+        }
     }
 
     /// Check if an address has a specific role
@@ -196,6 +209,12 @@ impl AuthGateway {
     /// # Returns
     /// True if the address has the role, false otherwise
     pub fn has_role(env: Env, address: Address, role: Role) -> bool {
+        if role == Role::None {
+            return false;
+        }
+        if address == Self::get_admin(env.clone()) {
+            return true;
+        }
         let user_role = Self::get_role(env, address);
         user_role == role
     }
@@ -209,6 +228,9 @@ impl AuthGateway {
     /// # Returns
     /// True if the address has any of the roles, false otherwise
     pub fn has_any_role(env: Env, address: Address, roles: Vec<Role>) -> bool {
+        if address == Self::get_admin(env.clone()) {
+            return roles.iter().any(|role| role != Role::None);
+        }
         let user_role = Self::get_role(env, address);
         roles.iter().any(|role| user_role == role)
     }
@@ -275,12 +297,18 @@ impl AuthGateway {
             if role == Role::None {
                 panic!("use revoke_role to remove roles");
             }
+            if role == Role::Admin {
+                panic!("admin role can only be assigned through admin handoff");
+            }
+            if address == env.current_contract_address() {
+                panic!("contract cannot grant a role to itself");
+            }
 
             env.storage()
                 .instance()
                 .set(&DataKey::Role(address.clone()), &role);
 
-            events::emit_role_assigned(&env, &address, role, &env.current_contract_address());
+            events::emit_role_assigned(&env, &address, role, &Self::get_admin(env.clone()));
         }
     }
 
@@ -305,24 +333,23 @@ impl AuthGateway {
     ///
     /// # Panics
     /// * If caller is not current admin
-    /// * If new_admin already has a role (must be None first)
+    /// * If new_admin already has a non-admin role (must be None first)
+    /// * If new_admin does not authorize the handoff
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         current_admin.require_auth();
 
-        let new_admin_role: Role = env
-            .storage()
-            .instance()
-            .get(&DataKey::Role(new_admin.clone()))
-            .unwrap_or(Role::None);
+        if new_admin == current_admin {
+            panic!("new admin must differ from current admin");
+        }
+        new_admin.require_auth();
+
+        let new_admin_role = Self::get_role(env.clone(), new_admin.clone());
         if new_admin_role != Role::None {
             panic!("new admin must have no existing role");
         }
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
 
         events::emit_role_assigned(&env, &new_admin, Role::Admin, &current_admin);
         events::emit_role_revoked(&env, &current_admin, Role::Admin, &new_admin);

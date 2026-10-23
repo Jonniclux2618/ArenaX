@@ -2,12 +2,81 @@
   {
     "path": "/*",
     "timings": [
+      { "metric": "first-contentful-paint", "budget": 1800 },
       { "metric": "largest-contentful-paint", "budget": 2500 },
+      { "metric": "cumulative-layout-shift", "budget": 0.1 },
+      { "metric": "total-blocking-time", "budget": 300 },
       { "metric": "interactive", "budget": 3000 }
     ],
     "resourceSizes": [
-      { "resourceType": "script", "budget": 300 },
+      { "resourceType": "script", "budget": 350 },
+      { "resourceType": "stylesheet", "budget": 60 },
+      { "resourceType": "image", "budget": 500 },
+      { "resourceType": "font", "budget": 150 },
       { "resourceType": "total", "budget": 1000 }
+    ]
+  },
+  {
+    "path": "/en/tournaments",
+    "timings": [
+      { "metric": "first-contentful-paint", "budget": 1600 },
+      { "metric": "largest-contentful-paint", "budget": 2400 },
+      { "metric": "cumulative-layout-shift", "budget": 0.08 },
+      { "metric": "total-blocking-time", "budget": 250 },
+      { "metric": "interactive", "budget": 2800 }
+    ],
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 300 },
+      { "resourceType": "stylesheet", "budget": 50 },
+      { "resourceType": "image", "budget": 400 },
+      { "resourceType": "font", "budget": 120 },
+      { "resourceType": "total", "budget": 850 }
+    ]
+  },
+  {
+    "path": "/en/tournaments/*/bracket",
+    "timings": [
+      { "metric": "first-contentful-paint", "budget": 1700 },
+      { "metric": "largest-contentful-paint", "budget": 2500 },
+      { "metric": "cumulative-layout-shift", "budget": 0.1 },
+      { "metric": "total-blocking-time", "budget": 300 },
+      { "metric": "interactive", "budget": 3000 }
+    ],
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 320 },
+      { "resourceType": "stylesheet", "budget": 50 },
+      { "resourceType": "image", "budget": 350 },
+      { "resourceType": "total", "budget": 900 }
+    ]
+  },
+  {
+    "path": "/en/matches/*",
+    "timings": [
+      { "metric": "first-contentful-paint", "budget": 1650 },
+      { "metric": "largest-contentful-paint", "budget": 2400 },
+      { "metric": "cumulative-layout-shift", "budget": 0.08 },
+      { "metric": "total-blocking-time", "budget": 280 },
+      { "metric": "interactive", "budget": 2900 }
+    ],
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 300 },
+      { "resourceType": "stylesheet", "budget": 50 },
+      { "resourceType": "total", "budget": 850 }
+    ]
+  },
+  {
+    "path": "/en/leaderboard",
+    "timings": [
+      { "metric": "first-contentful-paint", "budget": 1500 },
+      { "metric": "largest-contentful-paint", "budget": 2200 },
+      { "metric": "cumulative-layout-shift", "budget": 0.05 },
+      { "metric": "total-blocking-time", "budget": 220 },
+      { "metric": "interactive", "budget": 2600 }
+    ],
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 280 },
+      { "resourceType": "stylesheet", "budget": 45 },
+      { "resourceType": "total", "budget": 750 }
     ]
   }
 ]

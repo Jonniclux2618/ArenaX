@@ -113,6 +113,13 @@ impl MatchService {
         let can_dispute = self.can_user_dispute_match(user_id, &match_record).await?;
         let dispute_status = self.get_match_dispute_status(match_id).await?;
 
+        // Current live-stream sequence number so clients can adopt the
+        // WebSocket baseline from an authoritative snapshot (Issue #33).
+        let version = match &self.event_bus {
+            Some(bus) => bus.current_match_version(match_id).await,
+            None => None,
+        };
+
         Ok(MatchResponse {
             id: match_record.id,
             tournament_id: match_record.tournament_id,
@@ -132,6 +139,7 @@ impl MatchService {
             can_report_score,
             can_dispute,
             dispute_status,
+            version,
         })
     }
 
@@ -1545,6 +1553,7 @@ impl MatchService {
                 can_report_score: false,
                 can_dispute: false,
                 dispute_status: None,
+                version: None,
             });
         }
 
@@ -1880,35 +1889,86 @@ pub struct LeaderboardEntry {
 }
 
 impl MatchService {
+    /// Publish a sequence-aware match state event (Issue #33).
+    ///
+    /// `event_data` carries `"type"` (or legacy `"event"`) plus any of
+    /// `"match_id"`, `"from_status"`, `"user_id"`, `"reason"`,
+    /// `"conflict_reason"`. The match row is re-read so the event always
+    /// reflects the authoritative status/scores/winner *after* the write that
+    /// triggered it, and every event receives a monotonic `version` so clients
+    /// can drop duplicates, reject stale frames, and detect gaps (see
+    /// `RealtimeEvent::MatchStateSync`).
     async fn publish_match_event(&self, event_data: serde_json::Value) -> Result<(), ApiError> {
-        if let Some(ref event_bus) = self.event_bus {
-            if let (Some(match_id_str), Some(event_type)) = (
-                event_data.get("match_id").and_then(|v| v.as_str()),
-                event_data.get("event").and_then(|v| v.as_str()),
-            ) {
-                let match_id = Uuid::parse_str(match_id_str).unwrap_or_default();
-                let timestamp = chrono::Utc::now().to_rfc3339();
+        let Some(event_bus) = self.event_bus.as_ref() else {
+            return Ok(());
+        };
 
-                let event = crate::realtime::events::RealtimeEvent::MatchStatusChange {
-                    match_id,
-                    from_status: event_data
-                        .get("from_status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    to_status: event_type.to_string(),
-                    timestamp,
-                };
+        let Some(match_id_str) = event_data.get("match_id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let match_id = Uuid::parse_str(match_id_str).unwrap_or_default();
 
-                event_bus.publish_to_match(match_id, &event).await;
+        // Canonical key is "type"; "event" accepted for legacy callers.
+        let event_name = event_data
+            .get("type")
+            .or_else(|| event_data.get("event"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("status_changed")
+            .to_string();
 
-                // Also publish to participant user channels
-                for key in ["player1_id", "player2_id", "user_id"] {
-                    if let Some(uid_str) = event_data.get(key).and_then(|v| v.as_str()) {
-                        if let Ok(uid) = Uuid::parse_str(uid_str) {
-                            event_bus.publish_to_user(uid, &event).await;
-                        }
-                    }
+        let version = event_bus.next_match_version(match_id).await;
+        let timestamp = Utc::now().to_rfc3339();
+
+        // Re-read the match so the payload carries post-write authoritative
+        // state rather than whatever the caller happened to know.
+        let (status, score_player1, score_player2, winner_id) =
+            match self.get_match_by_id(match_id).await {
+                Ok(record) => {
+                    let status = match record.status {
+                        MatchStatus::Pending => "pending",
+                        MatchStatus::Scheduled => "scheduled",
+                        MatchStatus::InProgress => "in_progress",
+                        MatchStatus::Completed => "completed",
+                        MatchStatus::Conflict => "conflict",
+                        MatchStatus::Disputed => "disputed",
+                        MatchStatus::Cancelled => "cancelled",
+                        MatchStatus::Abandoned => "abandoned",
+                    };
+                    (
+                        status.to_string(),
+                        record.player1_score,
+                        record.player2_score,
+                        record.winner_id,
+                    )
+                }
+                Err(_) => ("unknown".to_string(), None, None, None),
+            };
+
+        let detail = event_data
+            .get("reason")
+            .or_else(|| event_data.get("conflict_reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let event = crate::realtime::events::RealtimeEvent::MatchStateSync {
+            match_id,
+            version,
+            event: event_name,
+            status,
+            score_player1,
+            score_player2,
+            winner_id,
+            detail,
+            timestamp,
+        };
+
+        event_bus.publish_to_match(match_id, &event).await;
+
+        // Also publish to participant user channels
+        for key in ["player1_id", "player2_id", "user_id"] {
+            if let Some(uid_str) = event_data.get(key).and_then(|v| v.as_str()) {
+                if let Ok(uid) = Uuid::parse_str(uid_str) {
+                    event_bus.publish_to_user(uid, &event).await;
                 }
             }
         }

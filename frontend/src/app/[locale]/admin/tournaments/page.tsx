@@ -55,15 +55,11 @@ export default function TournamentManagement() {
     setActionLoading(id);
     setError(null);
     try {
-      const token =
-        typeof window !== "undefined"
-          ? localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token")
-          : null;
       const res = await fetch(`/api/tournaments/${id}/cancel`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

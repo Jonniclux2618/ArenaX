@@ -15,17 +15,21 @@ const PROFILE_CACHE_TTL_SECONDS: u64 = 60;
 /// Active session info returned by `GET /api/auth/sessions`.
 #[derive(Debug, serde::Serialize)]
 pub struct ActiveSession {
+    pub session_id: String,
     pub device_id: Option<String>,
     pub created_at: i64,
     pub last_used_at: i64,
+    pub is_current: bool,
 }
 
 impl From<RefreshTokenRecord> for ActiveSession {
     fn from(r: RefreshTokenRecord) -> Self {
         Self {
+            session_id: r.session_id,
             device_id: r.device_id,
             created_at: r.created_at,
             last_used_at: r.last_used_at,
+            is_current: false,
         }
     }
 }
@@ -211,7 +215,7 @@ impl AuthService {
         .await
         .map_err(ApiError::database_error)?;
 
-        let roles = vec!["user".to_string()];
+        let roles = vec![user.role.clone()];
         let token_pair = self
             .jwt_service
             .generate_token_pair(user.id, roles, None)
@@ -266,6 +270,20 @@ impl AuthService {
 
     /// Blacklist the supplied access token (logout).
     pub async fn logout(&self, token: &str) -> Result<(), ApiError> {
+        let claims = self
+            .jwt_service
+            .validate_token(token)
+            .await
+            .map_err(|e| ApiError::unauthorized(format!("Logout failed: {}", e)))?;
+        if claims.token_type != crate::auth::jwt_service::TokenType::Access {
+            return Err(ApiError::unauthorized("Access token required"));
+        }
+        let user_id = Uuid::parse_str(&claims.sub)
+            .map_err(|_| ApiError::unauthorized("Invalid user ID in token"))?;
+        self.jwt_service
+            .revoke_user_session(user_id, &claims.session_id)
+            .await
+            .map_err(|e| ApiError::internal_error(format!("Session revocation failed: {}", e)))?;
         self.jwt_service
             .blacklist_token(token, "User logout")
             .await
@@ -304,6 +322,14 @@ impl AuthService {
 
         info!(user_id = %user_id, count, "All sessions revoked");
         Ok(count)
+    }
+
+    /// Revoke a single session owned by the authenticated user.
+    pub async fn revoke_session(&self, user_id: Uuid, session_id: &str) -> Result<(), ApiError> {
+        self.jwt_service
+            .revoke_user_session(user_id, session_id)
+            .await
+            .map_err(|e| ApiError::not_found(format!("Session not found: {}", e)))
     }
 
     // ── User helpers ─────────────────────────────────────────────────────────

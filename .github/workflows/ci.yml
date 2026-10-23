@@ -33,9 +33,12 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version-file: .nvmrc
         cache: 'npm'
         cache-dependency-path: frontend/package-lock.json
+
+    - name: Install pinned npm
+      run: npm install --global npm@10.9.3
     
     - name: Install dependencies
       run: npm ci
@@ -51,6 +54,17 @@ jobs:
 
     - name: Run tests
       run: npm test -- --ci --forceExit --passWithNoTests
+
+    - name: Enforce Performance Budgets (#48)
+      run: npm run check:perf-budgets
+
+    - name: Upload Playwright report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: playwright-report
+        path: frontend/playwright-report/
+        retention-days: 7
 
   # Smart Contracts CI — Reproducible & blocking builds (#51)
   contracts:
@@ -92,18 +106,48 @@ jobs:
       - name: Verify contract invariants
         run: ./specs/verify.sh
 
-      - name: Build optimized Wasm contracts
-        run: cargo build --locked --workspace --target wasm32-unknown-unknown --release
-
-      - name: Generate release artifact metadata
+      - name: Build optimized Wasm contracts and generate release metadata
         env:
           SOURCE_REVISION: ${{ github.sha }}
         run: |
           ./scripts/build-release-artifacts.sh
 
+      - name: Verify release artifacts
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          output = "target/wasm32-unknown-unknown/release"
+          metadata_path = os.path.join(output, "artifact-metadata.json")
+          with open(metadata_path, encoding="utf-8") as metadata_file:
+              metadata = json.load(metadata_file)
+
+          wasm_files = {
+              name for name in os.listdir(output) if name.endswith(".wasm")
+          }
+          if not wasm_files:
+              raise SystemExit("No Wasm contract artifacts were generated")
+          if metadata.get("source_revision") != os.environ["SOURCE_REVISION"]:
+              raise SystemExit("Artifact metadata does not match the checked-out revision")
+          recorded_files = {artifact["filename"] for artifact in metadata["artifacts"]}
+          if recorded_files != wasm_files:
+              raise SystemExit("Artifact metadata does not describe every generated Wasm file")
+
+          for artifact in metadata["artifacts"]:
+              path = os.path.join(output, artifact["filename"])
+              with open(path, "rb") as artifact_file:
+                  digest = hashlib.sha256(artifact_file.read()).hexdigest()
+              if digest != artifact["sha256"]:
+                  raise SystemExit(f"SHA-256 mismatch for {artifact['filename']}")
+          PY
+
       - name: Upload contract build artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           name: soroban-contract-artifacts
           path: |
@@ -128,6 +172,9 @@ jobs:
         node-version: '20'
         cache: 'npm'
         cache-dependency-path: server/package-lock.json
+
+    - name: Install pinned npm
+      run: npm install --global npm@10.9.3
     
     - name: Install dependencies
       run: npm ci
@@ -140,7 +187,6 @@ jobs:
     
     - name: Build and run tests
       run: npm test
-
   # Backend database migration CI
   backend-migrations:
     name: Backend Migrations
@@ -410,14 +456,6 @@ jobs:
 
     - name: Run microbenchmarks
       run: cargo bench --locked -- --save-baseline current
-
-      - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-report
-          path: frontend/playwright-report/
-          retention-days: 7
 
   # Transactional rollout/rollback gate (#96)
   deploy-gates:

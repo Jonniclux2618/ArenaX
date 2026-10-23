@@ -145,6 +145,7 @@ export function BracketView({ bracketData, currentUserId }: BracketViewProps) {
                         tabIndex={0}
                         role="region"
                         aria-label={`Match: ${match.player1?.username ?? "TBD"} vs ${match.player2?.username ?? (isBye ? "Bye" : "TBD")}. Status: ${match.status}`}
+                        style={{ contentVisibility: "auto", containIntrinsicSize: "0 80px" }}
                         className="rounded-lg border border-border bg-card p-3 shadow-sm hover:border-primary/50 transition-colors"
                       >
                         <div className="flex items-center justify-between pb-2 border-b border-border/50 text-xs">

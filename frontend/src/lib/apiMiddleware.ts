@@ -21,7 +21,6 @@
 
 import {
   RequestMiddlewarePipeline,
-  createAuthMiddleware,
   createRetryMiddleware,
   createCircuitBreakerMiddleware,
   correlationIdMiddleware,
@@ -34,34 +33,7 @@ import {
   type InterceptedRequest,
 } from "./responseInterceptor";
 import type { StandardResponse, PaginatedStandardResponse } from "@/types/response";
-
-// ---------------------------------------------------------------------------
-// Token helpers (mirror api.ts — kept local to avoid circular imports)
-// ---------------------------------------------------------------------------
-
-const TOKEN_KEY = "auth_token";
-const REFRESH_TOKEN_KEY = "auth_refresh_token";
-
-function getStoredToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem(TOKEN_KEY) ?? sessionStorage.getItem(TOKEN_KEY);
-}
-
-function getStoredRefreshToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return (
-    localStorage.getItem(REFRESH_TOKEN_KEY) ??
-    sessionStorage.getItem(REFRESH_TOKEN_KEY)
-  );
-}
-
-function updateStoredTokens(access: string, refresh: string): void {
-  if (typeof window === "undefined") return;
-  const inLocal = !!localStorage.getItem(TOKEN_KEY);
-  const storage = inLocal ? localStorage : sessionStorage;
-  storage.setItem(TOKEN_KEY, access);
-  storage.setItem(REFRESH_TOKEN_KEY, refresh);
-}
+import "@/lib/authStorage";
 
 // ---------------------------------------------------------------------------
 // EnhancedApiClient
@@ -89,7 +61,7 @@ export class EnhancedApiClient {
   private readonly interceptor: ResponseInterceptor;
 
   // Shared in-flight refresh promise — shared with legacy ApiClient via module state
-  private refreshPromise: Promise<string> | null = null;
+  private refreshPromise: Promise<void> | null = null;
   private onAuthFailure?: () => void;
 
   constructor(opts: EnhancedApiClientOptions = {}) {
@@ -108,7 +80,6 @@ export class EnhancedApiClient {
     this.pipeline = new RequestMiddlewarePipeline({
       middlewares: [
         correlationIdMiddleware,
-        createAuthMiddleware(getStoredToken),
         createRetryMiddleware({
           maxAttempts: opts.retry?.maxAttempts ?? 3,
           baseDelayMs: opts.retry?.baseDelayMs ?? 300,
@@ -132,27 +103,19 @@ export class EnhancedApiClient {
   // Core request execution
   // ---------------------------------------------------------------------------
 
-  private async refreshAccessToken(): Promise<string> {
+  private async refreshAccessToken(): Promise<void> {
     if (this.refreshPromise) return this.refreshPromise;
 
     this.refreshPromise = (async () => {
-      const refreshToken = getStoredRefreshToken();
-      if (!refreshToken) throw new Error("No refresh token available");
-
       const url = `${this.baseURL}/auth/refresh`;
       const resp = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ refresh_token: refreshToken }),
+        credentials: "include",
+        body: JSON.stringify({}),
       });
 
       if (!resp.ok) throw new Error("Refresh failed");
-      const data = await resp.json() as {
-        access_token: string;
-        refresh_token: string;
-      };
-      updateStoredTokens(data.access_token, data.refresh_token);
-      return data.access_token;
     })().finally(() => {
       this.refreshPromise = null;
     });

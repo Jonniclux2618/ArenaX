@@ -13,6 +13,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AuthUser, LoginRequest, RegisterRequest } from "@/types";
 import { api } from "@/lib/api";
 import { AuthApiError, REGISTER_ERROR_MAP } from "@/lib/authErrors";
+import { broadcastAuthLogout, subscribeToAuthSession } from "@/lib/authSessionSync";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -301,11 +302,7 @@ export const AuthProvider = ({
 
   // ── Logout ─────────────────────────────────────────────────────────────────
 
-  const logout = useCallback(() => {
-    // Tell the server to blacklist the current token and clear cookies.
-    // Fire-and-forget — clear local state immediately regardless of outcome.
-    api.logout().catch(() => {});
-
+  const clearLocalSession = useCallback(() => {
     cacheUser(null);
     if (typeof window !== "undefined") {
       localStorage.removeItem(PENDING_VERIFICATION_EMAIL_KEY);
@@ -314,6 +311,23 @@ export const AuthProvider = ({
     setExpiresAt(null);
     queryClient.removeQueries({ queryKey: AUTH_PROFILE_QUERY_KEY });
   }, [queryClient]);
+
+  const logout = useCallback(() => {
+    // Tell the server to blacklist the current token and clear cookies.
+    // Fire-and-forget — clear local state immediately regardless of outcome.
+    api.logout().catch(() => {});
+    broadcastAuthLogout();
+    clearLocalSession();
+    router.replace("/login?reason=session_expired");
+  }, [clearLocalSession, router]);
+
+  useEffect(() => {
+    return subscribeToAuthSession((event) => {
+      if (event.type !== "logout") return;
+      clearLocalSession();
+      router.replace("/login?reason=session_expired");
+    });
+  }, [clearLocalSession, router]);
 
   // ── Token refresh ──────────────────────────────────────────────────────────
 

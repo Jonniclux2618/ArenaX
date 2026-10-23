@@ -28,6 +28,7 @@ import {
 } from "@/lib/responseInterceptor";
 import type { StandardResponse, PaginatedStandardResponse } from "@/types/response";
 import { pinnedFetch } from "@/api/certificatePinning";
+import { clearLegacyAuthTokens } from "@/lib/authStorage";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -117,30 +118,8 @@ export function clearMetrics(): void {
   _metrics.length = 0;
 }
 
-// ─── Token storage helpers ────────────────────────────────────────────────────
-
-function getStoredToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token");
-}
-
-function getStoredRefreshToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("refresh_token") ?? sessionStorage.getItem("refresh_token");
-}
-
-function storeTokens(access: string, refresh?: string): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem("auth_token", access);
-  if (refresh) localStorage.setItem("refresh_token", refresh);
-}
-
 function clearTokens(): void {
-  if (typeof window === "undefined") return;
-  ["auth_token", "refresh_token"].forEach((k) => {
-    localStorage.removeItem(k);
-    sessionStorage.removeItem(k);
-  });
+  clearLegacyAuthTokens();
 }
 
 // ─── Retry helpers ────────────────────────────────────────────────────────────
@@ -188,7 +167,7 @@ export class EnhancedApiClient {
   /** In-flight GET dedupe cache: url → Promise */
   private readonly _inFlight = new Map<string, Promise<unknown>>();
   /** Track whether a token refresh is in progress */
-  private _refreshPromise: Promise<string | null> | null = null;
+  private _refreshPromise: Promise<boolean> | null = null;
 
   constructor(config: ClientConfig) {
     this.baseURL = config.baseURL;
@@ -200,31 +179,24 @@ export class EnhancedApiClient {
 
   // ─── Token refresh ──────────────────────────────────────────────────────────
 
-  private async refreshAccessToken(): Promise<string | null> {
+  private async refreshAccessToken(): Promise<boolean> {
     if (this._refreshPromise) return this._refreshPromise;
 
     this._refreshPromise = (async () => {
-      const refreshToken = getStoredRefreshToken();
-      if (!refreshToken) return null;
       try {
         const res = await pinnedFetch(`${this.baseURL}/auth/refresh`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refreshToken }),
+          credentials: "include",
+          body: JSON.stringify({}),
         });
         if (!res.ok) {
           clearTokens();
-          return null;
+          return false;
         }
-        const json = await res.json() as { accessToken?: string; tokens?: { accessToken: string; refreshToken?: string } };
-        const accessToken =
-          json?.accessToken ??
-          json?.tokens?.accessToken ??
-          null;
-        if (accessToken) storeTokens(accessToken, json?.tokens?.refreshToken);
-        return accessToken;
+        return true;
       } catch {
-        return null;
+        return false;
       } finally {
         this._refreshPromise = null;
       }
@@ -250,22 +222,19 @@ export class EnhancedApiClient {
     let success = false;
 
     try {
-      const response = await pinnedFetch(url, { ...init, signal: controller.signal });
+      const response = await pinnedFetch(url, {
+        ...init,
+        credentials: "include",
+        signal: controller.signal,
+      });
       clearTimeout(timeoutId);
       status = response.status;
 
       // 401 → attempt token refresh once
       if (status === 401 && attempt === 0) {
-        const newToken = await this.refreshAccessToken();
-        if (newToken) {
-          const retryInit: RequestInit = {
-            ...init,
-            headers: {
-              ...(init.headers as Record<string, string>),
-              Authorization: `Bearer ${newToken}`,
-            },
-          };
-          return this.fetchWithRetry<T>(url, retryInit, options, attempt + 1, requestStartTime);
+        const refreshed = await this.refreshAccessToken();
+        if (refreshed) {
+          return this.fetchWithRetry<T>(url, init, options, attempt + 1, requestStartTime);
         }
         // Refresh failed — clear tokens and throw auth error
         clearTokens();
@@ -397,17 +366,14 @@ export class EnhancedApiClient {
   async request<T>(endpoint: string, options: RequestOptions = {}): Promise<T> {
     const { body, noRetry, timeoutMs: _t, noAnalytics, params, skipInterceptor, ...fetchOpts } = options;
     const url = buildURL(this.baseURL, endpoint, params);
-    const token = getStoredToken();
-
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(fetchOpts.headers as Record<string, string> | undefined),
     };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-
     const init: RequestInit = {
       ...fetchOpts,
       headers,
+      credentials: "include",
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     };
 
@@ -465,10 +431,6 @@ export class EnhancedApiClient {
 
   // ─── Token management (public for AuthProvider) ─────────────────────────────
 
-  setTokens(access: string, refresh?: string): void {
-    storeTokens(access, refresh);
-  }
-
   clearAuth(): void {
     clearTokens();
   }
@@ -482,17 +444,15 @@ export class EnhancedApiClient {
    */
   async getStandard<T>(endpoint: string, options?: RequestOptions): Promise<StandardResponse<T>> {
     const url = buildURL(this.baseURL, endpoint, options?.params);
-    const token = getStoredToken();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(options?.headers as Record<string, string> | undefined),
     };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-
     const startTime = performance.now();
     const response = await pinnedFetch(url, {
       method: "GET",
       headers,
+      credentials: "include",
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 
@@ -522,17 +482,15 @@ export class EnhancedApiClient {
     options?: RequestOptions,
   ): Promise<PaginatedStandardResponse<T>> {
     const url = buildURL(this.baseURL, endpoint, options?.params);
-    const token = getStoredToken();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(options?.headers as Record<string, string> | undefined),
     };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-
     const startTime = performance.now();
     const response = await pinnedFetch(url, {
       method: "GET",
       headers,
+      credentials: "include",
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 

@@ -43,13 +43,32 @@ pub struct DatabaseConfig {
 }
 
 /// Read a `u64` from the environment, falling back when unset or unparseable.
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+fn env_required(name: &str) -> Result<String, anyhow::Error> {
+    env::var(name).map_err(|_| anyhow::anyhow!("{name} is required; set it in the service environment"))
 }
 
-/// Read a `u32` from the environment, falling back when unset or unparseable.
-fn env_u32(key: &str, default: u32) -> u32 {
-    env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+/// Read an optional integer, using the default only when the variable is absent.
+fn env_u64(key: &str, default: u64) -> Result<u64, anyhow::Error> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{key} must be a non-negative integer")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(_) => anyhow::bail!("{key} must contain valid text"),
+    }
+}
+
+/// Read an optional integer, using the default only when the variable is absent.
+fn env_u32(key: &str, default: u32) -> Result<u32, anyhow::Error> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{key} must be a non-negative integer")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(_) => anyhow::bail!("{key} must contain valid text"),
+    }
 }
 
 // ── Secret hardening (Issue #1161) ───────────────────────────────────────────
@@ -108,10 +127,21 @@ pub fn require_strong_secret(name: &str, value: &str) -> Result<(), anyhow::Erro
 /// Read a required secret from the environment and enforce [`MIN_SECRET_LENGTH`]
 /// plus the placeholder deny-list. A missing variable is reported by name.
 fn env_required_secret(name: &str) -> Result<String, anyhow::Error> {
-    let value = env::var(name)
-        .map_err(|_| anyhow::anyhow!("{name} environment variable is not set"))?;
-    require_strong_secret(name, &value)?;
+    let value = env::var(name).ok();
+    validate_required_secret(name, value.as_deref())?;
+    let value = value.ok_or_else(|| anyhow::anyhow!("{name} environment variable is not set"))?;
     Ok(value)
+}
+
+fn env_optional_secret(name: &str) -> Result<Option<String>, anyhow::Error> {
+    let value = env::var(name).ok().filter(|value| !value.trim().is_empty());
+    validate_optional_secret(name, value.as_deref())?;
+    Ok(value)
+}
+
+fn validate_required_secret(name: &str, value: Option<&str>) -> Result<(), anyhow::Error> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("{name} environment variable is not set"))?;
+    require_strong_secret(name, value)
 }
 
 /// Validate a secret that is optional to configure: when present it must meet
@@ -119,6 +149,39 @@ fn env_required_secret(name: &str) -> Result<String, anyhow::Error> {
 fn validate_optional_secret(name: &str, value: Option<&str>) -> Result<(), anyhow::Error> {
     if let Some(v) = value {
         require_strong_secret(name, v)?;
+    }
+    Ok(())
+}
+
+fn validate_url(name: &str, value: &str, allowed_schemes: &[&str]) -> Result<(), anyhow::Error> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("{name} must be a valid URL"))?;
+    if !allowed_schemes.contains(&parsed.scheme()) || parsed.host_str().is_none() {
+        anyhow::bail!("{name} must use one of these URL schemes: {}", allowed_schemes.join(", "));
+    }
+    Ok(())
+}
+
+fn require_https_in_production(name: &str, value: &str, production: bool) -> Result<(), anyhow::Error> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("{name} must be a valid URL"))?;
+    if production && parsed.scheme() != "https" {
+        anyhow::bail!("{name} must use HTTPS when APP_ENV is production");
+    }
+    Ok(())
+}
+
+fn validate_app_environment(value: &str) -> Result<bool, anyhow::Error> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "development" | "preview" => Ok(false),
+        "production" => Ok(true),
+        _ => anyhow::bail!("APP_ENV must be development, preview, or production"),
+    }
+}
+
+fn reject_test_credential(name: &str, value: &str, production: bool, test_prefix: &str) -> Result<(), anyhow::Error> {
+    if production && value.to_ascii_lowercase().starts_with(&test_prefix.to_ascii_lowercase()) {
+        anyhow::bail!("{name} contains test-environment credentials; configure a production credential");
     }
     Ok(())
 }
@@ -157,8 +220,8 @@ pub struct StorageConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PaymentsConfig {
-    pub paystack_secret: String,
-    pub flutterwave_secret: String,
+    pub paystack_secret: Option<String>,
+    pub flutterwave_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -283,19 +346,47 @@ impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
 
-        let database_url = env::var("DATABASE_URL")?;
+        let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+        let production = validate_app_environment(&app_env)?;
+        let database_url = env_required("DATABASE_URL")?;
+        validate_url("DATABASE_URL", &database_url, &["postgres", "postgresql"])?;
         let migration_mode = env::var("BACKEND_MIGRATION_MODE")
             .map(|value| MigrationMode::from_env_value(&value))
             .unwrap_or(Ok(MigrationMode::Run))?;
-        let redis_url = env::var("REDIS_URL")?;
-        let s3_endpoint = env::var("S3_ENDPOINT")?;
-        let s3_access_key = env::var("S3_ACCESS_KEY")?;
+        let redis_url = env_required("REDIS_URL")?;
+        validate_url("REDIS_URL", &redis_url, &["redis", "rediss"])?;
+        let s3_endpoint = env_required("S3_ENDPOINT")?;
+        validate_url("S3_ENDPOINT", &s3_endpoint, &["http", "https"])?;
+        require_https_in_production("S3_ENDPOINT", &s3_endpoint, production)?;
+        let s3_access_key = env_required("S3_ACCESS_KEY")?;
         // Secret-bearing variables are validated for length / placeholder values
         // so a deployment can never boot on a publicly-known default (#1161).
         let s3_secret_key = env_required_secret("S3_SECRET_KEY")?;
-        let s3_bucket = env::var("S3_BUCKET")?;
-        let paystack_secret = env_required_secret("PAYSTACK_SECRET")?;
-        let flutterwave_secret = env_required_secret("FLUTTERWAVE_SECRET")?;
+        let s3_bucket = env_required("S3_BUCKET")?;
+        let payment_provider = env::var("PAYMENT_PROVIDER").unwrap_or_else(|_| "paystack".into());
+        let (paystack_secret, flutterwave_secret) =
+            match payment_provider.trim().to_ascii_lowercase().as_str() {
+                "paystack" => (
+                    Some(env_required_secret("PAYSTACK_SECRET")?),
+                    env_optional_secret("FLUTTERWAVE_SECRET")?,
+                ),
+                "flutterwave" => (
+                    env_optional_secret("PAYSTACK_SECRET")?,
+                    Some(env_required_secret("FLUTTERWAVE_SECRET")?),
+                ),
+                _ => anyhow::bail!("PAYMENT_PROVIDER must be `paystack` or `flutterwave`"),
+            };
+        if let Some(secret) = paystack_secret.as_deref() {
+            reject_test_credential("PAYSTACK_SECRET", secret, production, "sk_test_")?;
+        }
+        if let Some(secret) = flutterwave_secret.as_deref() {
+            reject_test_credential(
+                "FLUTTERWAVE_SECRET",
+                secret,
+                production,
+                "FLWSECK_TEST-",
+            )?;
+        }
         let jwt_secret = env_required_secret("JWT_SECRET")?;
         // An empty value (as shipped in env.example) means "not configured",
         // not "configured to the empty string".
@@ -303,23 +394,34 @@ impl Config {
             .ok()
             .filter(|v| !v.trim().is_empty());
         validate_optional_secret("JWT_REFRESH_SECRET", jwt_refresh_secret.as_deref())?;
-        let jwt_expires_in = env::var("JWT_EXPIRES_IN")?;
+        let jwt_expires_in = env_required("JWT_EXPIRES_IN")?;
         let jwt_refresh_expires_in =
             env::var("JWT_REFRESH_EXPIRES_IN").unwrap_or_else(|_| "7d".to_string());
-        let stellar_network_url = env::var("STELLAR_NETWORK_URL")?;
+        let stellar_network_url = env_required("STELLAR_NETWORK_URL")?;
+        validate_url("STELLAR_NETWORK_URL", &stellar_network_url, &["http", "https"])?;
+        require_https_in_production("STELLAR_NETWORK_URL", &stellar_network_url, production)?;
+        if production && stellar_network_url.to_ascii_lowercase().contains("testnet") {
+            anyhow::bail!("STELLAR_NETWORK_URL points to testnet while APP_ENV is production");
+        }
         let stellar_admin_secret = env_required_secret("STELLAR_ADMIN_SECRET")?;
-        let soroban_contract_prize = env::var("SOROBAN_CONTRACT_PRIZE")?;
-        let soroban_contract_reputation = env::var("SOROBAN_CONTRACT_REPUTATION")?;
-        let soroban_contract_arenax_token = env::var("SOROBAN_CONTRACT_ARENAX_TOKEN")?;
+        let soroban_contract_prize = env_required("SOROBAN_CONTRACT_PRIZE")?;
+        let soroban_contract_reputation = env_required("SOROBAN_CONTRACT_REPUTATION")?;
+        let soroban_contract_arenax_token = env_required("SOROBAN_CONTRACT_ARENAX_TOKEN")?;
         // Falls back to the prize contract so existing deployments don't break.
         let soroban_contract_match = env::var("SOROBAN_CONTRACT_MATCH")
             .unwrap_or_else(|_| soroban_contract_prize.clone());
-        let ai_model_path = env::var("AI_MODEL_PATH")?;
-        let port: u16 = env::var("PORT")?.parse()?;
-        let host = env::var("HOST")?;
+        let ai_model_path = env_required("AI_MODEL_PATH")?;
+        let port: u16 = env_required("PORT")?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("PORT must be a valid port number"))?;
+        let host = env_required("HOST")?;
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-        let rate_limit_requests: u32 = env::var("RATE_LIMIT_REQUESTS")?.parse()?;
-        let rate_limit_window: u64 = env::var("RATE_LIMIT_WINDOW")?.parse()?;
+        let rate_limit_requests: u32 = env_required("RATE_LIMIT_REQUESTS")?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("RATE_LIMIT_REQUESTS must be a positive integer"))?;
+        let rate_limit_window: u64 = env_required("RATE_LIMIT_WINDOW")?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("RATE_LIMIT_WINDOW must be a positive integer"))?;
         let rate_limit_headers = env::var("RATE_LIMIT_HEADERS")
             .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
             .unwrap_or(true);
@@ -339,13 +441,13 @@ impl Config {
             database: DatabaseConfig {
                 url: database_url,
                 migration_mode,
-                max_connections: env_u32("DATABASE_MAX_CONNECTIONS", 20),
-                acquire_timeout_secs: env_u64("DATABASE_ACQUIRE_TIMEOUT_SECS", 2),
-                health_check_interval_secs: env_u64("DATABASE_HEALTH_INTERVAL_SECS", 10),
-                circuit_failure_threshold: env_u32("DATABASE_CIRCUIT_FAILURES", 3),
-                circuit_open_secs: env_u64("DATABASE_CIRCUIT_OPEN_SECS", 30),
-                statement_timeout_ms: env_u64("DATABASE_STATEMENT_TIMEOUT_MS", 5000),
-                slow_query_threshold_ms: env_u64("DATABASE_SLOW_QUERY_THRESHOLD_MS", 200),
+                max_connections: env_u32("DATABASE_MAX_CONNECTIONS", 20)?,
+                acquire_timeout_secs: env_u64("DATABASE_ACQUIRE_TIMEOUT_SECS", 2)?,
+                health_check_interval_secs: env_u64("DATABASE_HEALTH_INTERVAL_SECS", 10)?,
+                circuit_failure_threshold: env_u32("DATABASE_CIRCUIT_FAILURES", 3)?,
+                circuit_open_secs: env_u64("DATABASE_CIRCUIT_OPEN_SECS", 30)?,
+                statement_timeout_ms: env_u64("DATABASE_STATEMENT_TIMEOUT_MS", 5000)?,
+                slow_query_threshold_ms: env_u64("DATABASE_SLOW_QUERY_THRESHOLD_MS", 200)?,
             },
             redis: RedisConfig { url: redis_url },
             storage: StorageConfig {
@@ -461,5 +563,79 @@ mod secret_validation_tests {
             validate_optional_secret("JWT_REFRESH_SECRET", Some(&strong_secret())).is_ok()
         );
         assert!(validate_optional_secret("JWT_REFRESH_SECRET", Some("weak")).is_err());
+    }
+
+    #[test]
+    fn required_secret_validation_covers_missing_malformed_and_valid_values() {
+        let strong = strong_secret();
+        let cases = [
+            ("missing", None, false),
+            ("empty", Some("  "), false),
+            ("placeholder", Some("supersecretkey"), false),
+            ("too short", Some("short"), false),
+            ("valid", Some(strong.as_str()), true),
+        ];
+
+        for (case, value, expected) in cases {
+            assert_eq!(
+                validate_required_secret("JWT_SECRET", value).is_ok(),
+                expected,
+                "unexpected validation result for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_is_scheme_aware() {
+        let cases = [
+            ("postgres://user:pass@localhost/db", &["postgres", "postgresql"][..], true),
+            ("redis://localhost:6379", &["redis", "rediss"][..], true),
+            ("https://horizon.stellar.org", &["http", "https"][..], true),
+            ("https://example.com", &["postgres", "postgresql"][..], false),
+            ("not a URL", &["http", "https"][..], false),
+        ];
+
+        for (value, schemes, expected) in cases {
+            assert_eq!(
+                validate_url("ENDPOINT", value, schemes).is_ok(),
+                expected,
+                "unexpected validation result for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_rejects_test_credentials_but_nonproduction_allows_them() {
+        let cases = [
+            ("sk_test_key", true, false),
+            ("sk_live_key", true, true),
+            ("sk_test_key", false, true),
+        ];
+
+        for (value, production, expected) in cases {
+            assert_eq!(
+                reject_test_credential("PAYSTACK_SECRET", value, production, "sk_test_")
+                    .is_ok(),
+                expected,
+                "unexpected validation result for production={production}, value={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_urls_require_https() {
+        let cases = [
+            ("https://storage.example.com", true, true),
+            ("http://localhost:9000", false, true),
+            ("http://storage.example.com", true, false),
+        ];
+
+        for (value, production, expected) in cases {
+            assert_eq!(
+                require_https_in_production("S3_ENDPOINT", value, production).is_ok(),
+                expected,
+                "unexpected validation result for production={production}, value={value}"
+            );
+        }
     }
 }

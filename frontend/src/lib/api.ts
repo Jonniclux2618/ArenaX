@@ -49,6 +49,7 @@ import {
   SocialUser,
 } from "../types/social";
 import { AuthApiError } from "./authErrors";
+import { coordinateTokenRefresh } from "./authSessionSync";
 import { API_BASE } from "./constants";
 import { pinnedFetch } from "../api/certificatePinning";
 
@@ -96,21 +97,23 @@ class ApiClient {
 
     this.isRefreshing = true;
     this.refreshPromise = (async () => {
-      const url = `${this.baseURL}/auth/refresh`;
-      const response = await pinnedFetch(url, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        // No body needed — the refresh token arrives as a cookie.
-        body: JSON.stringify({}),
+      return coordinateTokenRefresh(async () => {
+        const url = `${this.baseURL}/auth/refresh`;
+        const response = await pinnedFetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          // No body needed — the refresh token arrives as a cookie.
+          body: JSON.stringify({}),
+        });
+
+        if (!response.ok) {
+          throw new Error("Refresh failed");
+        }
+
+        const data = await response.json() as { expires_in: number };
+        return data.expires_in ?? 900;
       });
-
-      if (!response.ok) {
-        throw new Error("Refresh failed");
-      }
-
-      const data = await response.json() as { expires_in: number };
-      return data.expires_in ?? 900;
     })().finally(() => {
       this.isRefreshing = false;
       this.refreshPromise = null;
@@ -184,14 +187,25 @@ class ApiClient {
     });
     const json = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const message =
-        (json as { error?: { message?: string } })?.error?.message ??
-        (json as { message?: string })?.message ??
+      const body = json as {
+        error?: string | { message?: string; code?: string | number };
+        message?: string;
+        code?: string | number;
+      };
+      const nestedError = typeof body.error === "object" ? body.error : null;
+      const responseCode = nestedError?.code ?? body.code;
+      const code = responseCode == null ? "UNKNOWN" : String(responseCode);
+      const responseMessage =
+        nestedError?.message ??
+        (typeof body.error === "string" ? body.error : undefined) ??
+        body.message ??
         `HTTP ${response.status}`;
-      const code =
-        (json as { error?: { code?: string } })?.error?.code ??
-        (json as { code?: string })?.code ??
-        "UNKNOWN";
+      const message =
+        endpoint === "/auth/login" && response.status === 401
+          ? "Invalid email or password"
+          : endpoint === "/auth/register" && response.status === 409
+            ? "Unable to complete registration. Check your details and try again."
+            : responseMessage;
       throw new AuthApiError(message, code);
     }
     return json as T;

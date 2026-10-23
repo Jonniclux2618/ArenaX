@@ -8,23 +8,80 @@ use std::collections::HashMap;
 use tokio::time::{interval, timeout, Duration};
 use uuid::Uuid;
 
+// ─────────────────────────────────────────────────────────────────────────────
 // Redis key patterns
+// ─────────────────────────────────────────────────────────────────────────────
 const QUEUE_KEY_PREFIX: &str = "queue";
 const QUEUE_ENTRY_PREFIX: &str = "queue_entry";
 /// Sorted-set key that tracks all active (game, game_mode) pairs so the
 /// background worker never has to query the database on every tick.
 const ACTIVE_MODES_KEY: &str = "matchmaking:active_modes";
+/// Set key tracking players who currently hold an active match reservation.
+/// An entry is inserted when a match is created and removed when the match
+/// leaves the PENDING state (or the reservation expires).  The presence of a
+/// player's UUID in this set acts as a duplicate-pairing guard: the matcher
+/// skips any player who is already reserved.
+///
+/// Key: `matchmaking:reserved`
+/// Members: `<user_id>`
+/// TTL on each member: managed via a separate per-player key with an EX flag.
+const ACTIVE_RESERVATIONS_SET: &str = "matchmaking:reserved";
+/// Per-player reservation sentinel.  Existence means the player has an active
+/// match reservation and must not be paired again.
+/// Key pattern: `matchmaking:reservation:<user_id>`
+/// TTL: `RESERVATION_TTL_SECS` seconds.
+const RESERVATION_KEY_PREFIX: &str = "matchmaking:reservation";
+/// How long (seconds) a match reservation blocks a player from re-entering
+/// the queue or being selected as a candidate.  Long enough for the match
+/// service to advance the match to STARTED; short enough that a crash
+/// does not orphan the player forever.
+const RESERVATION_TTL_SECS: u64 = 300; // 5 minutes
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rating-band and expansion policy (documented)
+// ─────────────────────────────────────────────────────────────────────────────
+/// Initial search radius around a player's rating.
+///
+/// Players whose ratings differ by at most `ELO_BUCKET_SIZE` are placed in the
+/// same bucket and are always eligible to be matched immediately.
 const ELO_BUCKET_SIZE: i32 = 100;
+/// Hard ceiling on the rating gap that is ever permitted in a ranked match.
+///
+/// The expansion policy below widens the search window in discrete steps as
+/// wait time grows, but it is capped at this value so that players at extreme
+/// ends of the ladder are never paired regardless of how long they wait.
 const MAX_ELO_GAP: i32 = 500;
-const MATCHMAKER_INTERVAL: Duration = Duration::from_secs(5);
-/// Hard deadline for a single matchmaking processing cycle.
-const PROCESS_TIMEOUT: Duration = Duration::from_millis(900);
+/// Expansion schedule — each entry is a (wait_threshold, new_max_gap) pair.
+///
+/// The algorithm doubles the current window once per threshold that is
+/// exceeded, subject to `MAX_ELO_GAP`.  The sequence is intentionally sparse
+/// at the start (tight fairness) and expands faster at the tail (reduce
+/// starvation):
+///
+/// | Elapsed wait | Max Elo gap |
+/// |---|---|
+/// | 0 – 29 s     | 100 (1 × bucket) |
+/// | 30 – 59 s    | 200 (2 × bucket) |
+/// | 60 – 119 s   | 400 (4 × bucket) |
+/// | 120 – 299 s  | 500 (capped)     |
+/// | ≥ 300 s      | 500 (capped)     |
+///
+/// A player who has waited ≥ 5 minutes (`MAX_WAIT_SECS`) is removed from the
+/// queue by the expiry mechanism rather than being given an unbounded gap.
 const EXPANSION_INTERVALS: &[Duration] = &[
     Duration::from_secs(30),
     Duration::from_secs(60),
     Duration::from_secs(120),
     Duration::from_secs(300),
 ];
+/// Maximum time a player is allowed to remain in the queue before the entry
+/// expires.  After this the client must re-join and will be given a fresh
+/// expiry TTL.
+const MAX_WAIT_SECS: u64 = 600; // 10 minutes
+
+const MATCHMAKER_INTERVAL: Duration = Duration::from_secs(5);
+/// Hard deadline for a single matchmaking processing cycle.
+const PROCESS_TIMEOUT: Duration = Duration::from_millis(900);
 
 pub use crate::models::matchmaker::{MatchCandidate, QueueEntry};
 
@@ -142,7 +199,10 @@ impl MatchmakerService {
             return Ok(());
         }
 
-        // Sort by wait time (longest waiting first) so they get priority.
+        // Sort by join time (oldest first) so long-waiting players get
+        // priority — this is the primary fairness tie-break.  When two
+        // candidates have identical match quality the one who waited longer
+        // is preferred (see `find_best_match_for_player`).
         let mut sorted_entries = queue_entries;
         sorted_entries.sort_by(|a, b| a.joined_at.cmp(&b.joined_at));
 
@@ -154,8 +214,21 @@ impl MatchmakerService {
                 continue;
             }
 
+            // Skip any player who already has an active match reservation.
+            // This is the duplicate-pairing guard: a player can only appear
+            // in one pending match at a time.
+            let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, entry.user_id);
+            let reserved: bool = conn
+                .exists(&reservation_key)
+                .await
+                .unwrap_or(false);
+            if reserved {
+                processed_players.insert(entry.user_id);
+                continue;
+            }
+
             if let Some(candidate) =
-                find_best_match_for_player(entry, &sorted_entries[i..], &processed_players)
+                find_best_match_for_player(entry, &sorted_entries[i..], &processed_players, conn).await
             {
                 processed_players.insert(candidate.player1.user_id);
                 processed_players.insert(candidate.player2.user_id);
@@ -164,6 +237,25 @@ impl MatchmakerService {
         }
 
         for candidate in matches_found {
+            // Set reservations for both players *before* writing to the DB so
+            // that a concurrent matchmaker tick cannot select either player.
+            let res_key1 = format!("{}:{}", RESERVATION_KEY_PREFIX, candidate.player1.user_id);
+            let res_key2 = format!("{}:{}", RESERVATION_KEY_PREFIX, candidate.player2.user_id);
+
+            let mut reserve_pipe = redis::pipe();
+            reserve_pipe
+                .cmd("SET").arg(&res_key1).arg(1u8).arg("EX").arg(RESERVATION_TTL_SECS).ignore()
+                .cmd("SADD").arg(ACTIVE_RESERVATIONS_SET).arg(candidate.player1.user_id.to_string()).ignore()
+                .cmd("SET").arg(&res_key2).arg(1u8).arg("EX").arg(RESERVATION_TTL_SECS).ignore()
+                .cmd("SADD").arg(ACTIVE_RESERVATIONS_SET).arg(candidate.player2.user_id.to_string()).ignore();
+
+            reserve_pipe.query_async::<()>(conn).await.map_err(|e| {
+                ApiError::internal_error(&format!("Redis reservation pipeline error: {}", e))
+            })?;
+
+            // Now write the match to the DB.  If this fails the reservations
+            // will expire naturally after RESERVATION_TTL_SECS and both
+            // players will be able to re-queue.
             self.create_match_from_candidate(&candidate).await?;
             self.record_candidate_metrics(conn, &candidate).await?;
             self.remove_from_queue(conn, &candidate.player1.user_id, game, game_mode).await?;
@@ -368,6 +460,18 @@ impl MatchmakerService {
     }
 
     /// Add a player to the matchmaking queue.
+    ///
+    /// # Invariants enforced
+    ///
+    /// 1. **No double-queue**: if the player already has a `queue_entry` key in
+    ///    Redis the operation is idempotent — the existing entry is returned
+    ///    without creating a duplicate.
+    /// 2. **No duplicate pairing**: if the player currently holds an active
+    ///    match reservation (i.e. a `matchmaking:reservation:<user_id>` key
+    ///    exists) the join request is rejected with a conflict error.
+    /// 3. **Atomicity**: the SET + ZADD + SADD are issued in a single pipelined
+    ///    round-trip so a crash between the steps cannot leave the queue in a
+    ///    half-inserted state.
     pub async fn add_to_queue(
         &self,
         user_id: Uuid,
@@ -377,6 +481,32 @@ impl MatchmakerService {
     ) -> Result<(), ApiError> {
         let mut conn = self.redis.clone();
         let now = Utc::now();
+
+        // ── Guard 1: reject if the player already has an active reservation ──
+        let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, user_id);
+        let has_reservation: bool = conn
+            .exists(&reservation_key)
+            .await
+            .map_err(|e| ApiError::internal_error(&format!("Redis EXISTS error: {}", e)))?;
+
+        if has_reservation {
+            return Err(ApiError::conflict(
+                "Player already has an active match reservation and cannot re-join the queue",
+            ));
+        }
+
+        // ── Guard 2: idempotent join — silently succeed if already queued ────
+        let entry_key = format!("{}:{}:{}:{}", QUEUE_ENTRY_PREFIX, game, game_mode, user_id);
+        let already_in_queue: bool = conn
+            .exists(&entry_key)
+            .await
+            .map_err(|e| ApiError::internal_error(&format!("Redis EXISTS error: {}", e)))?;
+
+        if already_in_queue {
+            // Player is already waiting; this is not an error.
+            return Ok(());
+        }
+
         let (min_elo, max_elo) = self.calculate_initial_elo_range(current_elo);
 
         let entry = QueueEntry {
@@ -390,7 +520,6 @@ impl MatchmakerService {
             wait_time_multiplier: 1.0,
         };
 
-        let entry_key = format!("{}:{}:{}:{}", QUEUE_ENTRY_PREFIX, game, game_mode, user_id);
         let entry_json = serde_json::to_string(&entry)
             .map_err(|e| ApiError::internal_error(&format!("JSON serialization error: {}", e)))?;
 
@@ -398,13 +527,18 @@ impl MatchmakerService {
         let queue_key = format!("{}:{}:{}:{}", QUEUE_KEY_PREFIX, game, game_mode, elo_bucket);
         let active_mode_member = format!("{}:{}", game, game_mode);
 
-        // Pipeline: SET entry + ZADD ELO bucket + SADD active-modes — 1 round-trip.
+        // ── Atomic pipeline: SET entry + ZADD ELO bucket + SADD active-modes ─
+        // All three writes happen in a single round-trip.  Using NX on the SET
+        // prevents a concurrent `add_to_queue` from overwriting an entry that
+        // was written between the EXISTS check and this pipeline (last-writer
+        // would otherwise win silently).
         let mut pipe = redis::pipe();
         pipe.cmd("SET")
             .arg(&entry_key)
             .arg(&entry_json)
             .arg("EX")
-            .arg(600u64)
+            .arg(MAX_WAIT_SECS)   // entry expires with the queue TTL
+            .arg("NX")            // do not overwrite if already present
             .ignore()
             .cmd("ZADD")
             .arg(&queue_key)
@@ -420,10 +554,23 @@ impl MatchmakerService {
             .await
             .map_err(|e| ApiError::internal_error(&format!("Redis pipeline error: {}", e)))?;
 
+        tracing::debug!(
+            user_id = %user_id,
+            game = %game,
+            game_mode = %game_mode,
+            current_elo,
+            "Player added to matchmaking queue"
+        );
+
         Ok(())
     }
 
     /// Remove a player from the matchmaking queue.
+    ///
+    /// Also removes the player from the active-modes reservation set so they
+    /// can re-join.  The per-player reservation key (if any) is NOT removed
+    /// here; it is managed by `create_match_from_candidate` and expires
+    /// naturally after `RESERVATION_TTL_SECS`.
     pub async fn remove_from_queue(
         &self,
         conn: &mut RedisConn,
@@ -449,6 +596,65 @@ impl MatchmakerService {
             .map_err(|e| ApiError::internal_error(&format!("Redis pipeline error: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Write a match reservation for the given player.
+    ///
+    /// The reservation prevents the player from being selected as a candidate
+    /// in subsequent matchmaker ticks while their match is being created in
+    /// the database.  It also prevents them from re-joining the queue before
+    /// the match is started.
+    ///
+    /// The key expires after `RESERVATION_TTL_SECS` as a safety valve against
+    /// service crashes leaving players permanently locked out.
+    pub async fn set_match_reservation(&self, user_id: &Uuid) -> Result<(), ApiError> {
+        let mut conn = self.redis.clone();
+        let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, user_id);
+
+        let mut pipe = redis::pipe();
+        pipe.cmd("SET")
+            .arg(&reservation_key)
+            .arg(1u8)
+            .arg("EX")
+            .arg(RESERVATION_TTL_SECS)
+            .ignore()
+            .cmd("SADD")
+            .arg(ACTIVE_RESERVATIONS_SET)
+            .arg(user_id.to_string())
+            .ignore();
+
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| ApiError::internal_error(&format!("Redis reservation set error: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Release a match reservation for the given player (call on match
+    /// cancellation or expiry so the player can re-queue).
+    pub async fn release_match_reservation(&self, user_id: &Uuid) -> Result<(), ApiError> {
+        let mut conn = self.redis.clone();
+        let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, user_id);
+
+        let mut pipe = redis::pipe();
+        pipe.cmd("DEL").arg(&reservation_key).ignore()
+            .cmd("SREM").arg(ACTIVE_RESERVATIONS_SET).arg(user_id.to_string()).ignore();
+
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| ApiError::internal_error(&format!("Redis reservation release error: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Return `true` if the player currently holds an active match reservation.
+    pub async fn has_active_reservation(&self, user_id: &Uuid) -> Result<bool, ApiError> {
+        let mut conn = self.redis.clone();
+        let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, user_id);
+
+        conn.exists(&reservation_key)
+            .await
+            .map_err(|e| ApiError::internal_error(&format!("Redis EXISTS error: {}", e)))
     }
 
     /// Return all active (game, game_mode) pairs tracked in Redis.
@@ -598,14 +804,27 @@ impl MatchmakerService {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Find the best opponent for `player` from `candidates`.
-/// This is pure CPU work — no I/O — so it does not need to be async.
-fn find_best_match_for_player(
+///
+/// # Fairness tie-break rules (in priority order)
+///
+/// 1. **Eligibility**: the candidate must not already be processed in this
+///    tick and must not hold an active match reservation in Redis.
+/// 2. **Rating gap**: the gap must be within the player's current expanded
+///    window (see `calculate_max_elo_gap`).
+/// 3. **Match quality score**: higher is better (blend of rating closeness
+///    and combined wait time — see `calculate_match_quality`).
+/// 4. **Join time of candidate**: when two candidates have identical quality
+///    scores the one who has been waiting longer wins.  This prevents newer
+///    players from repeatedly cutting ahead of long-waiters.
+async fn find_best_match_for_player(
     player: &QueueEntry,
     candidates: &[QueueEntry],
     processed_players: &std::collections::HashSet<Uuid>,
+    conn: &mut RedisConn,
 ) -> Option<MatchCandidate> {
     let mut best_candidate: Option<MatchCandidate> = None;
     let mut best_score = -1.0_f64;
+    let mut best_wait = 0i64; // join time of the best candidate found so far (epoch secs)
 
     let max_gap = calculate_max_elo_gap(player);
 
@@ -616,14 +835,28 @@ fn find_best_match_for_player(
             continue;
         }
 
+        // Duplicate-pairing guard: skip candidates with active reservations.
+        let reservation_key = format!("{}:{}", RESERVATION_KEY_PREFIX, candidate.user_id);
+        let reserved: bool = conn.exists(&reservation_key).await.unwrap_or(false);
+        if reserved {
+            continue;
+        }
+
         let elo_gap = (player.current_elo - candidate.current_elo).abs();
         if elo_gap > max_gap {
             continue;
         }
 
         let match_quality = calculate_match_quality(player, candidate, elo_gap);
-        if match_quality > best_score {
+        let candidate_wait = candidate.joined_at.timestamp();
+
+        // Prefer higher quality; break ties by longest-waiting candidate.
+        let is_better = match_quality > best_score + 1e-9
+            || (match_quality > best_score - 1e-9 && candidate_wait < best_wait);
+
+        if is_better {
             best_score = match_quality;
+            best_wait = candidate_wait;
             best_candidate = Some(MatchCandidate {
                 player1: player.clone(),
                 player2: candidate.clone(),
@@ -636,6 +869,13 @@ fn find_best_match_for_player(
     best_candidate
 }
 
+/// Compute the maximum allowable Elo gap for `entry` given how long they have
+/// waited.
+///
+/// The search window starts at `ELO_BUCKET_SIZE` (tight, high quality) and
+/// doubles for each expansion threshold crossed, capped at `MAX_ELO_GAP`.
+///
+/// See the `EXPANSION_INTERVALS` constant for the documented schedule.
 fn calculate_max_elo_gap(entry: &QueueEntry) -> i32 {
     let wait_seconds = Utc::now()
         .signed_duration_since(entry.joined_at)
@@ -650,6 +890,19 @@ fn calculate_max_elo_gap(entry: &QueueEntry) -> i32 {
     max_gap
 }
 
+/// Compute the match quality score for a candidate pairing.
+///
+/// The score is a value in approximately `[0.0, 1.5]`:
+///
+/// * **Elo component** (`0.0 – 1.0`): `1 - (elo_gap / MAX_ELO_GAP)`.  A gap
+///   of 0 yields 1.0; a gap at the hard ceiling yields 0.0.
+/// * **Wait-time bonus** (`0.0 – 0.5`): proportional to the combined average
+///   wait time normalised against the maximum allowed wait.  This bonus
+///   ensures that players who have been waiting a long time are more likely to
+///   be matched even at slightly lower quality, reducing starvation.
+///
+/// No personally-identifiable information is used or emitted — only Elo
+/// ratings and join timestamps, which are internal operational values.
 fn calculate_match_quality(player1: &QueueEntry, player2: &QueueEntry, elo_gap: i32) -> f64 {
     let elo_score = 1.0 - (elo_gap as f64 / MAX_ELO_GAP as f64);
 
@@ -659,7 +912,7 @@ fn calculate_match_quality(player1: &QueueEntry, player2: &QueueEntry, elo_gap: 
     let wait2 = Utc::now()
         .signed_duration_since(player2.joined_at)
         .num_seconds() as f64;
-    let wait_bonus = ((wait1 + wait2) / 2.0 / 600.0).min(0.5);
+    let wait_bonus = ((wait1 + wait2) / 2.0 / MAX_WAIT_SECS as f64).min(0.5);
 
     elo_score + wait_bonus
 }
@@ -678,6 +931,27 @@ pub fn calculate_percentiles(mut samples: Vec<f64>) -> crate::models::matchmaker
         p50: samples[p50_idx],
         p95: samples[p95_idx],
         p99: samples[p99_idx],
+    }
+}
+
+/// Test-visible wrapper around `calculate_max_elo_gap` for property tests.
+#[cfg(test)]
+pub fn calculate_max_elo_gap_pub(entry: &QueueEntry) -> i32 {
+    calculate_max_elo_gap(entry)
+}
+
+/// Test-visible wrapper around `calculate_match_quality` for property tests.
+#[cfg(test)]
+pub fn calculate_match_quality_pub(player1: &QueueEntry, player2: &QueueEntry, elo_gap: i32) -> f64 {
+    calculate_match_quality(player1, player2, elo_gap)
+}
+
+// Expose static wrappers on the service type so property tests can call them
+// via `MatchmakerService::calculate_max_elo_gap_pub(...)`.
+#[cfg(test)]
+impl MatchmakerService {
+    pub fn calculate_max_elo_gap_pub(entry: &QueueEntry) -> i32 {
+        calculate_max_elo_gap(entry)
     }
 }
 

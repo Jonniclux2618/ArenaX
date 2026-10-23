@@ -13,12 +13,20 @@ import { WalletBalances, WalletAssetCode } from "@/lib/wallet/types";
 interface BalanceCardsProps {
   isConnected: boolean;
   isLoading: boolean;
+  hasError: boolean;
+  isStale: boolean;
   balances: WalletBalances;
 }
 
 const ASSET_ORDER: WalletAssetCode[] = ["XLM", "USDC", "ARENAX"];
 
-export function BalanceCards({ isConnected, isLoading, balances }: BalanceCardsProps) {
+export function BalanceCards({
+  isConnected,
+  isLoading,
+  hasError,
+  isStale,
+  balances,
+}: BalanceCardsProps) {
   if (!isConnected) {
     return (
       <Card>
@@ -47,6 +55,19 @@ export function BalanceCards({ isConnected, isLoading, balances }: BalanceCardsP
     );
   }
 
+  if (hasError) {
+    return (
+      <Card role="alert">
+        <CardHeader>
+          <CardTitle>Balances unavailable</CardTitle>
+          <CardDescription>
+            Balance data could not be loaded. No zero balance is being shown as authoritative.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
   return (
     <div className="grid gap-4 md:grid-cols-3">
       {ASSET_ORDER.map((asset) => {
@@ -61,19 +82,29 @@ export function BalanceCards({ isConnected, isLoading, balances }: BalanceCardsP
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Available</span>
                 <span className="font-semibold" data-testid={`${asset}-available`}>
-                  {formatAssetAmount(balance.available)}
+                  {formatAssetAmount(balance.available, balance.precision)}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Locked (Escrow)</span>
-                <span className="font-semibold" data-testid={`${asset}-locked`}>
-                  {formatAssetAmount(balance.locked)}
+                <span className="text-muted-foreground">Held (Escrow)</span>
+                <span className="font-semibold" data-testid={`${asset}-held`}>
+                  {balance.held === null
+                    ? "Unavailable"
+                    : formatAssetAmount(balance.held, balance.precision)}
                 </span>
               </div>
-              <div className="flex items-center justify-between border-t pt-3">
-                <span className="text-muted-foreground">Total</span>
-                <span className="font-semibold">{formatAssetAmount(balance.total)}</span>
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Pending settlement</span>
+                <span className="font-semibold" data-testid={`${asset}-pending`}>
+                  {balance.pending === null
+                    ? "Unavailable"
+                    : formatAssetAmount(balance.pending, balance.precision)}
+                </span>
               </div>
+              <p className="text-xs text-muted-foreground">
+                As of {new Date(balance.asOf).toLocaleString()}
+                {isStale && " · May be outdated"}
+              </p>
 
               {!balance.hasTrustline && asset !== "XLM" && (
                 <p className="rounded-md bg-amber-100/70 px-2 py-1 text-xs text-amber-900 dark:bg-amber-900/20 dark:text-amber-200">

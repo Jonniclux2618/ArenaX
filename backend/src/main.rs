@@ -244,6 +244,15 @@ async fn main() -> io::Result<()> {
     )
     .with_redis(Arc::new(redis_client.clone()));
 
+    // OTP authentication service (Issue #6) — Redis-backed single-use
+    // challenges with distributed rate limiting and non-enumerating responses.
+    let otp_deliverer: Arc<dyn crate::service::otp_service::OtpDeliverer> =
+        Arc::new(crate::service::otp_service::NullDeliverer);
+    let otp_service = Arc::new(crate::service::otp_service::OtpService::new(
+        Arc::new(redis_client.clone()),
+        otp_deliverer,
+    ));
+
     // Start Redis Pub/Sub subscriber (broadcasts to local WebSocket actors)
     let broadcaster = WsBroadcaster::new(
         config.redis.url.clone(),
@@ -270,6 +279,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(redis_conn.clone()))
             .app_data(web::Data::new(Arc::new(redis_client.clone())))
             .app_data(web::Data::new(auth_service.clone()))
+            .app_data(web::Data::new(otp_service.clone()))
             .app_data(web::Data::new(event_bus.clone()))
             .app_data(web::Data::new(response_cache.clone()))
             .app_data(web::Data::new(leaderboard_broadcaster.clone()))
@@ -286,6 +296,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(notification_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
+            .wrap(crate::auth::AuthMiddleware::new((*jwt_service).clone()))
             .wrap(TenantContextMiddleware)
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
@@ -332,6 +343,7 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::feature_flag_handler::configure_routes)
                     // Auth endpoints (login, register, refresh are rate-limited strictly)
                     .configure(crate::http::auth_handler::configure_routes)
+                    .configure(crate::http::otp_handler::configure_routes)
                     .configure(crate::http::users::configure_routes)
                     .route(
                         "/notifications",
@@ -468,8 +480,8 @@ async fn main() -> io::Result<()> {
                             .route("/{category}/history/{player_id}", web::get().to(crate::http::leaderboard_handler::get_rank_history))
                             .route("/{category}/refresh", web::post().to(crate::http::leaderboard_handler::refresh_leaderboard))
                             .route("/{category}/stats", web::get().to(crate::http::leaderboard_handler::get_leaderboard_stats))
-                    ),
-            )
+                        ),
+                    )
             // Registered at the app level, not inside the `/api` scope above:
             // both modules declare their own `/api/...` scope, so nesting them
             // would produce `/api/api/...`.

@@ -202,7 +202,10 @@ export default async function middleware(request: NextRequest) {
     if (routeType === "public") return null;
 
     const loginUrl = new URL(`/${locale}/login`, request.url);
-    loginUrl.searchParams.set("redirect", pathname);
+    loginUrl.searchParams.set(
+      "redirect",
+      `${pathname}${request.nextUrl.search}`,
+    );
 
     const deny = (url: URL): NextResponse => {
       const redirect = NextResponse.redirect(url);
@@ -218,16 +221,15 @@ export default async function middleware(request: NextRequest) {
     if (!payload) return deny(loginUrl);
 
     const now = Math.floor(Date.now() / 1000);
-    if (payload.exp !== undefined && payload.exp < now) {
+    if (payload.exp === undefined || payload.exp <= now) {
       loginUrl.searchParams.set("reason", "expired");
       return deny(loginUrl);
     }
 
     const jwtSecret = process.env.JWT_SECRET ?? process.env.ADMIN_JWT_SECRET;
-    if (jwtSecret) {
-      const valid = await verifyJwtSignature(token, jwtSecret);
-      if (!valid) return deny(loginUrl);
-    }
+    if (!jwtSecret) return deny(loginUrl);
+    const valid = await verifyJwtSignature(token, jwtSecret);
+    if (!valid) return deny(loginUrl);
 
     const roles: string[] = Array.isArray(payload.roles) ? payload.roles : [];
     if (routeType === "admin" && !roles.includes("admin")) {

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use redis::{aio::ConnectionManager, AsyncCommands};
+use redis::{aio::ConnectionManager, AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -227,6 +227,8 @@ impl KeyRotation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRecord {
     pub user_id: Uuid,
+    #[serde(default)]
+    pub session_id: String,
     pub device_id: Option<String>,
     pub created_at: i64,
     pub last_used_at: i64,
@@ -269,7 +271,22 @@ impl JwtService {
         roles: Vec<String>,
         device_id: Option<String>,
     ) -> Result<String, JwtError> {
-        let session_id = Uuid::new_v4().to_string();
+        self.generate_access_token_in_session(
+            user_id,
+            roles,
+            device_id,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    async fn generate_access_token_in_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        device_id: Option<String>,
+        session_id: String,
+    ) -> Result<String, JwtError> {
 
         let claims = Claims {
             sub: user_id.to_string(),
@@ -303,12 +320,36 @@ impl JwtService {
         roles: Vec<String>,
         device_id: Option<String>,
     ) -> Result<String, JwtError> {
-        let session_id = Uuid::new_v4().to_string();
+        self.generate_refresh_token_in_session(
+            user_id,
+            roles,
+            device_id,
+            Uuid::new_v4().to_string(),
+            None,
+        )
+        .await
+    }
+
+    async fn generate_refresh_token_in_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        device_id: Option<String>,
+        session_id: String,
+        family_created_at: Option<i64>,
+    ) -> Result<String, JwtError> {
+        let now = Utc::now().timestamp();
+        let created_at = family_created_at.unwrap_or(now);
+        let expires_at = created_at + self.config.refresh_token_expiry.num_seconds();
+        let ttl_seconds = expires_at - now;
+        if ttl_seconds <= 0 {
+            return Err(JwtError::TokenExpired);
+        }
 
         let claims = Claims {
             sub: user_id.to_string(),
-            exp: (Utc::now() + self.config.refresh_token_expiry).timestamp(),
-            iat: Utc::now().timestamp(),
+            exp: expires_at,
+            iat: now,
             jti: Uuid::new_v4().to_string(),
             token_type: TokenType::Refresh,
             device_id: device_id.clone(),
@@ -325,17 +366,13 @@ impl JwtService {
         // Store refresh token record in Redis so we can validate, rotate, and
         // revoke it explicitly.
         drop(key_rotation); // release read-lock before async Redis call
-        self.store_refresh_token(&token, user_id, device_id.clone(), None)
-            .await?;
-
-        // Track hash in user's refresh-token set (for revoke-all and sessions list)
-        let hash = token_hash(&token);
-        let user_refresh_set = format!("user_refresh_tokens:{}", user_id);
-        let mut conn = self.redis.clone();
-        conn.sadd::<_, _, ()>(&user_refresh_set, &hash).await?;
-        conn.expire::<_, ()>(
-            &user_refresh_set,
-            self.config.refresh_token_expiry.num_seconds() as i64,
+        self.store_refresh_token(
+            &token,
+            user_id,
+            session_id.clone(),
+            device_id,
+            created_at,
+            ttl_seconds,
         )
         .await?;
 
@@ -351,11 +388,40 @@ impl JwtService {
         roles: Vec<String>,
         device_id: Option<String>,
     ) -> Result<TokenPair, JwtError> {
+        self.generate_token_pair_in_session(
+            user_id,
+            roles,
+            device_id,
+            Uuid::new_v4().to_string(),
+            None,
+        )
+        .await
+    }
+
+    async fn generate_token_pair_in_session(
+        &self,
+        user_id: Uuid,
+        roles: Vec<String>,
+        device_id: Option<String>,
+        session_id: String,
+        family_created_at: Option<i64>,
+    ) -> Result<TokenPair, JwtError> {
         let access_token = self
-            .generate_access_token(user_id, roles.clone(), device_id.clone())
+            .generate_access_token_in_session(
+                user_id,
+                roles.clone(),
+                device_id.clone(),
+                session_id.clone(),
+            )
             .await?;
         let refresh_token = self
-            .generate_refresh_token(user_id, roles, device_id)
+            .generate_refresh_token_in_session(
+                user_id,
+                roles,
+                device_id,
+                session_id,
+                family_created_at,
+            )
             .await?;
 
         Ok(TokenPair {
@@ -431,40 +497,92 @@ impl JwtService {
 
     /// Refresh access token using refresh token.
     ///
-    /// Implements single-use (rotating) refresh tokens:
-    /// 1. Validate the presented token (JWT signature + Redis record presence)
-    /// 2. Delete the old refresh-token record from Redis — replaying the same
-    ///    token after this point will return 401 `TokenBlacklisted` (record gone)
-    /// 3. Issue a brand-new access + refresh token pair
+    /// Consume the refresh token once and revoke the session family on replay.
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenPair, JwtError> {
-        // Step 1: Decode and validate the JWT (signature, expiry, blacklist, session)
         let claims = self.validate_token(refresh_token).await?;
 
         if claims.token_type != TokenType::Refresh {
             return Err(JwtError::InvalidToken);
         }
 
-        // Step 2: Verify the refresh-token record exists in Redis
-        let record = self.get_refresh_token_record(refresh_token).await?;
-
         let user_id =
             Uuid::parse_str(&claims.sub).map_err(|e| JwtError::TokenValidation(e.to_string()))?;
-
-        // Step 3: Invalidate the old refresh token (delete its Redis record)
-        // From this moment any replay of the old token will fail with "record missing".
-        self.invalidate_refresh_token(refresh_token, user_id).await?;
-
-        // Also remove the old session entry tied to this refresh token
-        self.revoke_session(&claims.session_id).await?;
-
-        // Step 4: Issue a fresh token pair (new session, new refresh record)
+        let hash = token_hash(refresh_token);
+        let refresh_key = format!("refresh:{}", hash);
+        let used_key = format!("refresh:used:{}", hash);
+        let family_key = format!("refresh_family:{}", claims.session_id);
+        let revoked_key = format!("refresh_family_revoked:{}", claims.session_id);
+        let user_refresh_set = format!("user_refresh_tokens:{}", user_id);
+        let ttl = self.config.refresh_token_expiry.num_seconds().max(1);
+        let script = Script::new(
+            r#"
+            local record = redis.call('GET', KEYS[1])
+            if record then
+                if redis.call('EXISTS', KEYS[4]) == 1 then
+                    return {'revoked', ''}
+                end
+                redis.call('DEL', KEYS[1])
+                redis.call('SREM', KEYS[3], ARGV[1])
+                redis.call('SREM', KEYS[5], ARGV[1])
+                redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+                return {'consumed', record}
+            end
+            local family = redis.call('GET', KEYS[2])
+            if family then
+                redis.call('SET', KEYS[4], '1', 'EX', ARGV[3])
+                local hashes = redis.call('SMEMBERS', KEYS[3])
+                for _, hash in ipairs(hashes) do
+                    local family_record = redis.call('GET', 'refresh:' .. hash)
+                    if family_record then
+                        local owner = cjson.decode(family_record).user_id
+                        redis.call('SREM', 'user_refresh_tokens:' .. owner, hash)
+                    end
+                    redis.call('DEL', 'refresh:' .. hash)
+                end
+                redis.call('DEL', KEYS[3])
+                redis.call('DEL', 'session:' .. family)
+                return {'replay', family}
+            end
+            return {'missing', ''}
+            "#,
+        );
+        let mut conn = self.redis.clone();
+        let result: Vec<String> = script
+            .key(refresh_key)
+            .key(used_key)
+            .key(family_key)
+            .key(revoked_key)
+            .key(user_refresh_set)
+            .arg(&hash)
+            .arg(&claims.session_id)
+            .arg(ttl)
+            .invoke_async(&mut conn)
+            .await?;
+        match result.first().map(String::as_str) {
+            Some("consumed") => {}
+            Some("replay") => {
+                warn!(session_id = %claims.session_id, user_id = %user_id, "Refresh-token replay detected; session family revoked");
+                return Err(JwtError::TokenBlacklisted);
+            }
+            _ => return Err(JwtError::SessionNotFound),
+        }
+        let record: RefreshTokenRecord = serde_json::from_str(
+            result.get(1).ok_or(JwtError::SessionNotFound)?,
+        )
+        .map_err(|e| JwtError::RedisError(e.to_string()))?;
         let token_pair = self
-            .generate_token_pair(user_id, claims.roles, record.device_id)
+            .generate_token_pair_in_session(
+                user_id,
+                claims.roles,
+                record.device_id,
+                claims.session_id,
+                Some(record.created_at),
+            )
             .await?;
 
         self.increment_analytics("refreshed").await?;
 
-        info!(user_id = %user_id, "Token refreshed — old refresh token invalidated");
+        info!(user_id = %user_id, "Refresh token rotated");
 
         Ok(token_pair)
     }
@@ -532,25 +650,31 @@ impl JwtService {
         user_id: Uuid,
         device_id: Option<String>,
     ) -> Result<(), JwtError> {
+        let session_key = format!("session:{}", session_id);
+        let mut conn = self.redis.clone();
+        let prior_json: Option<String> = conn.get(&session_key).await?;
+        let created_at = prior_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<SessionData>(json).ok())
+            .map(|session| session.created_at)
+            .unwrap_or_else(|| Utc::now().timestamp());
         let session_data = SessionData {
             user_id,
             session_id: session_id.to_string(),
             device_id,
-            created_at: Utc::now().timestamp(),
+            created_at,
             last_activity: Utc::now().timestamp(),
             ip_address: None,
             user_agent: None,
         };
 
-        let session_key = format!("session:{}", session_id);
         let session_json = serde_json::to_string(&session_data)
             .map_err(|e| JwtError::RedisError(e.to_string()))?;
 
-        let mut conn = self.redis.clone();
         conn.set_ex::<_, _, ()>(
             &session_key,
             session_json,
-            self.config.access_token_expiry.num_seconds() as u64,
+            self.config.refresh_token_expiry.num_seconds().max(1) as u64,
         )
         .await?;
 
@@ -592,11 +716,11 @@ impl JwtService {
             let updated_json =
                 serde_json::to_string(&session).map_err(|e| JwtError::RedisError(e.to_string()))?;
 
-            // Refresh the TTL using access_token_expiry (consistent with store_session).
+            // The session represents the refresh-token family, not one access token.
             conn.set_ex::<_, _, ()>(
                 &session_key,
                 updated_json,
-                self.config.access_token_expiry.num_seconds() as u64,
+                self.config.refresh_token_expiry.num_seconds().max(1) as u64,
             )
             .await?;
         }
@@ -635,6 +759,15 @@ impl JwtService {
         for session_id in session_ids {
             let session_key = format!("session:{}", session_id);
             conn.del::<_, ()>(&session_key).await?;
+            let revoked_key = format!("refresh_family_revoked:{}", session_id);
+            conn.set_ex::<_, _, ()>(
+                &revoked_key,
+                "1",
+                self.config.refresh_token_expiry.num_seconds().max(1) as u64,
+            )
+            .await?;
+            let family_key = format!("refresh_family:{}", session_id);
+            conn.del::<_, ()>(&family_key).await?;
         }
 
         conn.del::<_, ()>(&user_sessions_key).await?;
@@ -659,6 +792,67 @@ impl JwtService {
         Ok(())
     }
 
+    /// Revoke one session only after confirming it belongs to the caller.
+    pub async fn revoke_user_session(
+        &self,
+        user_id: Uuid,
+        session_id: &str,
+    ) -> Result<(), JwtError> {
+        let user_refresh_set = format!("user_refresh_tokens:{}", user_id);
+        let mut conn = self.redis.clone();
+        let hashes: Vec<String> = conn.smembers(&user_refresh_set).await?;
+        let mut belongs_to_user = false;
+        for hash in hashes {
+            let refresh_key = format!("refresh:{}", hash);
+            if let Some(json) = conn.get::<_, Option<String>>(&refresh_key).await? {
+                if let Ok(record) = serde_json::from_str::<RefreshTokenRecord>(&json) {
+                    if record.session_id == session_id {
+                        belongs_to_user = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !belongs_to_user {
+            return Err(JwtError::SessionNotFound);
+        }
+
+        let family_key = format!("refresh_family:{}", session_id);
+        let revoked_key = format!("refresh_family_revoked:{}", session_id);
+        let session_key = format!("session:{}", session_id);
+        let user_sessions_key = format!("user_sessions:{}", user_id);
+        let script = Script::new(
+            r#"
+            local hashes = redis.call('SMEMBERS', KEYS[1])
+            for _, hash in ipairs(hashes) do
+                local record = redis.call('GET', 'refresh:' .. hash)
+                if record then
+                    local owner = cjson.decode(record).user_id
+                    redis.call('SREM', 'user_refresh_tokens:' .. owner, hash)
+                end
+                redis.call('DEL', 'refresh:' .. hash)
+            end
+            redis.call('DEL', KEYS[1])
+            redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
+            redis.call('DEL', KEYS[3])
+            redis.call('SREM', KEYS[4], ARGV[2])
+            return #hashes
+            "#,
+        );
+        let _: i64 = script
+            .key(family_key)
+            .key(revoked_key)
+            .key(session_key)
+            .key(user_sessions_key)
+            .arg(self.config.refresh_token_expiry.num_seconds().max(1))
+            .arg(session_id)
+            .invoke_async(&mut conn)
+            .await?;
+
+        info!(user_id = %user_id, session_id = %session_id, "User session revoked");
+        Ok(())
+    }
+
     // ── Refresh-token record helpers ─────────────────────────────────────────
 
     /// Persist a `refresh:{hash}` record in Redis with the refresh-token TTL.
@@ -669,30 +863,54 @@ impl JwtService {
         &self,
         token: &str,
         user_id: Uuid,
+        session_id: String,
         device_id: Option<String>,
-        previous_last_used_at: Option<i64>,
+        created_at: i64,
+        ttl_seconds: i64,
     ) -> Result<(), JwtError> {
         let hash = token_hash(token);
         let key = format!("refresh:{}", hash);
+        let family_key = format!("refresh_family:{}", session_id);
+        let revoked_key = format!("refresh_family_revoked:{}", session_id);
+        let user_refresh_set = format!("user_refresh_tokens:{}", user_id);
 
         let now = Utc::now().timestamp();
         let record = RefreshTokenRecord {
             user_id,
+            session_id,
             device_id,
-            created_at: now,
-            last_used_at: previous_last_used_at.unwrap_or(now),
+            created_at,
+            last_used_at: now,
         };
 
         let json = serde_json::to_string(&record)
             .map_err(|e| JwtError::RedisError(e.to_string()))?;
 
+        let script = Script::new(
+            r#"
+            if redis.call('EXISTS', KEYS[4]) == 1 then return 0 end
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+            redis.call('SADD', KEYS[2], ARGV[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[3])
+            redis.call('SADD', KEYS[3], ARGV[2])
+            redis.call('EXPIRE', KEYS[3], ARGV[3])
+            return 1
+            "#,
+        );
         let mut conn = self.redis.clone();
-        conn.set_ex::<_, _, ()>(
-            &key,
-            json,
-            self.config.refresh_token_expiry.num_seconds() as u64,
-        )
-        .await?;
+        let stored: i32 = script
+            .key(key)
+            .key(family_key)
+            .key(user_refresh_set)
+            .key(revoked_key)
+            .arg(json)
+            .arg(hash)
+            .arg(ttl_seconds.max(1))
+            .invoke_async(&mut conn)
+            .await?;
+        if stored != 1 {
+            return Err(JwtError::TokenBlacklisted);
+        }
 
         Ok(())
     }

@@ -4,7 +4,6 @@ import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { CheckCircle2, XCircle, Loader2, AlertCircle } from "lucide-react";
-import Link from "next/link";
 import { useAuth } from "@/hooks/useAuth";
 import { useRouter } from "next/navigation";
 import { useUsernameAvailability } from "@/hooks/useUsernameAvailability";
@@ -201,20 +200,7 @@ export function RegisterForm({ className }: RegisterFormProps) {
                     error={!!form.formState.errors.email || !!error}
                   />
                 </FormControl>
-                <FormMessage>
-                  {form.formState.errors.email?.message ===
-                    REGISTER_ERROR_MAP.EMAIL_ALREADY_EXISTS?.message && (
-                    <>
-                      {" "}
-                      <Link
-                        href="/auth/login"
-                        className="underline underline-offset-2 hover:text-destructive/80 font-medium"
-                      >
-                        Log in instead
-                      </Link>
-                    </>
-                  )}
-                </FormMessage>
+                <FormMessage />
               </FormItem>
             )}
           />

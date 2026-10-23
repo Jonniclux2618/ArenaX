@@ -1,58 +1,58 @@
 # Upgrade Manager
 
-Governed contract-upgrade lifecycle for ArenaX Soroban contracts, closing
-[#969](https://github.com/Arenax-gaming/ArenaX/issues/969).
+Governed contract-upgrade lifecycle for ArenaX Soroban contracts, resolving [#56](https://github.com/Jonniclux2618/ArenaX/issues/56) and [#969](https://github.com/Arenax-gaming/ArenaX/issues/969).
 
-## Why this shape
+## Architecture & Responsibilities
 
-Soroban has no EVM-style `delegatecall` proxy. Instead a contract's
-*address* is permanent while its wasm implementation can be swapped in
-place via `Env::deployer().update_current_contract_wasm(hash)` — callers,
-other contracts, and off-chain indexers never need to learn a new address.
-That address stability is the proxy-equivalent guarantee this contract is
-built around.
+The ArenaX ecosystem separates time-locked governance responsibilities into clear layers:
+- **`upgrade-manager/` (This Contract)**: The single supported proposal-to-execution state machine for all contract upgrades (both self and managed contracts). Enforces fixed payload identity, dual-phase validation, governor voting thresholds, on-chain delay, cancellation, and expiry windows.
+- **`time-lock/`**: Generic operation queue for timelocked administrative actions and parameter adjustments across general, treasury, and emergency categories.
+- **`upgrade-system/`**: Reference single-contract migration prototype; superseded by this unified cross-contract `upgrade-manager`.
 
-`UpgradeManager` is the governance layer in front of that primitive:
+## Supported Proposal-to-Execution State Machine
 
-1. **Propose** — anyone can call `propose_upgrade(contract_name, new_wasm_hash, description, timelock_seconds)`.
-2. **Validate** — a governor records an implementation-validation verdict
-   (`validate_upgrade`) before a vote can pass execution.
-3. **Vote** — governors cast one yes/no vote each (`vote_upgrade`); a
-   proposal needs `approval_threshold` yes-votes to be executable.
-4. **Execute** — once validated, past threshold, and past the timelock,
-   `execute_upgrade` runs. For the manager's own implementation
-   (`SELF_CONTRACT`) it calls `update_current_contract_wasm` directly.
-   For any other tracked contract it records the governance-approved
-   wasm hash; that contract's own admin-gated `upgrade()` entrypoint
-   reads it via `get_approved_wasm_hash` and applies it to itself — one
-   contract cannot rewrite another's wasm directly on Soroban, so this
-   indirection is what makes third-party contracts governable from a
-   single place.
-5. **Rollback** — `rollback_upgrade` restores the previously-approved
-   wasm hash for a contract (or immediately re-applies it for `SELF`),
-   with a reason recorded.
-6. **History** — every execution and rollback appends an `UpgradeRecord`
-   to `get_upgrade_history(contract_name)`, and every step also emits a
-   versioned event (`arenax-events::upgrade_manager`) for off-chain
-   indexers.
+```
+   [Propose] ───────► Proposed
+                         │
+                    (Validate)
+                         ▼
+                     Validated
+                         │
+                      (Vote)
+                         ▼
+                     Approved
+                         │
+             (Timelock Delay Elapsed)
+                         ▼
+                     Executable
+                         │
+                     (Execute)
+                         ▼
+                      Executed
 
-## Integrating a target contract
-
-```rust
-pub fn upgrade(env: Env, caller: Address) {
-    caller.require_auth();
-    let manager: Address = /* stored upgrade-manager contract id */;
-    let hash = UpgradeManagerClient::new(&env, &manager)
-        .get_approved_wasm_hash(&symbol_short!("MyContract"))
-        .expect("no approved upgrade");
-    env.deployer().update_current_contract_wasm(hash);
-}
+  * Note: Any non-executed proposal can transition to:
+    - Canceled: via `cancel_proposal` (by Proposer, Admin, or Governor)
+    - Expired: if not executed within `DEFAULT_GRACE_PERIOD` (7 days after timelock_end)
 ```
 
-## Acceptance criteria mapping
+### Lifecycle Steps:
+1. **Propose** — Call `propose_upgrade` (or `propose_upgrade_with_manifest`). The candidate payload WASM hash is permanently bound at proposal creation and cannot be substituted.
+2. **Validate** — Governor verifies compatibility and emits `UpgradeValidated`. Required prior to execution.
+3. **Vote** — Governors vote until `approval_threshold` is reached (`ProposalStatus::Approved`).
+4. **Delay** — On-chain timelock delay must elapse (`ledger.timestamp >= timelock_end`).
+5. **Execute** — Call `execute_upgrade` or `execute_upgrade_guarded(proposal_id, expected_wasm_hash)`. Ensures payload integrity, enforces that the proposal is not canceled, not expired, validated, approved, and past delay.
+6. **Cancel** — Proposer, admin, or governors can cancel a proposal via `cancel_proposal` before execution.
+7. **Expiry** — Bounded execution grace period (`DEFAULT_GRACE_PERIOD = 7 days`) prevents stale or abandoned proposals from being executed in the distant future.
+8. **Rollback** — In emergencies, `rollback_upgrade` restores the previously verified implementation.
+9. **Emergency Pause** — Bounded pause duration (`MAX_PAUSE_DURATION = 7 days`) halts state mutations during incidents without causing permanent lockouts.
 
-- Proxy pattern implementation → stable contract address + wasm swap via `update_current_contract_wasm`.
-- Upgrade governance vote → `vote_upgrade` + `approval_threshold`.
-- Implementation validation → `validate_upgrade`, required before execution.
-- Rollback capability → `rollback_upgrade`.
-- Upgrade history logged → `get_upgrade_history` + `arenax-events::upgrade_manager` events.
+## Acceptance Criteria Mapping (#56)
+
+- **Fixed Payload Identity**: Payload WASM hash is recorded in `UpgradeProposal` upon creation. `execute_upgrade_guarded` asserts identity matches expected payload, preventing substitution.
+- **On-Chain Approval, Delay, Cancellation, and Expiry**:
+  - Approval: `votes.len() >= approval_threshold` verified in `execute_upgrade`.
+  - Delay: `ledger.timestamp >= proposal.timelock_end` strictly enforced.
+  - Cancellation: `cancel_proposal` moves proposal to `Canceled` state; execution immediately reverts.
+  - Expiry: Proposals expire after `timelock_end + DEFAULT_GRACE_PERIOD`; execution reverts with `ProposalExpired`.
+- **Independent Monitoring**: Detailed events emitted via `arenax_events::upgrade_manager`:
+  - `UpgradeProposed`, `UpgradeValidated`, `UpgradeVoted`, `UpgradeExecuted`, `UpgradeRolledBack`, `UpgradeCanceled`.

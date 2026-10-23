@@ -24,6 +24,29 @@ export function generateNonce(): string {
 }
 
 export function buildContentSecurityPolicy(nonce: string): string {
+  const stellarOrigins = [
+    process.env.NEXT_PUBLIC_STELLAR_HORIZON_URL,
+    process.env.NEXT_PUBLIC_SOROBAN_RPC_URL,
+  ]
+    .map((endpoint) => {
+      if (!endpoint) return null;
+      try {
+        const url = new URL(endpoint);
+        return url.protocol === "https:" ? url.origin : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((origin): origin is string => origin !== null);
+  const connectSources = [
+    "'self'",
+    "https://horizon-testnet.stellar.org",
+    "https://horizon.stellar.org",
+    "https://soroban-testnet.stellar.org",
+    "https://soroban-mainnet.stellar.org",
+    ...new Set(stellarOrigins),
+  ];
+
   return [
     "default-src 'self'",
     // 'strict-dynamic' lets scripts the nonce'd script itself loads run too,
@@ -33,8 +56,8 @@ export function buildContentSecurityPolicy(nonce: string): string {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob: https:",
     "font-src 'self' data:",
-    // Stellar network endpoints + WebSocket for real-time features
-    "connect-src 'self' https://horizon-testnet.stellar.org https://horizon.stellar.org https://*.stellar.org wss: ws:",
+    // Stellar Horizon/Soroban RPC plus same-origin app WebSockets only.
+    `connect-src ${connectSources.join(" ")}`,
     "frame-ancestors 'none'",
     "object-src 'none'",
     "base-uri 'self'",

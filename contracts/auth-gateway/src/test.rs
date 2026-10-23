@@ -19,10 +19,10 @@ fn initialize_contract(env: &Env, admin: &Address) -> Address {
     let contract_id = Address::generate(env);
     env.register_at(&contract_id, AuthGateway, ());
     let client = AuthGatewayClient::new(env, &contract_id);
-    
+
     env.mock_all_auths();
     client.initialize(admin);
-    
+
     contract_id
 }
 
@@ -353,8 +353,9 @@ fn test_all_role_types() {
     assert!(client.has_role(&operator, Role::Operator));
     assert!(client.has_role(&referee, Role::Referee));
     assert!(client.has_role(&player, Role::Player));
+    assert!(client.has_role(&admin, Role::Operator));
+    assert!(client.has_role(&admin, Role::Referee));
 
-    assert!(!client.has_role(&admin, Role::Operator));
     assert!(!client.has_role(&operator, Role::Referee));
     assert!(!client.has_role(&referee, Role::Player));
     assert!(!client.has_role(&player, Role::Admin));

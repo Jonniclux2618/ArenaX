@@ -16,7 +16,7 @@
  * Architecture:
  *   RequestMiddlewarePipeline
  *     ├── correlationId  — attaches X-Request-Id to every request
- *     ├── auth           — injects Bearer token + handles 401 refresh
+ *     ├── auth           — legacy optional Bearer middleware
  *     ├── retryBackoff   — exponential back-off with jitter
  *     ├── deduplication  — collapses identical in-flight GET requests
  *     ├── circuitBreaker — opens circuit after N consecutive failures
@@ -118,8 +118,8 @@ export const correlationIdMiddleware: RequestMiddlewareFn = async (ctx, next) =>
 };
 
 /**
- * Injects the Bearer token from storage into every request.
- * Skips auth routes to avoid circular refresh loops.
+ * Optional Bearer middleware for non-browser clients. Browser auth uses
+ * httpOnly cookies and must not pass tokens through JavaScript storage.
  */
 export function createAuthMiddleware(
   getToken: () => string | null,
@@ -382,6 +382,7 @@ export class RequestMiddlewarePipeline {
       url,
       options: {
         method: "GET",
+        credentials: "include",
         ...init,
         headers: {
           "content-type": "application/json",

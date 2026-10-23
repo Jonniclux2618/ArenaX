@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/Form";
 import { Edit2, Twitter, Twitch, Save, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { safeHref } from "@/lib/safeNavigation";
 import {
   MAX_BIO_LENGTH,
   profileBioSchema,
@@ -204,9 +205,9 @@ export function ProfileBio({ user, isEditing: isEditingProp, onEditToggle, onSav
               {'"'}{user.bio || "No bio set yet."}{'"'}
             </p>
             <div className="flex flex-wrap gap-3">
-              {user.socialLinks?.twitter && (
+              {safeHref(user.socialLinks?.twitter) && (
                 <a
-                  href={user.socialLinks.twitter}
+                  href={safeHref(user.socialLinks.twitter)!}
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center gap-2 text-xs bg-muted hover:bg-muted/80 px-3 py-1.5 rounded-full transition-colors"
@@ -215,9 +216,9 @@ export function ProfileBio({ user, isEditing: isEditingProp, onEditToggle, onSav
                   Twitter
                 </a>
               )}
-              {user.socialLinks?.twitch && (
+              {safeHref(user.socialLinks?.twitch) && (
                 <a
-                  href={user.socialLinks.twitch}
+                  href={safeHref(user.socialLinks.twitch)!}
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center gap-2 text-xs bg-muted hover:bg-muted/80 px-3 py-1.5 rounded-full transition-colors"

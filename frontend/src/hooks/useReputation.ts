@@ -117,7 +117,7 @@ export function useMyReputation() {
         localStorage.getItem("auth_token") ??
         sessionStorage.getItem("auth_token");
       const res = await fetch(`${API_BASE}/reputation/me`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: "include",
       });
       if (!res.ok) throw new Error("Failed to fetch reputation");
       const json = await res.json();

@@ -43,14 +43,10 @@ const TX_STATUS_COLORS: Record<string, string> = {
 
 async function fetchAdminData<T>(path: string): Promise<T | null> {
   try {
-    const token =
-      typeof window !== "undefined"
-        ? localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token")
-        : null;
     const res = await fetch(path, {
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
     });
     if (!res.ok) return null;

@@ -308,6 +308,11 @@ pub struct MatchResponse {
     pub can_report_score: bool,
     pub can_dispute: bool,
     pub dispute_status: Option<DisputeStatus>,
+    /// Monotonic event-stream sequence for this match (Issue #33).
+    /// Clients adopt it as the baseline when connecting to the live stream so
+    /// the initial REST snapshot and subsequent WebSocket frames converge.
+    /// `None` when no live event has been published yet.
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

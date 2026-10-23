@@ -51,6 +51,15 @@ pub struct UpgradeRolledBack {
     pub reason: Symbol,
 }
 
+#[contractevent(topics = ["ArenaXUpg_v1", "CANCELED"])]
+pub struct UpgradeCanceled {
+    pub proposal_id: u32,
+    pub contract_name: Symbol,
+    pub new_wasm_hash: BytesN<32>,
+    pub canceled_by: Address,
+    pub reason: Symbol,
+}
+
 pub fn emit_initialized(env: &soroban_sdk::Env, admin: &Address, approval_threshold: u32) {
     Initialized {
         admin: admin.clone(),
@@ -138,6 +147,24 @@ pub fn emit_upgrade_rolled_back(
         contract_name: contract_name.clone(),
         restored_wasm_hash: restored_wasm_hash.clone(),
         rolled_back_by: rolled_back_by.clone(),
+        reason: reason.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_upgrade_canceled(
+    env: &soroban_sdk::Env,
+    proposal_id: u32,
+    contract_name: &Symbol,
+    new_wasm_hash: &BytesN<32>,
+    canceled_by: &Address,
+    reason: &Symbol,
+) {
+    UpgradeCanceled {
+        proposal_id,
+        contract_name: contract_name.clone(),
+        new_wasm_hash: new_wasm_hash.clone(),
+        canceled_by: canceled_by.clone(),
         reason: reason.clone(),
     }
     .publish(env);

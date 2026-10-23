@@ -124,6 +124,11 @@ fn resolve_bucket_for(
         return Bucket { name: "auth_strict", limit: 5, window_secs: 60 };
     }
 
+    // OTP send/verify — strict (abuse and enumeration risk)
+    if path == "/api/auth/otp/send" || path == "/api/auth/otp/verify" {
+        return Bucket { name: "auth_strict", limit: 5, window_secs: 60 };
+    }
+
     // Auth — other (logout, me, change-password, sessions…)
     if path.starts_with("/api/auth") {
         return Bucket { name: "auth", limit: 30, window_secs: 60 };

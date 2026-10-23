@@ -2,15 +2,30 @@
   "ci": {
     "collect": {
       "numberOfRuns": 3,
+      "startServerCommand": "npm run start",
+      "url": [
+        "http://localhost:3000/en",
+        "http://localhost:3000/en/tournaments",
+        "http://localhost:3000/en/tournaments/1/bracket",
+        "http://localhost:3000/en/matches/1",
+        "http://localhost:3000/en/leaderboard"
+      ],
       "settings": {
+        "preset": "mobile",
         "budgetsPath": "./lighthouse-budget.json",
-        "onlyCategories": ["performance"]
+        "onlyCategories": ["performance", "accessibility"],
+        "emulatedFormFactor": "mobile",
+        "throttlingMethod": "simulate"
       }
     },
     "assert": {
       "assertions": {
+        "categories:performance": ["error", { "minScore": 0.85 }],
+        "categories:accessibility": ["error", { "minScore": 0.90 }],
         "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "first-contentful-paint": ["error", { "maxNumericValue": 1800 }],
         "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }],
+        "total-blocking-time": ["error", { "maxNumericValue": 300 }],
         "interactive": ["warn", { "maxNumericValue": 3000 }]
       }
     },

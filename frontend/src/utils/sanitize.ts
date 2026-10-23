@@ -4,6 +4,7 @@
  * Pure-TypeScript helpers with no runtime dependencies.
  * Use these on any user-supplied data before rendering or persisting it.
  */
+import { safeHref } from "@/lib/safeNavigation";
 
 // ─── HTML entity map ──────────────────────────────────────────────────────────
 const HTML_ENTITIES: Record<string, string> = {
@@ -17,33 +18,13 @@ const HTML_ENTITIES: Record<string, string> = {
   "=": "&#x3D;",
 };
 
-// Patterns for stripping dangerous HTML constructs
-const SCRIPT_TAG_PATTERN = /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi;
-const EVENT_HANDLER_PATTERN = /\s+on\w+\s*=\s*["'][^"']*["']/gi;
-const EVENT_HANDLER_UNQUOTED_PATTERN = /\s+on\w+\s*=\s*[^\s>]*/gi;
-const JAVASCRIPT_URI_PATTERN = /javascript\s*:/gi;
-const DATA_URI_SCRIPT_PATTERN = /data\s*:\s*text\/html/gi;
-const IFRAME_PATTERN = /<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi;
-const EMBED_OBJECT_PATTERN = /<(?:embed|object|applet)\b[^>]*>/gi;
-
 /**
- * Strips script tags, event handler attributes, javascript: URIs,
- * and other XSS vectors from an HTML string.
- *
- * NOTE: For rich-HTML use cases prefer a battle-tested library like DOMPurify
- * on the client side. This function is a lightweight server/SSR-safe fallback.
+ * Encodes input as plain text safe to interpolate into an HTML context.
+ * Rich user-provided HTML is intentionally not supported.
  */
 export function sanitizeHtml(input: string): string {
   if (typeof input !== "string") return "";
-  return input
-    .replace(SCRIPT_TAG_PATTERN, "")
-    .replace(IFRAME_PATTERN, "")
-    .replace(EMBED_OBJECT_PATTERN, "")
-    .replace(EVENT_HANDLER_PATTERN, "")
-    .replace(EVENT_HANDLER_UNQUOTED_PATTERN, "")
-    .replace(JAVASCRIPT_URI_PATTERN, "javascript_blocked:")
-    .replace(DATA_URI_SCRIPT_PATTERN, "data_blocked:text/html")
-    .trim();
+  return escapeHtml(input.trim());
 }
 
 /**
@@ -51,33 +32,8 @@ export function sanitizeHtml(input: string): string {
  * Allows http://, https://, relative paths, and anchor-only URLs.
  */
 export function sanitizeUrl(url: string): string {
-  if (typeof url !== "string" || url.trim() === "") return "#";
-  const trimmed = url.trim().toLowerCase();
-  // Block dangerous schemes
-  if (
-    trimmed.startsWith("javascript:") ||
-    trimmed.startsWith("vbscript:") ||
-    trimmed.startsWith("data:text/html") ||
-    trimmed.startsWith("data:application/")
-  ) {
-    return "#";
-  }
-  // Allow explicitly safe schemes and relative URLs
-  if (
-    trimmed.startsWith("http://") ||
-    trimmed.startsWith("https://") ||
-    trimmed.startsWith("/") ||
-    trimmed.startsWith("#") ||
-    trimmed.startsWith(".")
-  ) {
-    return url.trim();
-  }
-  // Block anything else with an explicit scheme that isn't safe
-  if (/^[a-z][a-z0-9+\-.]*:/i.test(trimmed)) {
-    return "#";
-  }
-  // Relative URLs without explicit scheme are fine
-  return url.trim();
+  const safe = safeHref(url);
+  return safe ?? "#";
 }
 
 /**

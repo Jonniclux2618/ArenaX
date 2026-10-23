@@ -1,6 +1,7 @@
 {
     "name": "arenax-server",
     "version": "0.1.0",
+    "packageManager": "npm@10.9.3",
     "description": "TypeScript backend for ArenaX gaming platform",
     "main": "dist/server.js",
     "scripts": {

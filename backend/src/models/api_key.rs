@@ -37,6 +37,7 @@ pub enum KeyStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ApiKey {
     pub id: Uuid,
+    #[serde(skip_serializing)]
     pub key: String,
     pub name: String,
     pub description: Option<String>,

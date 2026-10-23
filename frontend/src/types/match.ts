@@ -14,6 +14,12 @@ export interface Match {
   startedAt?: string;
   completedAt?: string;
   createdAt: string;
+  /**
+   * Monotonic live-stream sequence number for this match (#33). Present when
+   * the server has published at least one realtime event; the client adopts it
+   * as the WebSocket baseline so the snapshot and the stream converge.
+   */
+  version?: number;
 }
 
 export type MatchStatus =
@@ -142,6 +148,8 @@ export interface MatchHubDetails {
   /** Spectator mode configuration */
   spectatorLimit?: number;
   replayUrl?: string;
+  /** Live-stream sequence baseline adopted from the authoritative snapshot (#33) */
+  version?: number;
 }
 
 // ─── Spectator Mode Types ──────────────────────────────────────────────────────

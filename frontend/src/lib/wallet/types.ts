@@ -31,8 +31,10 @@ export interface AssetConfig {
 export interface AssetBalance {
   asset: WalletAssetCode;
   available: number;
-  locked: number;
-  total: number;
+  held: number | null;
+  pending: number | null;
+  precision: number;
+  asOf: string;
   hasTrustline: boolean;
   source: AssetSourceType;
   issuer?: string;

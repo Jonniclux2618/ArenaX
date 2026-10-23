@@ -51,6 +51,9 @@ log = "0.4"
 # Secure upload processing (#85): server-side content sniffing independent of
 # client-declared MIME types, plus object-key isolation for private storage.
 infer = "0.16"
+# Payment-provider webhook verification (#21): constant-time HMAC comparison
+# for signature checks over raw request bytes.
+subtle = "2.6"
 
 
 # Security: pin patched versions of transitive deps

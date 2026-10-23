@@ -29,6 +29,13 @@ Types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `migration`, `contrac
 
 ## Development setup
 
+### JavaScript toolchain
+
+Use Node.js 22.x and npm 10.9.3 for both `frontend/` and `server/`. The root
+`.nvmrc` and each `package.json` declare the supported toolchain. npm is the
+only package manager for these workspaces; commit changes to their respective
+`package-lock.json` files and do not create a pnpm lockfile.
+
 ### Backend (Rust)
 ```bash
 cd backend
@@ -65,6 +72,11 @@ npm run build
 
 - Keep PRs focused — one concern per PR.
 - All CI checks must pass before merge
+- Configure `Backend Build & Test` and `Backend Migrations` as required status
+  checks on protected branches. The Rust backend job runs migrations, SQLx
+  metadata validation, `cargo check`, and tests with PostgreSQL and Redis
+  readiness checks; it is blocking in the workflow. Repository branch
+  protection is maintained in GitHub settings, not by this workflow file.
 - Smart contract changes require two approvals
 - DB migrations must include a `.down.sql`
 - Never force-push to `main` or `dev`

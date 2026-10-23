@@ -92,12 +92,17 @@ export default function RegisterPage() {
       return;
     }
 
-    await registerUser({
-      username: result.data.username,
-      email: result.data.email,
-      password: result.data.password,
-      confirmPassword: result.data.confirmPassword,
-    });
+    try {
+      await registerUser({
+        username: result.data.username,
+        email: result.data.email,
+        password: result.data.password,
+        confirmPassword: result.data.confirmPassword,
+      });
+    } catch {
+      // AuthProvider presents a generic registration failure.
+      return;
+    }
 
     // register() intentionally does not populate the full user profile until
     // the email is verified, so the `user` effect above won't fire — navigate

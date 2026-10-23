@@ -19,6 +19,7 @@ import { clearAppBadge } from "@/hooks/useNotificationBadge";
 import { Button } from "@/components/ui/Button";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PersistentNotification } from "@/types/notification";
+import { safeRedirectPath } from "@/lib/safeNavigation";
 
 function formatTime(iso: string) {
   const date = new Date(iso);
@@ -39,6 +40,9 @@ function NotificationItem({
 }) {
   const { markAsRead, removeNotification } = useNotifications();
   const isRead = notification.read;
+  const safeLink = notification.link
+    ? safeRedirectPath(notification.link, "")
+    : "";
 
   const handleClick = () => {
     if (!isRead) markAsRead(notification.id);
@@ -81,8 +85,8 @@ function NotificationItem({
 
   return (
     <li className="group relative border-b border-border/50 last:border-0">
-      {notification.link ? (
-        <Link href={notification.link} onClick={onClose}>
+      {safeLink ? (
+        <Link href={safeLink} onClick={onClose}>
           {content}
         </Link>
       ) : (

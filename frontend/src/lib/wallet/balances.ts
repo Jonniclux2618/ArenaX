@@ -16,34 +16,52 @@ interface HorizonAccountResponse {
   balances: HorizonBalanceLine[];
 }
 
-type LockedBalanceRecord = Record<WalletAssetCode, number>;
+interface EscrowBalanceRecord {
+  held: Record<WalletAssetCode, number | null>;
+  pending: Record<WalletAssetCode, number | null>;
+}
+
+interface SorobanBalance {
+  amount: number;
+  precision: number;
+}
 
 const ASSET_CODES: WalletAssetCode[] = ["XLM", "USDC", "ARENAX"];
 
 const toNumber = (value: unknown): number => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+  const parsed =
+    typeof value === "number" || typeof value === "string"
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    throw new Error("Wallet balance response contains an invalid amount.");
+  }
+  return parsed;
 };
 
-const emptyLockedBalances = (): LockedBalanceRecord => ({
-  XLM: 0,
-  USDC: 0,
-  ARENAX: 0,
+const unavailableEscrowBalances = (): EscrowBalanceRecord => ({
+  held: { XLM: null, USDC: null, ARENAX: null },
+  pending: { XLM: null, USDC: null, ARENAX: null },
 });
 
 const buildAssetBalance = (
   asset: WalletAssetCode,
   available: number,
-  locked: number,
+  held: number | null,
+  pending: number | null,
   hasTrustline: boolean,
+  precision: number,
+  asOf: string,
 ): AssetBalance => {
   const config = walletConfig.assets[asset];
 
   return {
     asset,
     available,
-    locked,
-    total: available + locked,
+    held,
+    pending,
+    precision,
+    asOf,
     hasTrustline,
     source: config.source,
     issuer: config.issuer,
@@ -59,21 +77,34 @@ const resolveUrl = (endpoint: string, publicKey: string) => {
   return url.toString();
 };
 
-const normalizeLockedBalances = (raw: unknown): LockedBalanceRecord => {
+const normalizeEscrowBalances = (raw: unknown): EscrowBalanceRecord => {
   if (!raw || typeof raw !== "object") {
-    return emptyLockedBalances();
+    throw new Error("Escrow balance response is invalid.");
   }
 
   const response = raw as Record<string, unknown>;
-  const lockedNode =
-    response.locked && typeof response.locked === "object"
-      ? (response.locked as Record<string, unknown>)
-      : response;
+  const categoryValues = (
+    category: unknown,
+  ): Record<WalletAssetCode, number | null> => {
+    if (!category || typeof category !== "object") {
+      return { XLM: null, USDC: null, ARENAX: null };
+    }
+
+    const values = category as Record<string, unknown>;
+    return {
+      XLM: values.XLM === undefined ? null : toNumber(values.XLM),
+      USDC: values.USDC === undefined ? null : toNumber(values.USDC),
+      ARENAX: values.ARENAX === undefined ? null : toNumber(values.ARENAX),
+    };
+  };
 
   return {
-    XLM: toNumber(lockedNode.XLM),
-    USDC: toNumber(lockedNode.USDC),
-    ARENAX: toNumber(lockedNode.ARENAX),
+    held: categoryValues(
+      response.held ??
+        response.locked ??
+        (ASSET_CODES.some((asset) => asset in response) ? response : undefined),
+    ),
+    pending: categoryValues(response.pending),
   };
 };
 
@@ -118,104 +149,126 @@ const findClassicTrustline = (
   });
 };
 
-const fetchArenaxSorobanBalance = async (publicKey: string): Promise<number> => {
+const fetchArenaxSorobanBalance = async (
+  publicKey: string,
+): Promise<SorobanBalance> => {
   const endpoint = walletConfig.arenaxSorobanBalanceEndpoint;
   if (!endpoint) {
-    return 0;
+    throw new Error("ArenaX contract balance endpoint is not configured.");
   }
 
-  try {
-    const response = await fetch(resolveUrl(endpoint, publicKey), {
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      return 0;
-    }
-
-    const payload = (await response.json()) as Record<string, unknown>;
-    return toNumber(payload.balance);
-  } catch {
-    return 0;
+  const response = await fetch(resolveUrl(endpoint, publicKey), {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error("Unable to load ArenaX contract balance.");
   }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const amount = Number(payload.balance);
+  const precision = Number(payload.decimals ?? payload.precision);
+  if (
+    !Number.isFinite(amount) ||
+    !Number.isInteger(precision) ||
+    precision < 0 ||
+    precision > 20
+  ) {
+    throw new Error("ArenaX contract balance response is invalid.");
+  }
+
+  return { amount, precision };
 };
 
-export const fetchLockedBalances = async (
+export const fetchEscrowBalances = async (
   publicKey: string,
-): Promise<LockedBalanceRecord> => {
+): Promise<EscrowBalanceRecord> => {
   const endpoint = walletConfig.escrowBalancesEndpoint;
   if (!endpoint) {
-    return emptyLockedBalances();
+    return unavailableEscrowBalances();
   }
 
-  try {
-    const response = await fetch(resolveUrl(endpoint, publicKey), {
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
+  const response = await fetch(resolveUrl(endpoint, publicKey), {
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
 
-    if (!response.ok) {
-      return emptyLockedBalances();
-    }
-
-    const payload = (await response.json()) as unknown;
-    return normalizeLockedBalances(payload);
-  } catch {
-    return emptyLockedBalances();
+  if (!response.ok) {
+    throw new Error("Unable to load held and pending wallet balances.");
   }
+
+  return normalizeEscrowBalances(await response.json());
 };
 
 export const fetchWalletBalances = async (
   publicKey: string,
 ): Promise<WalletBalances> => {
-  const [account, locked] = await Promise.all([
+  const [account, escrow] = await Promise.all([
     fetchHorizonAccount(publicKey),
-    fetchLockedBalances(publicKey),
+    fetchEscrowBalances(publicKey),
   ]);
 
   const lines = account?.balances ?? [];
+  const asOf = new Date().toISOString();
 
   const xlmLine = lines.find((line) => line.asset_type === "native");
-  const xlmAvailable = toNumber(xlmLine?.balance);
+  const xlmAvailable = toNumber(xlmLine?.balance ?? 0);
 
   const usdcTrustline = findClassicTrustline(
     lines,
     "USDC",
     walletConfig.assets.USDC.issuer,
   );
-  const usdcAvailable = toNumber(usdcTrustline?.balance);
+  const usdcAvailable = toNumber(usdcTrustline?.balance ?? 0);
 
   const arenaConfig = walletConfig.assets.ARENAX;
 
   let arenaxAvailable = 0;
+  let arenaxPrecision = 7;
   let arenaxTrustline = true;
 
   if (arenaConfig.source === "soroban") {
-    arenaxAvailable = await fetchArenaxSorobanBalance(publicKey);
+    const contractBalance = await fetchArenaxSorobanBalance(publicKey);
+    arenaxAvailable = contractBalance.amount;
+    arenaxPrecision = contractBalance.precision;
   } else {
     const arenaTrustlineLine = findClassicTrustline(
       lines,
       "ARENAX",
       arenaConfig.issuer,
     );
-    arenaxAvailable = toNumber(arenaTrustlineLine?.balance);
+    arenaxAvailable = toNumber(arenaTrustlineLine?.balance ?? 0);
     arenaxTrustline = Boolean(arenaTrustlineLine);
   }
 
   const balances: WalletBalances = {
-    XLM: buildAssetBalance("XLM", xlmAvailable, locked.XLM, true),
+    XLM: buildAssetBalance(
+      "XLM",
+      xlmAvailable,
+      escrow.held.XLM,
+      escrow.pending.XLM,
+      true,
+      7,
+      asOf,
+    ),
     USDC: buildAssetBalance(
       "USDC",
       usdcAvailable,
-      locked.USDC,
+      escrow.held.USDC,
+      escrow.pending.USDC,
       Boolean(usdcTrustline),
+      7,
+      asOf,
     ),
     ARENAX: buildAssetBalance(
       "ARENAX",
       arenaxAvailable,
-      locked.ARENAX,
+      escrow.held.ARENAX,
+      escrow.pending.ARENAX,
       arenaxTrustline,
+      arenaxPrecision,
+      asOf,
     ),
   };
 
@@ -230,17 +283,23 @@ export const fetchWalletBalances = async (
 };
 
 export const createEmptyBalances = (): WalletBalances => {
-  const base = emptyLockedBalances();
-
   return ASSET_CODES.reduce((acc, asset) => {
-    acc[asset] = buildAssetBalance(asset, 0, base[asset], asset === "XLM");
+    acc[asset] = buildAssetBalance(
+      asset,
+      0,
+      null,
+      null,
+      asset === "XLM",
+      7,
+      new Date(0).toISOString(),
+    );
     return acc;
   }, {} as WalletBalances);
 };
 
-export const formatAssetAmount = (amount: number) => {
+export const formatAssetAmount = (amount: number, precision = 7) => {
   return amount.toLocaleString("en-US", {
     minimumFractionDigits: 0,
-    maximumFractionDigits: 7,
+    maximumFractionDigits: precision,
   });
 };

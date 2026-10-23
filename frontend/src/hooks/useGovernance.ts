@@ -4,6 +4,7 @@
  */
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { useAuth } from "@/hooks/useAuth";
 import type { Proposal, VoteChoice, CreateProposalDto } from "@/types/governance";
 
 // ---------------------------------------------------------------------------
@@ -14,11 +15,8 @@ import type { Proposal, VoteChoice, CreateProposalDto } from "@/types/governance
  * Returns true when a JWT access token is present in storage.
  * Works in both localStorage (remember-me) and sessionStorage (session-only).
  */
-function isAuthenticated(): boolean {
-  if (typeof window === "undefined") return false;
-  return !!(
-    localStorage.getItem("auth_token") ?? sessionStorage.getItem("auth_token")
-  );
+function useIsAuthenticated(): boolean {
+  return Boolean(useAuth().user);
 }
 
 /**
@@ -83,6 +81,7 @@ export function useProposal(id: string) {
  */
 export function useVoteOnProposal() {
   const qc = useQueryClient();
+  const isAuthenticated = useIsAuthenticated();
   return useMutation({
     mutationFn: async ({
       id,
@@ -93,7 +92,7 @@ export function useVoteOnProposal() {
       choice: VoteChoice;
       signature?: string;
     }) => {
-      if (!isAuthenticated()) {
+      if (!isAuthenticated) {
         throw new Error("Please log in to vote.");
       }
       try {
@@ -113,9 +112,10 @@ export function useVoteOnProposal() {
 /** Trigger execution of an APPROVED proposal */
 export function useExecuteProposal() {
   const qc = useQueryClient();
+  const isAuthenticated = useIsAuthenticated();
   return useMutation({
     mutationFn: async (id: string) => {
-      if (!isAuthenticated()) {
+      if (!isAuthenticated) {
         throw new Error("Please log in to execute proposals.");
       }
       try {
@@ -134,9 +134,10 @@ export function useExecuteProposal() {
 /** Start the voting period on a PENDING proposal */
 export function useStartVoting() {
   const qc = useQueryClient();
+  const isAuthenticated = useIsAuthenticated();
   return useMutation({
     mutationFn: async (id: string) => {
-      if (!isAuthenticated()) {
+      if (!isAuthenticated) {
         throw new Error("Please log in to start voting.");
       }
       try {
@@ -155,9 +156,10 @@ export function useStartVoting() {
 /** Create a new governance proposal */
 export function useCreateProposal() {
   const qc = useQueryClient();
+  const isAuthenticated = useIsAuthenticated();
   return useMutation({
     mutationFn: async (data: CreateProposalDto) => {
-      if (!isAuthenticated()) {
+      if (!isAuthenticated) {
         throw new Error("Please log in to create a proposal.");
       }
       try {

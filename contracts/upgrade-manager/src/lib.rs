@@ -47,13 +47,34 @@ pub enum DataKey {
     Validation(u32),
     Votes(u32),
     Executed(u32),
+    Canceled(u32),
+    Expiry(u32),
     ApprovedWasmHash(Symbol),
     PreviousWasmHash(Symbol),
     History(Symbol),
     Paused,
+    PausedUntil,
     Manifest(u32),
     ContractManifests(Symbol),
 }
+
+/// Official state machine stages for upgrade proposals (#56).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ProposalStatus {
+    Proposed = 0,
+    Validated = 1,
+    Approved = 2,
+    Executed = 3,
+    Canceled = 4,
+    Expired = 5,
+}
+
+/// Default grace window: proposals remain executable for 7 days after timelock elapses.
+pub const DEFAULT_GRACE_PERIOD: u64 = 604_800;
+/// Maximum emergency pause duration: 7 days to prevent permanent lockout (#57).
+pub const MAX_PAUSE_DURATION: u64 = 604_800;
 
 /// Upgrade manifest tracking schema versions and proposal details (#1064).
 #[contracttype]
@@ -122,6 +143,11 @@ pub enum UpgradeError {
     NoPriorVersion = 13,
     InvalidThreshold = 14,
     ContractPaused = 15,
+    ProposalCanceled = 16,
+    ProposalExpired = 17,
+    PayloadMismatch = 18,
+    Unauthorized = 19,
+    InvalidDuration = 20,
 }
 
 #[contract]
@@ -197,6 +223,10 @@ impl UpgradeManager {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        let expiry = timelock_end.saturating_add(DEFAULT_GRACE_PERIOD);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Expiry(proposal_id), &expiry);
         env.storage()
             .persistent()
             .set(&DataKey::Votes(proposal_id), &Vec::<Address>::new(&env));
@@ -376,9 +406,63 @@ impl UpgradeManager {
         Ok(votes.len())
     }
 
+    /// Cancel a pending proposal (#56).
+    ///
+    /// Can only be called by the proposer, the admin, or a governor.
+    /// Fails if the proposal is already executed, expired, or canceled.
+    pub fn cancel_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u32,
+        reason: Symbol,
+    ) -> Result<(), UpgradeError> {
+        caller.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+        let proposal = Self::get_proposal(&env, proposal_id)?;
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(UpgradeError::NotInitialized)?;
+        let is_gov = Self::is_governor(&env, &caller);
+
+        if caller != proposal.proposed_by && caller != admin && !is_gov {
+            return Err(UpgradeError::Unauthorized);
+        }
+
+        if Self::is_executed(&env, proposal_id) {
+            return Err(UpgradeError::AlreadyExecuted);
+        }
+        if Self::is_canceled(&env, proposal_id) {
+            return Err(UpgradeError::ProposalCanceled);
+        }
+
+        let expiry = Self::get_expiry_internal(&env, &proposal);
+        if env.ledger().timestamp() > expiry {
+            return Err(UpgradeError::ProposalExpired);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Canceled(proposal_id), &true);
+
+        events::emit_upgrade_canceled(
+            &env,
+            proposal_id,
+            &proposal.contract_name,
+            &proposal.new_wasm_hash,
+            &caller,
+            &reason,
+        );
+
+        Ok(())
+    }
+
     /// Execute an approved proposal. Requires: a positive validation
     /// verdict, at least `approval_threshold` yes-votes, the timelock
-    /// elapsed, and no prior execution of this proposal.
+    /// elapsed, valid expiry window, not canceled, and no prior execution.
     ///
     /// For [`SELF_CONTRACT`] this calls `update_current_contract_wasm`
     /// directly. For any other tracked contract it records the approved
@@ -388,19 +472,54 @@ impl UpgradeManager {
         caller: Address,
         proposal_id: u32,
     ) -> Result<(), UpgradeError> {
+        Self::execute_upgrade_internal(&env, caller, proposal_id, None)
+    }
+
+    /// Execute an approved proposal with explicit payload identity verification (#56).
+    ///
+    /// Ensures payload identity cannot be altered or substituted prior to execution.
+    pub fn execute_upgrade_guarded(
+        env: Env,
+        caller: Address,
+        proposal_id: u32,
+        expected_wasm_hash: BytesN<32>,
+    ) -> Result<(), UpgradeError> {
+        Self::execute_upgrade_internal(&env, caller, proposal_id, Some(expected_wasm_hash))
+    }
+
+    fn execute_upgrade_internal(
+        env: &Env,
+        caller: Address,
+        proposal_id: u32,
+        expected_wasm_hash: Option<BytesN<32>>,
+    ) -> Result<(), UpgradeError> {
         caller.require_auth();
-        Self::require_governor(&env, &caller)?;
-        Self::require_not_paused(&env)?;
+        Self::require_governor(env, &caller)?;
+        Self::require_not_paused(env)?;
 
-        let proposal = Self::get_proposal(&env, proposal_id)?;
+        let proposal = Self::get_proposal(env, proposal_id)?;
 
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::Executed(proposal_id))
-            .unwrap_or(false)
-        {
+        if Self::is_executed(env, proposal_id) {
             return Err(UpgradeError::AlreadyExecuted);
+        }
+        if Self::is_canceled(env, proposal_id) {
+            return Err(UpgradeError::ProposalCanceled);
+        }
+
+        let now = env.ledger().timestamp();
+        let expiry = Self::get_expiry_internal(env, &proposal);
+        if now > expiry {
+            return Err(UpgradeError::ProposalExpired);
+        }
+
+        if now < proposal.timelock_end {
+            return Err(UpgradeError::TimelockNotElapsed);
+        }
+
+        if let Some(expected) = expected_wasm_hash {
+            if expected != proposal.new_wasm_hash {
+                return Err(UpgradeError::PayloadMismatch);
+            }
         }
 
         let validation: ValidationResult = env
@@ -416,7 +535,7 @@ impl UpgradeManager {
             .storage()
             .persistent()
             .get(&DataKey::Votes(proposal_id))
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
         let threshold: u32 = env
             .storage()
             .instance()
@@ -426,15 +545,11 @@ impl UpgradeManager {
             return Err(UpgradeError::ThresholdNotMet);
         }
 
-        if env.ledger().timestamp() < proposal.timelock_end {
-            return Err(UpgradeError::TimelockNotElapsed);
-        }
-
         let previous_hash = env
             .storage()
             .persistent()
             .get(&DataKey::ApprovedWasmHash(proposal.contract_name.clone()))
-            .unwrap_or_else(|| Self::unknown_hash(&env));
+            .unwrap_or_else(|| Self::unknown_hash(env));
 
         env.storage().persistent().set(
             &DataKey::PreviousWasmHash(proposal.contract_name.clone()),
@@ -454,7 +569,7 @@ impl UpgradeManager {
         }
 
         Self::append_history(
-            &env,
+            env,
             &proposal.contract_name,
             UpgradeRecord {
                 proposal_id,
@@ -468,7 +583,7 @@ impl UpgradeManager {
         );
 
         events::emit_upgrade_executed(
-            &env,
+            env,
             proposal_id,
             &proposal.contract_name,
             &previous_hash,
@@ -552,6 +667,80 @@ impl UpgradeManager {
             .get(&DataKey::ApprovedWasmHash(contract_name))
     }
 
+    /// Return the current proposal status in the upgrade state machine (#56).
+    pub fn get_proposal_status(env: Env, proposal_id: u32) -> Result<ProposalStatus, UpgradeError> {
+        let proposal = Self::get_proposal(&env, proposal_id)?;
+
+        if Self::is_canceled(&env, proposal_id) {
+            return Ok(ProposalStatus::Canceled);
+        }
+        if Self::is_executed(&env, proposal_id) {
+            return Ok(ProposalStatus::Executed);
+        }
+
+        let now = env.ledger().timestamp();
+        let expiry = Self::get_expiry_internal(&env, &proposal);
+        if now > expiry {
+            return Ok(ProposalStatus::Expired);
+        }
+
+        let votes: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Votes(proposal_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ApprovalThreshold)
+            .unwrap_or(u32::MAX);
+
+        if votes.len() >= threshold {
+            return Ok(ProposalStatus::Approved);
+        }
+
+        if let Some(validation) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ValidationResult>(&DataKey::Validation(proposal_id))
+        {
+            if validation.is_valid {
+                return Ok(ProposalStatus::Validated);
+            }
+        }
+
+        Ok(ProposalStatus::Proposed)
+    }
+
+    pub fn is_canceled(env: &Env, proposal_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Canceled(proposal_id))
+            .unwrap_or(false)
+    }
+
+    pub fn is_executed(env: &Env, proposal_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Executed(proposal_id))
+            .unwrap_or(false)
+    }
+
+    pub fn get_proposal_expiry(env: Env, proposal_id: u32) -> Option<u64> {
+        let proposal: UpgradeProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))?;
+        Some(Self::get_expiry_internal(&env, &proposal))
+    }
+
+    fn get_expiry_internal(env: &Env, proposal: &UpgradeProposal) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Expiry(proposal.proposal_id))
+            .unwrap_or(proposal.timelock_end.saturating_add(DEFAULT_GRACE_PERIOD))
+    }
+
     pub fn get_proposal_query(env: Env, proposal_id: u32) -> Option<UpgradeProposal> {
         env.storage()
             .persistent()
@@ -581,11 +770,7 @@ impl UpgradeManager {
 
     /// Pause or resume the upgrade manager (admin only, emergency stop).
     ///
-    /// While paused, all state mutations (proposals, votes, validations,
-    /// executions, rollbacks) are rejected; queries keep working. Deliberately
-    /// NOT guarded by `require_not_paused` itself — unpausing must stay
-    /// reachable while paused. The flag lives in instance storage, which
-    /// persists across wasm upgrades of this contract at the same address.
+    /// Automatically applies bounded duration to prevent permanent lockout (#57).
     pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), UpgradeError> {
         caller.require_auth();
         let admin: Address = env
@@ -600,6 +785,8 @@ impl UpgradeManager {
         env.storage().instance().set(&DataKey::Paused, &paused);
 
         if paused {
+            let until = env.ledger().timestamp().saturating_add(MAX_PAUSE_DURATION);
+            env.storage().instance().set(&DataKey::PausedUntil, &until);
             arenax_events::emergency_pause::emit_paused(
                 &env,
                 &env.current_contract_address(),
@@ -607,6 +794,7 @@ impl UpgradeManager {
                 &symbol_short!("ADMIN"),
             );
         } else {
+            env.storage().instance().set(&DataKey::PausedUntil, &0u64);
             arenax_events::emergency_pause::emit_unpaused(
                 &env,
                 &env.current_contract_address(),
@@ -617,11 +805,28 @@ impl UpgradeManager {
     }
 
     /// Check if the upgrade manager is paused (read; works while paused).
+    ///
+    /// If the bounded pause window has elapsed, the contract automatically unpauses (#57).
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
+        let paused: bool = env
+            .storage()
             .instance()
             .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !paused {
+            return false;
+        }
+
+        if let Some(until) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::PausedUntil)
+        {
+            if until > 0 && env.ledger().timestamp() >= until {
+                return false;
+            }
+        }
+        true
     }
 
     fn require_initialized(env: &Env) -> Result<(), UpgradeError> {
@@ -638,13 +843,13 @@ impl UpgradeManager {
         Ok(())
     }
 
+    fn is_governor(env: &Env, address: &Address) -> bool {
+        let governors: Option<Vec<Address>> = env.storage().instance().get(&DataKey::Governors);
+        governors.map(|g| g.contains(address)).unwrap_or(false)
+    }
+
     fn require_governor(env: &Env, address: &Address) -> Result<(), UpgradeError> {
-        let governors: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Governors)
-            .ok_or(UpgradeError::NotInitialized)?;
-        if !governors.contains(address) {
+        if !Self::is_governor(env, address) {
             return Err(UpgradeError::NotGovernor);
         }
         Ok(())

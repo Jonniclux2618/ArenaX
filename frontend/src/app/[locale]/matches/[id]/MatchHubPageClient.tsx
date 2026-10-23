@@ -11,8 +11,10 @@ import {
   useMatchWebSocket,
 } from "@/hooks/useMatchWebSocket";
 import { useMatch } from "@/hooks/useMatches";
-import { MatchDetailView } from "@/components/match/MatchDetailView";
-import { SpectatorMode } from "@/components/match/SpectatorMode";
+import {
+  DynamicMatchDetailView,
+  DynamicSpectatorMode,
+} from "@/lib/dynamicImports";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -85,10 +87,11 @@ function MatchHubPageContent() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [match?.status]);
 
-  const { isConnected, lastUpdate, connectionError, connectionRestored, reconnect } = useMatchWebSocket({
-    matchId,
-    enabled: match?.status === "in_progress" || match?.status === "disputed",
-  });
+  const { isConnected, lastUpdate, connectionError, connectionRestored, lastSyncedAt, reconnect } =
+    useMatchWebSocket({
+      matchId,
+      enabled: match?.status === "in_progress" || match?.status === "disputed",
+    });
 
   const expectedOpponentReport = useMemo(() => {
     if (!match?.reports.length) {
@@ -135,15 +138,23 @@ function MatchHubPageContent() {
     }
 
     if (lastUpdate.message) {
-      setLiveFeed((previous) => [
-        {
-          id: `live-${lastUpdate.timestamp}`,
-          type: lastUpdate.status === "disputed" ? "alert" : "score",
-          message: lastUpdate.message!,
-          createdAt: new Date(lastUpdate.timestamp).toISOString(),
-        },
-        ...previous,
-      ]);
+      // Version-stamped id (#33): sequenced frames are applied exactly once,
+      // and the id lets the list dedupe any residual replay.
+      const eventId = `live-${lastUpdate.version ?? lastUpdate.timestamp}`;
+      setLiveFeed((previous) => {
+        if (previous.some((entry) => entry.id === eventId)) {
+          return previous;
+        }
+        return [
+          {
+            id: eventId,
+            type: lastUpdate.status === "disputed" ? "alert" : "score",
+            message: lastUpdate.message!,
+            createdAt: new Date(lastUpdate.timestamp).toISOString(),
+          },
+          ...previous,
+        ];
+      });
     }
   }, [lastUpdate, match]);
 
@@ -219,7 +230,7 @@ function MatchHubPageContent() {
               Back
             </Button>
           </div>
-          <MatchDetailView
+          <DynamicMatchDetailView
             match={matchDetail}
             currentUserId={currentUserId}
             onReportIssue={() => {
@@ -261,7 +272,7 @@ function MatchHubPageContent() {
     (isLive || isDisputed || match.status === "completed")
   ) {
     return (
-      <SpectatorMode
+      <DynamicSpectatorMode
         match={match as MatchHubDetails}
         currentUserId={currentUserId}
         currentUserName={user?.username ?? "Spectator"}
@@ -354,7 +365,11 @@ function MatchHubPageContent() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3">
-                  <ConnectionPill isConnected={isConnected} active={isLive || isDisputed} />
+                  <ConnectionPill
+                    isConnected={isConnected}
+                    active={isLive || isDisputed}
+                    lastSyncedAt={lastSyncedAt}
+                  />
                   <StatusPill status={match.status} />
                 </div>
               </div>
@@ -595,9 +610,11 @@ function MatchHubPageContent() {
 function ConnectionPill({
   isConnected,
   active,
+  lastSyncedAt,
 }: {
   isConnected: boolean;
   active: boolean;
+  lastSyncedAt: number | null;
 }) {
   if (!active) {
     return (
@@ -608,12 +625,20 @@ function ConnectionPill({
   }
 
   return (
-    <div
-      className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm ${isConnected ? "bg-emerald-400/15 text-emerald-200" : "bg-rose-400/15 text-rose-100"
-        }`}
-    >
-      {isConnected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
-      {isConnected ? "Live relay connected" : "Relay reconnecting"}
+    <div className="flex flex-col items-end gap-1">
+      <div
+        className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm ${isConnected ? "bg-emerald-400/15 text-emerald-200" : "bg-rose-400/15 text-rose-100"
+          }`}
+      >
+        {isConnected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+        {isConnected ? "Live relay connected" : "Relay reconnecting"}
+      </div>
+      {/* Last successful synchronization (#33) — display-only, never blocks actions */}
+      <p role="status" className="text-[11px] text-foreground/60">
+        {lastSyncedAt
+          ? `Synced ${new Date(lastSyncedAt).toLocaleTimeString()}`
+          : "Syncing…"}
+      </p>
     </div>
   );
 }

@@ -33,10 +33,7 @@ type PageState = 'loading' | 'ready' | 'countdown' | 'error';
 
 function buildWsUrl(sessionId: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const token =
-    localStorage.getItem('auth_token') ?? sessionStorage.getItem('auth_token');
-  const qs = token ? `?token=${encodeURIComponent(token)}` : '';
-  return `${protocol}://${window.location.host}/ws/lobby/${sessionId}${qs}`;
+  return `${protocol}://${window.location.host}/ws/lobby/${encodeURIComponent(sessionId)}`;
 }
 
 const GAME_MODE_LABELS: Record<string, string> = {

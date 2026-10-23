@@ -53,6 +53,9 @@ pub enum DataKey {
     RewardPool,
     TotalStaked,
     Stake(Address),
+    /// Per-position sub-unit carry and APR snapshot; whole unfunded accrual expires at checkpoint.
+    RewardRemainder(Address),
+    RewardRate(Address),
     EpochDistributed(u64),
     GlobalPauseContract,
 }
@@ -109,8 +112,11 @@ impl StakingRewardsContract {
             .persistent()
             .get::<DataKey, StakingPosition>(&key)
         {
-            current.pending_rewards += Self::calculate_position_rewards(&current, &params, now);
-            current.amount += amount;
+            Self::checkpoint_position(&env, &mut current, &params, now);
+            current.amount = current
+                .amount
+                .checked_add(amount)
+                .expect("stake amount overflow");
             current.lock_period = current.lock_period.max(lock_period);
             current.last_reward_at = now;
             current.governance_weight =
@@ -128,6 +134,15 @@ impl StakingRewardsContract {
             }
         };
 
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::RewardRate(user.clone()))
+        {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RewardRate(user.clone()), &params.annual_rate_bps);
+        }
         env.storage().persistent().set(&key, &position);
         let total = env
             .storage()
@@ -136,7 +151,10 @@ impl StakingRewardsContract {
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::TotalStaked, &(total + amount));
+            .set(
+                &DataKey::TotalStaked,
+                &total.checked_add(amount).expect("total stake overflow"),
+            );
         env.events().publish(
             (soroban_sdk::symbol_short!("STAKED"), user),
             (amount, lock_period),
@@ -166,20 +184,36 @@ impl StakingRewardsContract {
         }
 
         let now = env.ledger().timestamp();
-        position.pending_rewards += Self::calculate_position_rewards(&position, &params, now);
-        let unlocked_at = position.staked_at + position.lock_period;
+        Self::checkpoint_position(&env, &mut position, &params, now);
+        let unlocked_at = position
+            .staked_at
+            .checked_add(position.lock_period)
+            .expect("unlock timestamp overflow");
         let penalty = if now < unlocked_at {
-            amount * params.early_unstake_penalty_bps as i128 / 10_000
+            amount
+                .checked_mul(params.early_unstake_penalty_bps as i128)
+                .expect("unstake penalty overflow")
+                / 10_000
         } else {
             0
         };
         let payout = amount - penalty;
 
         position.amount -= amount;
-        position.last_reward_at = now;
         position.governance_weight = Self::governance_weight(position.amount, position.lock_period);
-        if position.amount == 0 {
+        let reward_remainder = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::RewardRemainder(user.clone()))
+            .unwrap_or(0);
+        if position.amount == 0 && position.pending_rewards == 0 && reward_remainder == 0 {
             env.storage().persistent().remove(&key);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::RewardRate(user.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::RewardRemainder(user.clone()));
         } else {
             env.storage().persistent().set(&key, &position);
         }
@@ -191,7 +225,10 @@ impl StakingRewardsContract {
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::TotalStaked, &(total - amount).max(0));
+            .set(
+                &DataKey::TotalStaked,
+                &total.checked_sub(amount).expect("total stake underflow"),
+            );
         let token = Self::token(&env);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &user, &payout);
         if penalty > 0 {
@@ -200,9 +237,10 @@ impl StakingRewardsContract {
                 .instance()
                 .get::<DataKey, i128>(&DataKey::RewardPool)
                 .unwrap_or(0);
-            env.storage()
-                .instance()
-                .set(&DataKey::RewardPool, &(pool + penalty));
+            env.storage().instance().set(
+                &DataKey::RewardPool,
+                &pool.checked_add(penalty).expect("reward pool overflow"),
+            );
         }
         env.events().publish(
             (soroban_sdk::symbol_short!("UNSTAKED"), user),
@@ -221,9 +259,22 @@ impl StakingRewardsContract {
             .persistent()
             .get::<DataKey, StakingPosition>(&DataKey::Stake(user))
         {
-            let synthetic_now = position.last_reward_at + period;
-            Self::calculate_position_rewards(&position, &params, synthetic_now)
-                + position.pending_rewards
+            let synthetic_now = position
+                .last_reward_at
+                .checked_add(period)
+                .expect("reward period overflow");
+            let pool = env
+                .storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::RewardPool)
+                .unwrap_or(0);
+            position
+                .pending_rewards
+                .checked_add(
+                    Self::calculate_position_rewards(&env, &position, &params, synthetic_now)
+                        .min(pool),
+                )
+                .expect("reward calculation overflow")
         } else {
             0
         }
@@ -251,9 +302,6 @@ impl StakingRewardsContract {
             .unwrap_or(0);
         let distribution = pool.min(total / 100);
         env.storage()
-            .instance()
-            .set(&DataKey::RewardPool, &(pool - distribution));
-        env.storage()
             .persistent()
             .set(&DataKey::EpochDistributed(epoch), &distribution);
         env.events()
@@ -275,31 +323,16 @@ impl StakingRewardsContract {
             .get(&key)
             .expect("stake not found");
         let now = env.ledger().timestamp();
-        let rewards =
-            position.pending_rewards + Self::calculate_position_rewards(&position, &params, now);
-        if rewards <= 0 {
-            panic!("no rewards");
-        }
-
-        let pool = env
-            .storage()
-            .instance()
-            .get::<DataKey, i128>(&DataKey::RewardPool)
-            .unwrap_or(0);
-        let payout = rewards.min(pool);
-        if payout <= 0 {
-            panic!("reward pool empty");
-        }
-
-        position.pending_rewards = rewards - payout;
-        position.last_reward_at = now;
+        Self::checkpoint_position(&env, &mut position, &params, now);
+        let rewards = position.pending_rewards;
+        position.pending_rewards = 0;
         env.storage().persistent().set(&key, &position);
-        env.storage()
-            .instance()
-            .set(&DataKey::RewardPool, &(pool - payout));
+        if rewards == 0 {
+            return 0;
+        }
         let token = Self::token(&env);
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &user, &payout);
-        payout
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &user, &rewards);
+        rewards
     }
 
     pub fn get_staking_info(env: Env, user: Address) -> StakingInfo {
@@ -325,8 +358,22 @@ impl StakingRewardsContract {
                     .instance()
                     .get(&DataKey::Params)
                     .expect("params missing");
-                Self::calculate_position_rewards(&p, &params, env.ledger().timestamp())
-                    + p.pending_rewards
+                let pool = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, i128>(&DataKey::RewardPool)
+                    .unwrap_or(0);
+                p.pending_rewards
+                    .checked_add(
+                        Self::calculate_position_rewards(
+                            &env,
+                            &p,
+                            &params,
+                            env.ledger().timestamp(),
+                        )
+                        .min(pool),
+                    )
+                    .expect("reward calculation overflow")
             })
             .unwrap_or(0);
 
@@ -418,20 +465,82 @@ impl StakingRewardsContract {
     }
 
     fn calculate_position_rewards(
+        env: &Env,
         position: &StakingPosition,
         params: &RewardParams,
         now: u64,
     ) -> i128 {
+        Self::calculate_position_reward_parts(env, position, params, now).0
+    }
+
+    fn calculate_position_reward_parts(
+        env: &Env,
+        position: &StakingPosition,
+        params: &RewardParams,
+        now: u64,
+    ) -> (i128, i128) {
         let elapsed = now.saturating_sub(position.last_reward_at) as i128;
         let lock_multiplier_bps =
             10_000 + (position.lock_period.min(31_536_000) as i128 * 5_000 / 31_536_000);
-        position.amount * params.annual_rate_bps as i128 * lock_multiplier_bps * elapsed
-            / (31_536_000i128 * 10_000 * 10_000)
+        let reward_remainder = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::RewardRemainder(position.user.clone()))
+            .unwrap_or(0);
+        let reward_rate_bps = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RewardRate(position.user.clone()))
+            .unwrap_or(params.annual_rate_bps);
+        let numerator = position
+            .amount
+            .checked_mul(reward_rate_bps as i128)
+            .and_then(|value| value.checked_mul(lock_multiplier_bps))
+            .and_then(|value| value.checked_mul(elapsed))
+            .and_then(|value| value.checked_add(reward_remainder))
+            .expect("reward calculation overflow");
+        let denominator = 31_536_000i128 * 10_000 * 10_000;
+        (numerator / denominator, numerator % denominator)
+    }
+
+    fn checkpoint_position(
+        env: &Env,
+        position: &mut StakingPosition,
+        params: &RewardParams,
+        now: u64,
+    ) {
+        let (accrued, remainder) =
+            Self::calculate_position_reward_parts(env, position, params, now);
+        let pool = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::RewardPool)
+            .unwrap_or(0);
+        let funded_accrual = accrued.min(pool);
+        position.pending_rewards = position
+            .pending_rewards
+            .checked_add(funded_accrual)
+            .expect("pending reward overflow");
+        env.storage().persistent().set(
+            &DataKey::RewardRemainder(position.user.clone()),
+            &remainder,
+        );
+        env.storage().persistent().set(
+            &DataKey::RewardRate(position.user.clone()),
+            &params.annual_rate_bps,
+        );
+        position.last_reward_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPool, &(pool - funded_accrual));
     }
 
     fn governance_weight(amount: i128, lock_period: u64) -> i128 {
         let lock_bonus_bps = lock_period.min(31_536_000) as i128 * 5_000 / 31_536_000;
-        amount * (10_000 + lock_bonus_bps) / 10_000
+        amount
+            .checked_mul(10_000 + lock_bonus_bps)
+            .expect("governance weight overflow")
+            / 10_000
     }
 
     fn require_admin(env: &Env) {

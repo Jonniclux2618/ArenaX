@@ -67,6 +67,8 @@ pub enum DataKey {
     TimeRestriction(Address, u32),    // (Account, Role) -> TimeRestriction
     AuditLog(u64),                    // (EntryId) -> AuditEntry
     AuditCounter,
+    PermissionCacheRevision(Address, String),
+    PermissionRevision,
 }
 
 #[contracttype]
@@ -121,9 +123,6 @@ impl AccessControl {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
 
-        // Grant admin role to the admin address
-        let key = DataKey::Role(admin.clone(), ROLE_ADMIN);
-        env.storage().persistent().set(&key, &true);
         events::emit_role_granted(&env, &admin, ROLE_ADMIN, &admin);
 
         Self::record_audit_entry_internal(
@@ -137,12 +136,18 @@ impl AccessControl {
 
     /// Check if an account has a specific role (or admin role)
     pub fn has_role(env: Env, account: Address, role: u32) -> bool {
-        // Admin has all privileges
+        if !ALL_ROLE_IDS.contains(&role) {
+            return false;
+        }
+
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("not initialized");
+        if role == ROLE_ADMIN {
+            return account == admin;
+        }
         if account == admin {
             return true;
         }
@@ -166,8 +171,16 @@ impl AccessControl {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
 
+        if !ALL_ROLE_IDS.contains(&role) || role == ROLE_ADMIN {
+            panic!("admin role can only be assigned through admin handoff");
+        }
+        if account == env.current_contract_address() {
+            panic!("contract cannot grant a role to itself");
+        }
+
         let key = DataKey::Role(account.clone(), role);
         env.storage().persistent().set(&key, &true);
+        Self::bump_permission_revision(&env);
 
         events::emit_role_granted(&env, &account, role, &admin);
 
@@ -185,8 +198,13 @@ impl AccessControl {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
 
+        if role == ROLE_ADMIN {
+            panic!("admin role can only be revoked through admin handoff");
+        }
+
         let key = DataKey::Role(account.clone(), role);
         env.storage().persistent().remove(&key);
+        Self::bump_permission_revision(&env);
 
         events::emit_role_revoked(&env, &account, role, &admin);
 
@@ -209,6 +227,9 @@ impl AccessControl {
     ) {
         delegator.require_auth();
 
+        if role == ROLE_ADMIN {
+            panic!("admin role cannot be delegated");
+        }
         if !Self::has_role(env.clone(), delegator.clone(), role) {
             panic!("delegator does not have the specified role");
         }
@@ -328,6 +349,7 @@ impl AccessControl {
         env.storage()
             .persistent()
             .set(&DataKey::Permission(name), &perm);
+        Self::bump_permission_revision(&env);
     }
 
     /// Assign a permission to a role
@@ -349,6 +371,7 @@ impl AccessControl {
         }
         perms.push_back(permission_name.clone());
         env.storage().persistent().set(&key, &perms);
+        Self::bump_permission_revision(&env);
 
         Self::record_audit_entry_internal(
             &env,
@@ -378,6 +401,7 @@ impl AccessControl {
             i += 1;
         }
         env.storage().persistent().set(&key, &new_perms);
+        Self::bump_permission_revision(&env);
 
         Self::record_audit_entry_internal(
             &env,
@@ -418,8 +442,19 @@ impl AccessControl {
     /// Check if an account has a specific permission (with storage caching)
     pub fn account_has_permission(env: Env, account: Address, permission_name: String) -> bool {
         let cache_key = DataKey::PermissionCache(account.clone(), permission_name.clone());
-        if let Some(cached) = env.storage().persistent().get::<DataKey, bool>(&cache_key) {
-            return cached;
+        let revision = Self::permission_revision(&env);
+        let cache_revision_key =
+            DataKey::PermissionCacheRevision(account.clone(), permission_name.clone());
+        if let Some(cached_revision) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&cache_revision_key)
+        {
+            if cached_revision == revision {
+                if let Some(cached) = env.storage().persistent().get::<DataKey, bool>(&cache_key) {
+                    return cached;
+                }
+            }
         }
 
         let roles_to_check = soroban_sdk::vec![
@@ -451,13 +486,18 @@ impl AccessControl {
 
         // Cache the evaluated result in storage
         env.storage().persistent().set(&cache_key, &has_perm);
+        env.storage()
+            .persistent()
+            .set(&cache_revision_key, &revision);
         has_perm
     }
 
     /// Manually clear cached permission evaluation for an account and permission
     pub fn clear_permission_cache(env: Env, account: Address, permission_name: String) {
-        let cache_key = DataKey::PermissionCache(account, permission_name);
+        let cache_key = DataKey::PermissionCache(account.clone(), permission_name.clone());
         env.storage().persistent().remove(&cache_key);
+        let revision_key = DataKey::PermissionCacheRevision(account, permission_name);
+        env.storage().persistent().remove(&revision_key);
     }
 
     // ── Time-Based Access ──────────────────────────────────────────────────
@@ -532,6 +572,9 @@ impl AccessControl {
     ) {
         delegator.require_auth();
 
+        if role == ROLE_ADMIN {
+            panic!("admin role cannot be delegated");
+        }
         if !Self::has_role(env.clone(), delegator.clone(), role) {
             panic!("delegator does not have the specified role");
         }
@@ -560,6 +603,9 @@ impl AccessControl {
     }
 
     pub fn use_delegation(env: Env, delegator: Address, delegatee: Address, role: u32) -> bool {
+        if role == ROLE_ADMIN || !Self::has_role(env.clone(), delegator.clone(), role) {
+            return false;
+        }
         let key = DataKey::Delegation(delegator.clone(), delegatee.clone());
         let mut info: DelegationInfo = match env.storage().persistent().get(&key) {
             Some(i) => i,
@@ -664,9 +710,46 @@ impl AccessControl {
             .expect("not initialized")
     }
 
+    /// Atomically replace the sole administrator. Both parties must authorize
+    /// the handoff; the old administrator cannot be removed independently.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current_admin = Self::get_admin(env.clone());
+        current_admin.require_auth();
+        if new_admin == current_admin {
+            panic!("new admin must differ from current admin");
+        }
+        new_admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Self::bump_permission_revision(&env);
+        events::emit_role_granted(&env, &new_admin, ROLE_ADMIN, &current_admin);
+        events::emit_role_revoked(&env, &current_admin, ROLE_ADMIN, &new_admin);
+        Self::record_audit_entry_internal(
+            &env,
+            current_admin,
+            String::from_str(&env, "TRANSFER_ADMIN"),
+            new_admin,
+            String::from_str(&env, "Administrator transferred by mutual authorization"),
+        );
+    }
+
     fn require_admin(env: &Env) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+    }
+
+    fn permission_revision(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PermissionRevision)
+            .unwrap_or(0)
+    }
+
+    fn bump_permission_revision(env: &Env) {
+        let revision = Self::permission_revision(env).saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::PermissionRevision, &revision);
     }
 
     pub fn get_permission_definitions(

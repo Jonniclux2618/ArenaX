@@ -54,6 +54,7 @@ export function WalletDashboard() {
   const balancesQuery = useQuery({
     queryKey: ["wallet-balances", publicKey, walletConfig.network],
     enabled: Boolean(publicKey),
+    staleTime: 25_000,
     queryFn: async () => {
       if (!publicKey) {
         return createEmptyBalances();
@@ -172,6 +173,8 @@ export function WalletDashboard() {
       <BalanceCards
         isConnected={isConnected}
         isLoading={Boolean(publicKey) && balancesQuery.isLoading}
+        hasError={Boolean(balancesQuery.error) && !balancesQuery.data}
+        isStale={balancesQuery.isStale}
         balances={balances}
       />
 
@@ -196,7 +199,7 @@ export function WalletDashboard() {
       />
 
       {/* Withdraw Modal with explicit confirmation before irreversible action (#39) */}
-      {isConnected && (
+      {isConnected && balancesQuery.data && (
         <WithdrawModal
           open={isWithdrawOpen}
           balances={balances}

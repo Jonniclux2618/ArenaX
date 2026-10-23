@@ -70,6 +70,22 @@ export const DynamicMatchDetailView = dynamic(
   }
 );
 
+export const DynamicSpectatorMode = dynamic(
+  () => import('@/components/match/SpectatorMode').then(m => m.SpectatorMode),
+  { 
+    loading: () => <LoadingSkeleton height="h-96" />,
+    ssr: false 
+  }
+);
+
+export const DynamicBracketSeedingEditor = dynamic(
+  () => import('@/components/tournaments/BracketSeedingEditor').then(m => m.BracketSeedingEditor),
+  { 
+    loading: () => <LoadingSkeleton height="h-64" />,
+    ssr: false 
+  }
+);
+
 // Tournament registration
 export const DynamicJoinTournamentButton = dynamic(
   () => import('@/components/tournaments/JoinTournamentButton').then(m => m.JoinTournamentButton),

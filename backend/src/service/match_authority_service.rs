@@ -340,85 +340,156 @@ impl MatchAuthorityService {
     // COMPLETE MATCH
     // =============================================================================
 
-    /// Complete a match (STARTED -> COMPLETED transition)
+    /// Complete a match (STARTED -> COMPLETED transition).
+    ///
+    /// # Atomicity guarantee
+    ///
+    /// The state check, state update, chain-sync record, and transition record
+    /// are all performed inside a single serialisable transaction that acquires
+    /// a `FOR UPDATE` row lock.  Concurrent calls for the same match will
+    /// queue behind the lock; only one will see a valid `STARTED` state and
+    /// succeed — subsequent calls will see `COMPLETED` (idempotent) or
+    /// receive an `InvalidStateTransition` conflict response.
     pub async fn complete_match(
         &self,
         match_id: Uuid,
         dto: CompleteMatchDTO,
+        actor: &str,
         signer_secret: &str,
     ) -> Result<MatchAuthorityResponse, ApiError> {
         // Validate DTO
         validator::Validate::validate(&dto)
             .map_err(|e| ApiError::bad_request(format!("Validation error: {}", e)))?;
 
-        // Get match
-        let match_entity = self.get_match_entity(match_id).await?;
+        let config = TransactionConfig {
+            isolation_level: IsolationLevel::Serializable,
+            max_retries: 3,
+            ..Default::default()
+        };
 
-        // Validate FSM transition
-        self.validate_transition(&match_entity.state, &MatchAuthorityState::Completed)?;
+        let dto_clone = dto.clone();
+        let actor_owned = actor.to_string();
+        let signer_secret_owned = signer_secret.to_string();
+        let db_pool = self.db_pool.clone();
+        let soroban_service = self.soroban_service.clone();
+        let match_lifecycle_contract = self.match_lifecycle_contract.clone();
 
-        // Validate winner is one of the players
-        if dto.winner != match_entity.player_a && dto.winner != match_entity.player_b {
-            return Err(ApiError::bad_request(
-                "Winner must be one of the match players",
-            ));
-        }
+        execute_transaction(&db_pool, &config, move |tx| {
+            let dto = dto_clone.clone();
+            let actor = actor_owned.clone();
+            let signer_secret = signer_secret_owned.clone();
+            let soroban_service = soroban_service.clone();
+            let match_lifecycle_contract = match_lifecycle_contract.clone();
+            Box::pin(async move {
+                // Acquire row lock to prevent concurrent state changes.
+                let match_entity = sqlx::query_as!(
+                    MatchAuthorityEntity,
+                    r#"
+                    SELECT
+                        id, on_chain_match_id, player_a, player_b, winner,
+                        state as "state: MatchAuthorityState",
+                        created_at, started_at, ended_at, last_chain_tx,
+                        idempotency_key, metadata
+                    FROM match_authority
+                    WHERE id = $1
+                    FOR UPDATE
+                    "#,
+                    match_id
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?
+                .ok_or_else(|| ApiError::not_found("Match not found"))?;
 
-        info!(
-            match_id = %match_id,
-            winner = %dto.winner,
-            "Completing match"
-        );
+                // Validate FSM transition — stable conflict response on failure.
+                if !match_entity.state.can_transition_to(&MatchAuthorityState::Completed) {
+                    return Err(ApiError::conflict(&format!(
+                        "Invalid state transition from {:?} to Completed",
+                        match_entity.state
+                    )));
+                }
 
-        // Step 1: Submit complete_match transaction to blockchain
-        let chain_result = self
-            .complete_match_on_chain(&match_entity.on_chain_match_id, &dto.winner, signer_secret)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to complete match on blockchain");
-                ApiError::internal_error(format!("Blockchain completion failed: {}", e))
-            })?;
+                // Validate winner is one of the players.
+                if dto.winner != match_entity.player_a && dto.winner != match_entity.player_b {
+                    return Err(ApiError::bad_request(
+                        "Winner must be one of the match players",
+                    ));
+                }
 
-        // Step 2: Update match state
-        sqlx::query!(
-            r#"
-            UPDATE match_authority
-            SET state = 'COMPLETED'::match_authority_state,
-                winner = $1,
-                last_chain_tx = $2,
-                ended_at = NOW()
-            WHERE id = $3
-            "#,
-            dto.winner,
-            chain_result.hash,
-            match_id
-        )
-        .execute(&self.db_pool)
-        .await
-        .map_err(|e| ApiError::database_error(e))?;
+                info!(match_id = %match_id, winner = %dto.winner, "Completing match");
 
-        // Step 3: Record blockchain sync
-        self.record_chain_sync(
-            match_id,
-            "complete_match",
-            &chain_result.hash,
-            "pending",
-            None,
-        )
+                let chain_result = complete_match_on_chain_helper(
+                    &soroban_service,
+                    &match_lifecycle_contract,
+                    &match_entity.on_chain_match_id,
+                    &dto.winner,
+                    &signer_secret,
+                )
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to complete match on blockchain");
+                    ApiError::internal_error(format!("Blockchain completion failed: {}", e))
+                })?;
+
+                // Update match state within transaction.
+                sqlx::query!(
+                    r#"
+                    UPDATE match_authority
+                    SET state = 'COMPLETED'::match_authority_state,
+                        winner = $1,
+                        last_chain_tx = $2,
+                        ended_at = NOW()
+                    WHERE id = $3
+                    "#,
+                    dto.winner,
+                    chain_result.hash,
+                    match_id
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                // Record blockchain sync within transaction.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_chain_sync (
+                        id, match_id, operation_type, tx_hash, tx_status, error_message, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(), match_id, "complete_match",
+                    chain_result.hash, "pending", None::<String>, serde_json::json!({})
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                // Record transition with actor, timestamp (DB NOW()), and reason.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_transitions (
+                        id, match_id, from_state, to_state, actor, chain_tx, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(),
+                    match_id,
+                    match_entity.state as MatchAuthorityState,
+                    MatchAuthorityState::Completed as MatchAuthorityState,
+                    actor,
+                    chain_result.hash,
+                    serde_json::json!({
+                        "winner": dto.winner,
+                        "reason": dto.reason.as_deref().unwrap_or("match_result_submitted")
+                    })
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                info!(match_id = %match_id, "Match completed successfully");
+                Ok::<(), ApiError>(())
+            })
+        })
         .await?;
-
-        // Step 4: Record transition
-        self.record_transition(
-            match_id,
-            match_entity.state,
-            MatchAuthorityState::Completed,
-            &dto.winner,
-            Some(&chain_result.hash),
-            None,
-        )
-        .await?;
-
-        info!(match_id = %match_id, "Match completed successfully");
 
         self.get_match_with_transitions(match_id).await
     }
@@ -427,7 +498,16 @@ impl MatchAuthorityService {
     // DISPUTE MATCH
     // =============================================================================
 
-    /// Raise a dispute for a match (COMPLETED -> DISPUTED transition)
+    /// Raise a dispute for a match (COMPLETED -> DISPUTED transition).
+    ///
+    /// # Atomicity guarantee
+    ///
+    /// The state check, state update, chain-sync record, and transition record
+    /// are all performed inside a single serialisable transaction that acquires
+    /// a `FOR UPDATE` row lock.  Simultaneous finalize + dispute attempts for
+    /// the same match will serialize: exactly one will see `COMPLETED` and
+    /// succeed; the other will see `DISPUTED` or `FINALIZED` and receive a
+    /// stable conflict response without partial updates.
     pub async fn raise_dispute(
         &self,
         match_id: Uuid,
@@ -435,69 +515,127 @@ impl MatchAuthorityService {
         reason: String,
         signer_secret: &str,
     ) -> Result<MatchAuthorityResponse, ApiError> {
-        // Get match
-        let match_entity = self.get_match_entity(match_id).await?;
+        let config = TransactionConfig {
+            isolation_level: IsolationLevel::Serializable,
+            max_retries: 3,
+            ..Default::default()
+        };
 
-        // Validate FSM transition
-        self.validate_transition(&match_entity.state, &MatchAuthorityState::Disputed)?;
+        let actor_owned = actor.to_string();
+        let reason_owned = reason.clone();
+        let signer_secret_owned = signer_secret.to_string();
+        let db_pool = self.db_pool.clone();
+        let soroban_service = self.soroban_service.clone();
+        let match_lifecycle_contract = self.match_lifecycle_contract.clone();
 
-        // Validate actor is one of the players
-        if actor != match_entity.player_a && actor != match_entity.player_b {
-            return Err(ApiError::forbidden("Only match players can raise disputes"));
-        }
+        execute_transaction(&db_pool, &config, move |tx| {
+            let actor = actor_owned.clone();
+            let reason = reason_owned.clone();
+            let signer_secret = signer_secret_owned.clone();
+            let soroban_service = soroban_service.clone();
+            let match_lifecycle_contract = match_lifecycle_contract.clone();
+            Box::pin(async move {
+                // Acquire row lock to prevent concurrent state changes.
+                let match_entity = sqlx::query_as!(
+                    MatchAuthorityEntity,
+                    r#"
+                    SELECT
+                        id, on_chain_match_id, player_a, player_b, winner,
+                        state as "state: MatchAuthorityState",
+                        created_at, started_at, ended_at, last_chain_tx,
+                        idempotency_key, metadata
+                    FROM match_authority
+                    WHERE id = $1
+                    FOR UPDATE
+                    "#,
+                    match_id
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?
+                .ok_or_else(|| ApiError::not_found("Match not found"))?;
 
-        info!(
-            match_id = %match_id,
-            actor = %actor,
-            "Raising dispute"
-        );
+                // Stable conflict response on invalid transition.
+                if !match_entity.state.can_transition_to(&MatchAuthorityState::Disputed) {
+                    return Err(ApiError::conflict(&format!(
+                        "Invalid state transition from {:?} to Disputed",
+                        match_entity.state
+                    )));
+                }
 
-        // Step 1: Submit raise_dispute transaction to blockchain
-        let chain_result = self
-            .raise_dispute_on_chain(&match_entity.on_chain_match_id, actor, signer_secret)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to raise dispute on blockchain");
-                ApiError::internal_error(format!("Blockchain dispute failed: {}", e))
-            })?;
+                // Only a participant may raise a dispute.
+                if actor != match_entity.player_a && actor != match_entity.player_b {
+                    return Err(ApiError::forbidden("Only match players can raise disputes"));
+                }
 
-        // Step 2: Update match state
-        sqlx::query!(
-            r#"
-            UPDATE match_authority
-            SET state = 'DISPUTED'::match_authority_state,
-                last_chain_tx = $1
-            WHERE id = $2
-            "#,
-            chain_result.hash,
-            match_id
-        )
-        .execute(&self.db_pool)
-        .await
-        .map_err(|e| ApiError::database_error(e))?;
+                info!(match_id = %match_id, actor = %actor, "Raising dispute");
 
-        // Step 3: Record blockchain sync
-        self.record_chain_sync(
-            match_id,
-            "raise_dispute",
-            &chain_result.hash,
-            "pending",
-            None,
-        )
+                let chain_result = raise_dispute_on_chain_helper(
+                    &soroban_service,
+                    &match_lifecycle_contract,
+                    &match_entity.on_chain_match_id,
+                    &actor,
+                    &signer_secret,
+                )
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to raise dispute on blockchain");
+                    ApiError::internal_error(format!("Blockchain dispute failed: {}", e))
+                })?;
+
+                // Update match state within transaction.
+                sqlx::query!(
+                    r#"
+                    UPDATE match_authority
+                    SET state = 'DISPUTED'::match_authority_state,
+                        last_chain_tx = $1
+                    WHERE id = $2
+                    "#,
+                    chain_result.hash,
+                    match_id
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                // Record blockchain sync within transaction.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_chain_sync (
+                        id, match_id, operation_type, tx_hash, tx_status, error_message, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(), match_id, "raise_dispute",
+                    chain_result.hash, "pending", None::<String>, serde_json::json!({})
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                // Record transition with actor, timestamp, and reason.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_transitions (
+                        id, match_id, from_state, to_state, actor, chain_tx, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(),
+                    match_id,
+                    match_entity.state as MatchAuthorityState,
+                    MatchAuthorityState::Disputed as MatchAuthorityState,
+                    actor,
+                    chain_result.hash,
+                    serde_json::json!({ "reason": reason })
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
+
+                info!(match_id = %match_id, "Dispute raised successfully");
+                Ok::<(), ApiError>(())
+            })
+        })
         .await?;
-
-        // Step 4: Record transition
-        self.record_transition(
-            match_id,
-            match_entity.state,
-            MatchAuthorityState::Disputed,
-            actor,
-            Some(&chain_result.hash),
-            Some(serde_json::json!({ "reason": reason })),
-        )
-        .await?;
-
-        info!(match_id = %match_id, "Dispute raised successfully");
 
         self.get_match_with_transitions(match_id).await
     }
@@ -506,67 +644,149 @@ impl MatchAuthorityService {
     // FINALIZE MATCH
     // =============================================================================
 
-    /// Finalize a match (COMPLETED/DISPUTED -> FINALIZED transition)
-    /// This performs on-chain settlement
+    /// Finalize a match (COMPLETED/DISPUTED -> FINALIZED transition).
+    /// This performs on-chain settlement.
+    ///
+    /// # Atomicity guarantee
+    ///
+    /// The state check, state update, chain-sync record, and transition record
+    /// are all performed inside a single serialisable transaction that acquires
+    /// a `FOR UPDATE` row lock.  Simultaneous finalize + dispute + forfeit
+    /// attempts for the same match will serialize: exactly one will see a
+    /// valid pre-final state and succeed — the others receive a stable
+    /// conflict response without any partial row updates.
     pub async fn finalize_match(
         &self,
         match_id: Uuid,
+        actor: &str,
         signer_secret: &str,
     ) -> Result<MatchAuthorityResponse, ApiError> {
-        // Get match
-        let match_entity = self.get_match_entity(match_id).await?;
+        let config = TransactionConfig {
+            isolation_level: IsolationLevel::Serializable,
+            max_retries: 3,
+            ..Default::default()
+        };
 
-        if match_entity.state != MatchAuthorityState::Finalized {
-            self.validate_transition(&match_entity.state, &MatchAuthorityState::Finalized)?;
+        let actor_owned = actor.to_string();
+        let signer_secret_owned = signer_secret.to_string();
+        let db_pool = self.db_pool.clone();
+        let soroban_service = self.soroban_service.clone();
+        let match_lifecycle_contract = self.match_lifecycle_contract.clone();
 
-            info!(
-                match_id = %match_id,
-                from_state = ?match_entity.state,
-                "Finalizing match"
-            );
+        execute_transaction(&db_pool, &config, move |tx| {
+            let actor = actor_owned.clone();
+            let signer_secret = signer_secret_owned.clone();
+            let soroban_service = soroban_service.clone();
+            let match_lifecycle_contract = match_lifecycle_contract.clone();
+            Box::pin(async move {
+                // Acquire row lock — prevents concurrent finalize/dispute/forfeit.
+                let match_entity = sqlx::query_as!(
+                    MatchAuthorityEntity,
+                    r#"
+                    SELECT
+                        id, on_chain_match_id, player_a, player_b, winner,
+                        state as "state: MatchAuthorityState",
+                        created_at, started_at, ended_at, last_chain_tx,
+                        idempotency_key, metadata
+                    FROM match_authority
+                    WHERE id = $1
+                    FOR UPDATE
+                    "#,
+                    match_id
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?
+                .ok_or_else(|| ApiError::not_found("Match not found"))?;
 
-            let chain_result = self
-                .finalize_match_on_chain(&match_entity.on_chain_match_id, signer_secret)
+                // Idempotent: already finalized → succeed immediately.
+                if match_entity.state == MatchAuthorityState::Finalized {
+                    return Ok::<(), ApiError>(());
+                }
+
+                // Stable conflict response on invalid transition.
+                if !match_entity.state.can_transition_to(&MatchAuthorityState::Finalized) {
+                    return Err(ApiError::conflict(&format!(
+                        "Invalid state transition from {:?} to Finalized",
+                        match_entity.state
+                    )));
+                }
+
+                info!(
+                    match_id = %match_id,
+                    from_state = ?match_entity.state,
+                    actor = %actor,
+                    "Finalizing match"
+                );
+
+                let chain_result = finalize_match_on_chain_helper(
+                    &soroban_service,
+                    &match_lifecycle_contract,
+                    &match_entity.on_chain_match_id,
+                    &signer_secret,
+                )
                 .await
                 .map_err(|e| {
                     error!(error = %e, "Failed to finalize match on blockchain");
                     ApiError::internal_error(format!("Blockchain finalization failed: {}", e))
                 })?;
 
-            sqlx::query!(
-                r#"
-                UPDATE match_authority
-                SET state = 'FINALIZED'::match_authority_state,
-                    last_chain_tx = $1
-                WHERE id = $2
-                "#,
-                chain_result.hash,
-                match_id
-            )
-            .execute(&self.db_pool)
-            .await
-            .map_err(|e| ApiError::database_error(e))?;
+                // Update match state within transaction.
+                sqlx::query!(
+                    r#"
+                    UPDATE match_authority
+                    SET state = 'FINALIZED'::match_authority_state,
+                        last_chain_tx = $1
+                    WHERE id = $2
+                    "#,
+                    chain_result.hash,
+                    match_id
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
 
-            self.record_chain_sync(
-                match_id,
-                "finalize_match",
-                &chain_result.hash,
-                "pending",
-                None,
-            )
-            .await?;
+                // Record blockchain sync within transaction.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_chain_sync (
+                        id, match_id, operation_type, tx_hash, tx_status, error_message, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(), match_id, "finalize_match",
+                    chain_result.hash, "pending", None::<String>, serde_json::json!({})
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
 
-            self.record_transition(
-                match_id,
-                match_entity.state,
-                MatchAuthorityState::Finalized,
-                "system",
-                Some(&chain_result.hash),
-                None,
-            )
-            .await?;
-        }
+                // Record transition with actor, timestamp, and reason.
+                sqlx::query!(
+                    r#"
+                    INSERT INTO match_transitions (
+                        id, match_id, from_state, to_state, actor, chain_tx, metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    Uuid::new_v4(),
+                    match_id,
+                    match_entity.state as MatchAuthorityState,
+                    MatchAuthorityState::Finalized as MatchAuthorityState,
+                    actor,
+                    chain_result.hash,
+                    serde_json::json!({ "reason": "match_finalization" })
+                )
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ApiError::database_error(e))?;
 
+                info!(match_id = %match_id, "Match finalized successfully");
+                Ok::<(), ApiError>(())
+            })
+        })
+        .await?;
+
+        // Reputation update runs outside the transaction — it is best-effort
+        // and must not roll back the finalization if it fails.
         if let Some(reputation_service) = &self.reputation_service {
             reputation_service
                 .update_reputation_on_finalized_match(match_id)
@@ -579,8 +799,6 @@ impl MatchAuthorityService {
                 })?;
         }
 
-        info!(match_id = %match_id, "Match finalized successfully");
-
         self.get_match_with_transitions(match_id).await
     }
 
@@ -591,6 +809,32 @@ impl MatchAuthorityService {
     /// Get match by ID
     pub async fn get_match(&self, match_id: Uuid) -> Result<MatchAuthorityResponse, ApiError> {
         self.get_match_with_transitions(match_id).await
+    }
+
+    /// Return the full ordered transition history for a match.
+    ///
+    /// This is the primary audit and support query endpoint.  Every state
+    /// change is recorded with the actor (player address or "system"), a
+    /// wall-clock timestamp supplied by the database, the chain transaction
+    /// hash, and a `metadata` JSON object containing the human-readable
+    /// `reason` field.
+    ///
+    /// The result is always ordered chronologically (oldest → newest) and
+    /// includes both valid transitions and any rejected attempts that were
+    /// recorded with `error` set.
+    pub async fn get_transition_history(
+        &self,
+        match_id: Uuid,
+    ) -> Result<crate::models::match_authority::TransitionListResponse, ApiError> {
+        // Verify the match exists before querying transitions.
+        let _ = self.get_match_entity(match_id).await?;
+        let transitions = self.get_match_transitions(match_id).await?;
+        let total = transitions.len();
+        Ok(crate::models::match_authority::TransitionListResponse {
+            match_id,
+            transitions,
+            total,
+        })
     }
 
     /// Get match entity (internal)
@@ -1031,6 +1275,67 @@ fn require_successful_transaction(
             result.error.unwrap_or_else(|| format!("status {:?}", result.status))
         ))
     }
+}
+
+/// Helper: complete match on chain (used inside transactions).
+async fn complete_match_on_chain_helper(
+    soroban_service: &Arc<SorobanService>,
+    match_lifecycle_contract: &str,
+    on_chain_match_id: &str,
+    winner: &str,
+    signer_secret: &str,
+) -> Result<SorobanTxResult, String> {
+    let operator = crate::service::stellar_service::stellar_public_from_secret(signer_secret)?;
+    let args = serde_json::json!({
+        "operator": operator,
+        "match_id": on_chain_match_id,
+        "winner": winner,
+    });
+    soroban_service
+        .invoke(match_lifecycle_contract, "complete_match", &args, signer_secret)
+        .await
+        .map_err(|e| format!("Soroban complete_match failed: {}", e))
+        .and_then(|r| require_successful_transaction(r, "complete_match"))
+}
+
+/// Helper: raise dispute on chain (used inside transactions).
+async fn raise_dispute_on_chain_helper(
+    soroban_service: &Arc<SorobanService>,
+    match_lifecycle_contract: &str,
+    on_chain_match_id: &str,
+    actor: &str,
+    signer_secret: &str,
+) -> Result<SorobanTxResult, String> {
+    let operator = crate::service::stellar_service::stellar_public_from_secret(signer_secret)?;
+    let args = serde_json::json!({
+        "operator": operator,
+        "match_id": on_chain_match_id,
+        "actor": actor,
+    });
+    soroban_service
+        .invoke(match_lifecycle_contract, "raise_dispute_by_operator", &args, signer_secret)
+        .await
+        .map_err(|e| format!("Soroban raise_dispute failed: {}", e))
+        .and_then(|r| require_successful_transaction(r, "raise_dispute"))
+}
+
+/// Helper: finalize match on chain (used inside transactions).
+async fn finalize_match_on_chain_helper(
+    soroban_service: &Arc<SorobanService>,
+    match_lifecycle_contract: &str,
+    on_chain_match_id: &str,
+    signer_secret: &str,
+) -> Result<SorobanTxResult, String> {
+    let operator = crate::service::stellar_service::stellar_public_from_secret(signer_secret)?;
+    let args = serde_json::json!({
+        "operator": operator,
+        "match_id": on_chain_match_id,
+    });
+    soroban_service
+        .invoke(match_lifecycle_contract, "finalize_match", &args, signer_secret)
+        .await
+        .map_err(|e| format!("Soroban finalize_match failed: {}", e))
+        .and_then(|r| require_successful_transaction(r, "finalize_match"))
 }
 
 #[cfg(test)]

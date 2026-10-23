@@ -144,7 +144,16 @@ export function generateStructuredData(type: string, data: any) {
     ...data,
   };
 
-  return JSON.stringify(baseData);
+  return JSON.stringify(baseData).replace(/[<>&\u2028\u2029]/g, (character) => {
+    const escapes: Record<string, string> = {
+      "<": "\\u003c",
+      ">": "\\u003e",
+      "&": "\\u0026",
+      "\u2028": "\\u2028",
+      "\u2029": "\\u2029",
+    };
+    return escapes[character];
+  });
 }
 
 // Organization structured data

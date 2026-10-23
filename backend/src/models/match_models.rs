@@ -46,6 +46,8 @@ pub struct MatchScore {
     pub match_id: Uuid,
     pub player_id: Uuid,
     pub score: i32,
+    /// SHA-256 hash of the original score submission payload.
+    pub request_hash: Option<String>,
     /// What this player claims their opponent scored.
     /// Combined with `score`, this lets the system determine each player's
     /// claimed winner without requiring a separate "winner" field.
@@ -261,6 +263,8 @@ pub struct ReportScoreRequest {
     pub opponent_score: i32,
     pub proof_url: Option<String>,
     pub telemetry_data: Option<String>,
+    /// Optional client key used to identify retries of this submission.
+    pub idempotency_key: Option<String>,
 }
 
 /// One attempt to submit a score report, recorded for anti-spam enforcement.

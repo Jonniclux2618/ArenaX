@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use redis::Client as RedisClient;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub struct MatchService {
@@ -150,48 +151,209 @@ impl MatchService {
         user_id: Uuid,
         request: ReportScoreRequest,
     ) -> Result<MatchScore, ApiError> {
-        // Anti-spam: log and gate before any other validation.
-        // enforce_report_rate_limit inserts an attempt record first, then checks
-        // the running total — ensuring the limit holds under concurrent bursts.
-        self.enforce_report_rate_limit(match_id, user_id).await?;
+        let request_hash = score_request_hash(&request);
+        if request.idempotency_key.as_ref().is_some_and(|key| {
+            key.trim().is_empty() || key.len() > 255
+        }) {
+            return Err(ApiError::bad_request("Invalid score submission idempotency key"));
+        }
 
-        // FSM + eligibility validation
-        let match_record = self.get_match_by_id(match_id).await?;
-        self.validate_score_report(&match_record, user_id).await?;
-
-        // Create score record — includes opponent_score for conflict detection
-        let score_record = sqlx::query_as!(
-            MatchScore,
-            r#"
-            INSERT INTO match_scores (
-                id, match_id, player_id, score, opponent_score, proof_url,
-                telemetry_data, submitted_at, verified
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
-            ) RETURNING *
-            "#,
-            Uuid::new_v4(),
-            match_id,
-            user_id,
-            request.score,
-            request.opponent_score,
-            request.proof_url,
-            request.telemetry_data,
-            Utc::now(),
-            false
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
+        let match_record = sqlx::query_as::<_, Match>(
+            "SELECT * FROM matches WHERE id = $1 FOR UPDATE",
         )
-        .fetch_one(&self.db_pool)
+        .bind(match_id)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| ApiError::database_error(e))?;
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("Match not found"))?;
 
-        // Mark this attempt as accepted
-        self.mark_last_attempt_accepted(match_id, user_id).await?;
+        if user_id != match_record.player1_id && match_record.player2_id != Some(user_id) {
+            return Err(ApiError::forbidden("User is not a player in this match"));
+        }
 
-        // Update the match's score columns
-        self.update_match_score(match_id, user_id, request.score)
+        if let Some(key) = request.idempotency_key.as_deref() {
+            let prior_hash: Option<String> = sqlx::query_scalar::<_, String>(
+                "SELECT COALESCE(request_hash, '') FROM score_report_attempts WHERE match_id = $1 AND player_id = $2 AND idempotency_key = $3 ORDER BY attempted_at LIMIT 1",
+            )
+            .bind(match_id)
+            .bind(user_id)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+            if prior_hash
+                .as_deref()
+                .is_some_and(|prior| prior != request_hash.as_str())
+            {
+                return Err(ApiError::conflict(
+                    "Idempotency key was already used for a different score submission",
+                ));
+            }
+        }
+
+        let existing = sqlx::query_as::<_, MatchScore>(
+            "SELECT * FROM match_scores WHERE match_id = $1 AND player_id = $2",
+        )
+        .bind(match_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if let Some(existing) = existing {
+            let same_payload = existing.request_hash.as_deref() == Some(request_hash.as_str())
+                || (existing.request_hash.is_none()
+                    && existing.score == request.score
+                    && existing.opponent_score == Some(request.opponent_score)
+                    && existing.proof_url == request.proof_url
+                    && existing.telemetry_data == request.telemetry_data);
+            if same_payload {
+                tx.commit().await.map_err(ApiError::database_error)?;
+                return Ok(existing);
+            }
+            return Err(ApiError::conflict(
+                "A different score submission already exists for this player and match",
+            ));
+        }
+
+        if match_record.status != MatchStatus::InProgress {
+            return Err(ApiError::conflict(format!(
+                "Cannot report score for match in status {:?}",
+                match_record.status
+            )));
+        }
+
+        let (attempt_id, rate_limited) = self
+            .enforce_report_rate_limit(
+                &mut tx,
+                match_id,
+                user_id,
+                &request_hash,
+                request.idempotency_key.as_deref(),
+            )
             .await?;
+        if rate_limited {
+            tx.commit().await.map_err(ApiError::database_error)?;
+            return Err(ApiError::too_many_requests(
+                "Score report rate limit exceeded (max 5 attempts per match). Please contact support if you believe this is an error.",
+            ));
+        }
 
-        // Publish score reported event
+        let score_record = sqlx::query_as::<_, MatchScore>(
+            r#"INSERT INTO match_scores (
+                id, match_id, player_id, score, opponent_score, proof_url,
+                telemetry_data, submitted_at, verified, request_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING *"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(match_id)
+        .bind(user_id)
+        .bind(request.score)
+        .bind(request.opponent_score)
+        .bind(&request.proof_url)
+        .bind(&request.telemetry_data)
+        .bind(Utc::now())
+        .bind(false)
+        .bind(&request_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+
+        if user_id == match_record.player1_id {
+            sqlx::query("UPDATE matches SET player1_score = $1, updated_at = NOW() WHERE id = $2")
+                .bind(request.score)
+                .bind(match_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::database_error)?;
+        } else {
+            sqlx::query("UPDATE matches SET player2_score = $1, updated_at = NOW() WHERE id = $2")
+                .bind(request.score)
+                .bind(match_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::database_error)?;
+        }
+
+        sqlx::query("UPDATE score_report_attempts SET accepted = TRUE WHERE id = $1")
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+
+        let mut became_completed = false;
+        let mut became_conflicted = false;
+        let mut conflict_reason = None;
+        if let Some(player2_id) = match_record.player2_id {
+            let reports = sqlx::query_as::<_, MatchScore>(
+                "SELECT * FROM match_scores WHERE match_id = $1 AND player_id IN ($2, $3)",
+            )
+            .bind(match_id)
+            .bind(match_record.player1_id)
+            .bind(player2_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+            if reports.len() == 2 {
+                let player1_report = reports.iter().find(|row| row.player_id == match_record.player1_id).unwrap();
+                let player2_report = reports.iter().find(|row| row.player_id == player2_id).unwrap();
+                let claimed_winner = |report: &MatchScore, own_id: Uuid, other_id: Uuid| {
+                    match report.score.cmp(&report.opponent_score.unwrap_or(0)) {
+                        Ordering::Greater => Some(own_id),
+                        Ordering::Less => Some(other_id),
+                        Ordering::Equal => None,
+                    }
+                };
+                if claimed_winner(player1_report, match_record.player1_id, player2_id)
+                    != claimed_winner(player2_report, player2_id, match_record.player1_id)
+                {
+                    became_conflicted = true;
+                    let reason = format!(
+                        "Score discrepancy: Player A reported {}-{}, Player B reported {}-{}",
+                        player1_report.score,
+                        player1_report.opponent_score.unwrap_or(0),
+                        player2_report.opponent_score.unwrap_or(0),
+                        player2_report.score
+                    );
+                    sqlx::query("UPDATE matches SET status = $1, conflict_reason = $2, updated_at = NOW() WHERE id = $3")
+                        .bind(MatchStatus::Conflict as i32)
+                        .bind(&reason)
+                        .bind(match_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(ApiError::database_error)?;
+                    conflict_reason = Some(reason);
+                } else {
+                    became_completed = true;
+                    let winner_id = match player1_report.score.cmp(&player2_report.score) {
+                        Ordering::Greater => Some(match_record.player1_id),
+                        Ordering::Less => Some(player2_id),
+                        Ordering::Equal => None,
+                    };
+                    sqlx::query("UPDATE matches SET status = $1, winner_id = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3")
+                        .bind(MatchStatus::Completed as i32)
+                        .bind(winner_id)
+                        .bind(match_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(ApiError::database_error)?;
+                }
+            }
+        } else {
+            became_completed = true;
+            let winner_id = (request.score > request.opponent_score).then_some(user_id);
+            sqlx::query("UPDATE matches SET status = $1, winner_id = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3")
+                .bind(MatchStatus::Completed as i32)
+                .bind(winner_id)
+                .bind(match_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::database_error)?;
+        }
+
+        tx.commit().await.map_err(ApiError::database_error)?;
+
         self.publish_match_event(serde_json::json!({
             "type": "score_reported",
             "match_id": match_id,
@@ -200,16 +362,15 @@ impl MatchService {
             "score": request.score
         }))
         .await?;
-
-        // When both players have reported, detect conflicts before completing
-        let both_reported = self.both_players_reported_scores(match_id).await?;
-        if both_reported {
-            let has_conflict = self.detect_score_conflict(match_id).await?;
-            if has_conflict {
-                self.process_conflict(match_id).await?;
-            } else {
-                self.process_match_completion(match_id).await?;
-            }
+        if became_completed {
+            self.process_match_completion(match_id).await?;
+        } else if became_conflicted {
+            self.publish_match_event(serde_json::json!({
+                "type": "conflict",
+                "match_id": match_id,
+                "conflict_reason": conflict_reason
+            }))
+            .await?;
         }
 
         Ok(score_record)
@@ -1778,80 +1939,40 @@ impl MatchService {
     /// prevents flooding via rapid retries.
     async fn enforce_report_rate_limit(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         match_id: Uuid,
         player_id: Uuid,
-    ) -> Result<(), ApiError> {
+        request_hash: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<(Uuid, bool), ApiError> {
         const MAX_ATTEMPTS_PER_MATCH: i64 = 5;
 
         // Always record the attempt regardless of outcome
-        sqlx::query!(
-            r#"
-            INSERT INTO score_report_attempts
-                (id, match_id, player_id, attempted_at, accepted)
-            VALUES ($1, $2, $3, $4, FALSE)
-            "#,
-            Uuid::new_v4(),
-            match_id,
-            player_id,
-            Utc::now()
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO score_report_attempts (id, match_id, player_id, attempted_at, accepted, request_hash, idempotency_key) VALUES ($1, $2, $3, $4, FALSE, $5, $6)",
         )
-        .execute(&self.db_pool)
+        .bind(attempt_id)
+        .bind(match_id)
+        .bind(player_id)
+        .bind(Utc::now())
+        .bind(request_hash)
+        .bind(idempotency_key)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| ApiError::database_error(e))?;
+        .map_err(ApiError::database_error)?;
 
         // Count total attempts AFTER the insert
-        let total = sqlx::query!(
-            r#"
-            SELECT COUNT(*) AS count
-            FROM score_report_attempts
-            WHERE match_id = $1 AND player_id = $2
-            "#,
-            match_id,
-            player_id
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM score_report_attempts WHERE match_id = $1 AND player_id = $2",
         )
-        .fetch_one(&self.db_pool)
+        .bind(match_id)
+        .bind(player_id)
+        .fetch_one(&mut **tx)
         .await
-        .map_err(|e| ApiError::database_error(e))?
-        .count
-        .unwrap_or(0);
+        .map_err(ApiError::database_error)?;
 
-        if total > MAX_ATTEMPTS_PER_MATCH {
-            return Err(ApiError::too_many_requests(format!(
-                "Score report rate limit exceeded (max {} attempts per match). \
-                 Please contact support if you believe this is an error.",
-                MAX_ATTEMPTS_PER_MATCH
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Update the most-recently inserted attempt record for this player/match to
-    /// `accepted = TRUE` once the score row has been successfully written.
-    async fn mark_last_attempt_accepted(
-        &self,
-        match_id: Uuid,
-        player_id: Uuid,
-    ) -> Result<(), ApiError> {
-        sqlx::query!(
-            r#"
-            UPDATE score_report_attempts
-            SET accepted = TRUE
-            WHERE id = (
-                SELECT id FROM score_report_attempts
-                WHERE match_id = $1 AND player_id = $2
-                ORDER BY attempted_at DESC
-                LIMIT 1
-            )
-            "#,
-            match_id,
-            player_id
-        )
-        .execute(&self.db_pool)
-        .await
-        .map_err(|e| ApiError::database_error(e))?;
-
-        Ok(())
+        Ok((attempt_id, total > MAX_ATTEMPTS_PER_MATCH))
     }
 }
 
@@ -1861,6 +1982,24 @@ pub struct MatchHistoryResponse {
     pub total: i64,
     pub page: i32,
     pub per_page: i32,
+}
+
+fn score_request_hash(request: &ReportScoreRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"arenax-score-report-v1\0");
+    hasher.update(request.score.to_be_bytes());
+    hasher.update(request.opponent_score.to_be_bytes());
+    for value in [&request.proof_url, &request.telemetry_data] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

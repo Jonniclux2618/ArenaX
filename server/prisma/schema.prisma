@@ -300,6 +300,7 @@ model WalletTransaction {
   userId         String
   user           User            @relation(fields: [userId], references: [id])
   idempotencyKey String          @unique
+  requestHash    String?         @db.Char(64)
   type           TransactionType
   currency       Currency
   amount         Decimal         @db.Decimal(20, 7)

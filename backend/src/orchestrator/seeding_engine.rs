@@ -19,12 +19,14 @@ impl SeedingEngine {
         &self,
         tournament_id: Uuid,
     ) -> Result<(), ApiError> {
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::database_error)?;
+
         // Validate tournament status
         let row = sqlx::query(
-            "SELECT status, game, bracket_type FROM tournaments WHERE id = $1",
+            "SELECT status, game, bracket_type FROM tournaments WHERE id = $1 FOR UPDATE",
         )
         .bind(tournament_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::database_error)?
         .ok_or_else(|| ApiError::not_found("Tournament not found"))?;
@@ -46,6 +48,18 @@ impl SeedingEngine {
 
         let game: String = row.try_get("game").map_err(ApiError::database_error)?;
 
+        let existing_round: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM tournament_rounds WHERE tournament_id = $1 AND round_number = 1",
+        )
+        .bind(tournament_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if existing_round.is_some() {
+            tx.commit().await.map_err(ApiError::database_error)?;
+            return Ok(());
+        }
+
         // Fetch active participants with their Elo ratings
         let participants: Vec<ParticipantWithElo> = sqlx::query_as::<_, ParticipantWithElo>(
             r#"
@@ -55,12 +69,12 @@ impl SeedingEngine {
             LEFT JOIN user_elo ue ON ue.user_id = tp.user_id AND ue.game = $2
             WHERE tp.tournament_id = $1
               AND (tp.status = 'active' OR tp.status = 'paid')
-            ORDER BY COALESCE(ue.current_rating, 1200) DESC, tp.registered_at ASC
+            ORDER BY COALESCE(ue.current_rating, 1200) DESC, tp.registered_at ASC, tp.user_id ASC
             "#,
         )
         .bind(tournament_id)
         .bind(game)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -84,7 +98,7 @@ impl SeedingEngine {
             )
             .bind(seed)
             .bind(p.id)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
         }
@@ -110,7 +124,7 @@ impl SeedingEngine {
         .bind(round_type)
         .bind("in_progress")
         .bind(Utc::now())
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
 
@@ -121,37 +135,23 @@ impl SeedingEngine {
             let seed_a = seeding_order[match_idx * 2];     // 1-indexed seed
             let seed_b = seeding_order[match_idx * 2 + 1]; // 1-indexed seed
 
-            // Seeds beyond participant count are byes
-            let player_a_id = if seed_a <= n {
-                Some(participants[seed_a - 1].user_id)
-            } else {
-                None
-            };
-            let player_b_id = if seed_b <= n {
-                Some(participants[seed_b - 1].user_id)
-            } else {
-                None
-            };
-
-            let is_bye = player_a_id.is_none() || player_b_id.is_none();
-            let winner_id: Option<Uuid> = if is_bye {
+            let player_a_id = participants.get(seed_a - 1).map(|p| p.user_id);
+            let player_b_id = participants.get(seed_b - 1).map(|p| p.user_id);
+            let winner_id = if player_a_id.is_none() || player_b_id.is_none() {
                 player_a_id.or(player_b_id)
             } else {
                 None
             };
-            let match_status = if is_bye { "completed" } else { "pending" };
+            let match_status = if winner_id.is_some() { "completed" } else { "pending" };
 
             let match_number = (match_idx + 1) as i32;
 
             // For byes, ensure the real player is player1
-            let (p1, p2): (Uuid, Option<Uuid>) =
-                if player_a_id.is_some() && player_b_id.is_some() {
-                    (player_a_id.unwrap(), player_b_id)
-                } else if player_a_id.is_some() {
-                    (player_a_id.unwrap(), None)
-                } else {
-                    (player_b_id.unwrap(), None)
-                };
+            let (p1, p2) = match (player_a_id, player_b_id) {
+                (Some(player_a), Some(player_b)) => (player_a, Some(player_b)),
+                (Some(player), None) | (None, Some(player)) => (player, None),
+                (None, None) => continue,
+            };
 
             sqlx::query(
                 r#"
@@ -170,7 +170,7 @@ impl SeedingEngine {
             .bind(winner_id)
             .bind(match_status)
             .bind(Utc::now())
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(ApiError::database_error)?;
         }
@@ -181,9 +181,11 @@ impl SeedingEngine {
         )
         .bind(tournament_id)
         .bind(Utc::now())
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::database_error)?;
+
+        tx.commit().await.map_err(ApiError::database_error)?;
 
         Ok(())
     }
@@ -257,6 +259,31 @@ mod tests {
             for pair in order.chunks(2) {
                 assert_eq!(pair[0] + pair[1], size + 1);
             }
+        }
+    }
+
+    #[test]
+    fn generated_participant_counts_cover_seeds_once_and_assign_expected_byes() {
+        for participant_count in 4..=64 {
+            let bracket_size = participant_count.next_power_of_two();
+            let order = generate_bracket_order(bracket_size);
+            let mut seeds = Vec::new();
+            let mut byes = 0;
+
+            for pair in order.chunks(2) {
+                let first = (pair[0] <= participant_count).then_some(pair[0]);
+                let second = (pair[1] <= participant_count).then_some(pair[1]);
+                if first.is_some() || second.is_some() {
+                    byes += usize::from(first.is_none() || second.is_none());
+                    seeds.extend(first);
+                    seeds.extend(second);
+                }
+            }
+
+            seeds.sort_unstable();
+            assert_eq!(seeds, (1..=participant_count).collect::<Vec<_>>());
+            assert_eq!(byes, bracket_size - participant_count);
+            assert_eq!(order, generate_bracket_order(bracket_size));
         }
     }
 }

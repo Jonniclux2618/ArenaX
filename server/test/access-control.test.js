@@ -1,5 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert'
+import { readFileSync } from 'node:fs'
+
+const authorizationPolicy = JSON.parse(
+  readFileSync(new URL('../../security/authorization-policy.json', import.meta.url), 'utf8')
+)
 
 test('ADMIN should have all permissions', async () => {
   const { hasPermission } = await import('../dist/middleware/rbac.middleware.js')
@@ -54,6 +59,16 @@ test('PLAYER should inherit from USER', async () => {
   assert.ok(playerPerms.includes('matches:read'))
   assert.ok(playerPerms.includes('matches:write'))
   assert.ok(playerPerms.includes('analytics:read'))
+})
+
+test('shared authorization matrix matches TypeScript permission enforcement', async () => {
+  const { hasPermission } = await import('../dist/middleware/rbac.middleware.js')
+  assert.ok(authorizationPolicy.operations.length > 0)
+  for (const operation of authorizationPolicy.operations) {
+    const { role, permission } = operation.typescript
+    assert.ok(hasPermission(role, permission), `${role} must have ${permission} for ${operation.resource}`)
+    assert.ok(!hasPermission('USER', permission), `USER must not have ${permission} for ${operation.resource}`)
+  }
 })
 
 test('OPERATOR should have most permissions', async () => {

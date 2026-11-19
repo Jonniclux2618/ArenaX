@@ -9,6 +9,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub payments: PaymentsConfig,
     pub auth: AuthConfig,
+    pub sensitive_operation_secret: String,
     pub stellar: StellarConfig,
     pub ai: AiConfig,
     pub server: ServerConfig,
@@ -91,6 +92,102 @@ const FORBIDDEN_SECRET_VALUES: &[&str] = &[
     "test",
 ];
 
+const APPROVED_SECRET_ENV: &[&str] = &[
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "PAYSTACK_SECRET",
+    "FLUTTERWAVE_SECRET",
+    "JWT_SECRET",
+    "JWT_REFRESH_SECRET",
+    "SENSITIVE_OPERATION_SECRET",
+    "STELLAR_ADMIN_SECRET",
+    "SENDGRID_API_KEY",
+    "EMAIL_API_KEY",
+    "ENCRYPTION_KEY_V1",
+    "FLUTTERWAVE_WEBHOOK_HASH",
+    "SLACK_WEBHOOK_URL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+];
+
+fn is_sensitive_env_name(name: &str) -> bool {
+    [
+        "_SECRET",
+        "_TOKEN",
+        "_PASSWORD",
+        "_API_KEY",
+        "_ACCESS_KEY",
+        "_PRIVATE_KEY",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+        || [
+            "_SECRET_",
+            "_TOKEN_",
+            "_PASSWORD_",
+            "_API_KEY_",
+            "_ACCESS_KEY_",
+            "_PRIVATE_KEY_",
+        ]
+        .iter()
+        .any(|marker| name.contains(marker))
+        || name == "ENCRYPTION_KEY_V1"
+        || name == "WALLET_MASTER_KEYS"
+    || name == "SLACK_WEBHOOK_URL"
+    || name == "OTEL_EXPORTER_OTLP_HEADERS"
+}
+
+fn validate_secret_inventory(
+    vars: impl IntoIterator<Item = (String, String)>,
+    production: bool,
+) -> Result<(), anyhow::Error> {
+    let mut unknown = Vec::new();
+    let mut placeholders = Vec::new();
+
+    for (name, value) in vars {
+        if !is_sensitive_env_name(&name) || value.trim().is_empty() {
+            continue;
+        }
+        if !APPROVED_SECRET_ENV.contains(&name.as_str()) {
+            unknown.push(name);
+            continue;
+        }
+        let normalized = value.trim().to_ascii_lowercase();
+        if FORBIDDEN_SECRET_VALUES.contains(&normalized.as_str())
+            || ["replace", "your", "example", "placeholder", "xxx", "test", "<"]
+                .iter()
+                .any(|placeholder| {
+                    normalized.starts_with(placeholder)
+                        || normalized
+                            .split(|character: char| !character.is_ascii_alphanumeric())
+                            .any(|part| part == *placeholder)
+                })
+        {
+            placeholders.push(name);
+        }
+    }
+
+    if !unknown.is_empty() {
+        unknown.sort();
+        anyhow::bail!(
+            "unapproved secret environment variable(s): {}; add an owner and purpose to the secret inventory",
+            unknown.join(", ")
+        );
+    }
+    if production && !placeholders.is_empty() {
+        placeholders.sort();
+        anyhow::bail!(
+            "placeholder value(s) are not allowed for secret variable(s): {}",
+            placeholders.join(", ")
+        );
+    }
+    if !production {
+        for name in placeholders {
+            tracing::warn!(variable = %name, "configured secret uses a placeholder value");
+        }
+    }
+    Ok(())
+}
+
 /// Reject a secret that is empty, a known placeholder, or too short to carry
 /// meaningful entropy.
 ///
@@ -98,14 +195,21 @@ const FORBIDDEN_SECRET_VALUES: &[&str] = &[
 /// and the reason, but never echoes the secret's value.
 pub fn require_strong_secret(name: &str, value: &str) -> Result<(), anyhow::Error> {
     let trimmed = value.trim();
+    let normalized = trimmed.to_ascii_lowercase();
 
     if trimmed.is_empty() {
         anyhow::bail!("{name} is empty; refusing to start with an empty secret");
     }
 
-    if FORBIDDEN_SECRET_VALUES
-        .iter()
-        .any(|weak| trimmed.eq_ignore_ascii_case(weak))
+    if FORBIDDEN_SECRET_VALUES.contains(&normalized.as_str())
+        || ["replace", "your", "example", "placeholder", "xxx", "<"]
+            .iter()
+            .any(|placeholder| {
+                normalized.starts_with(placeholder)
+                    || normalized
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .any(|part| part == *placeholder)
+            })
     {
         anyhow::bail!(
             "{name} is set to a well-known default value; refusing to start. \
@@ -348,6 +452,7 @@ impl Config {
 
         let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
         let production = validate_app_environment(&app_env)?;
+        validate_secret_inventory(env::vars().collect::<Vec<_>>(), production)?;
         let database_url = env_required("DATABASE_URL")?;
         validate_url("DATABASE_URL", &database_url, &["postgres", "postgresql"])?;
         let migration_mode = env::var("BACKEND_MIGRATION_MODE")
@@ -388,6 +493,7 @@ impl Config {
             )?;
         }
         let jwt_secret = env_required_secret("JWT_SECRET")?;
+        let sensitive_operation_secret = env_required_secret("SENSITIVE_OPERATION_SECRET")?;
         // An empty value (as shipped in env.example) means "not configured",
         // not "configured to the empty string".
         let jwt_refresh_secret = env::var("JWT_REFRESH_SECRET")
@@ -466,6 +572,7 @@ impl Config {
                 jwt_expires_in,
                 jwt_refresh_expires_in,
             },
+            sensitive_operation_secret,
             stellar: StellarConfig {
                 network_url: stellar_network_url,
                 admin_secret: stellar_admin_secret,
@@ -636,6 +743,25 @@ mod secret_validation_tests {
                 expected,
                 "unexpected validation result for production={production}, value={value}"
             );
+        }
+
+        #[test]
+        fn secret_inventory_rejects_unknown_names_without_reading_values() {
+            let error = validate_secret_inventory(
+                vec![("UNOWNED_API_TOKEN".to_string(), "never-print-this".to_string())],
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("UNOWNED_API_TOKEN"));
+            assert!(!error.contains("never-print-this"));
+        }
+
+        #[test]
+        fn secret_inventory_warns_for_placeholders_outside_production_and_rejects_them_in_production() {
+            let vars = vec![("JWT_SECRET".to_string(), "changeme".to_string())];
+            assert!(validate_secret_inventory(vars.clone(), false).is_ok());
+            assert!(validate_secret_inventory(vars, true).is_err());
         }
     }
 }

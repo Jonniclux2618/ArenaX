@@ -68,6 +68,30 @@ for attempt in 0.5.5:
 
 Admin-only endpoints (`/api/auth/analytics`, `/api/reputation/bad-actors`) check for the `admin` role in JWT claims. Requests from non-admin users receive `403 Forbidden`.
 
+## Account recovery
+
+- While signed in, create ten one-use recovery codes with `POST
+  /api/auth/recovery/codes`. Password-backed accounts must re-enter the current
+  password; OAuth-only accounts must have a valid signed-in session. Store the
+  returned codes offline. Only hashes are persisted, and issuing a new set
+  invalidates the unused codes from the previous set.
+- `POST /api/auth/recovery/start` accepts a recovery code and creates or reuses
+  a case, and consumes that code for any new case. The same proof is bound to
+  that case for completion or appeal. Recovery is independent of email, device,
+  and OAuth access.
+  The existing account email receives a mandatory security notice; delivery
+  failures are recorded and returned explicitly.
+- Password recovery cannot complete until 24 hours after the request and the
+  case expires after 72 hours. `POST /api/auth/recovery/complete` updates the
+  password and audit record in one database transaction,
+  and revokes existing sessions before commit. If the database transaction
+  fails after session revocation, sessions remain revoked (fail closed).
+- A user with the recovery proof can appeal at
+  `POST /api/auth/recovery/appeal`; an administrator reviews appeals at
+  `POST /api/auth/recovery/appeal/review`. Users who no longer have a recovery
+  code can contact `security@arenax.gg` with the case reference for human
+  review. Never send recovery codes or passwords to support.
+
 ## Stellar / Blockchain
 
 - Private keys (`STELLAR_ADMIN_SECRET`) are loaded from environment variables -- never hardcoded.

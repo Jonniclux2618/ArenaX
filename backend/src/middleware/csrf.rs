@@ -42,6 +42,12 @@ fn is_exempt(path: &str) -> bool {
     path.starts_with("/api/auth/login")
         || path.starts_with("/api/auth/register")
         || path.starts_with("/api/auth/refresh")
+        || matches!(
+            path,
+            "/api/auth/recovery/start"
+                | "/api/auth/recovery/complete"
+                | "/api/auth/recovery/appeal"
+        )
         || path.starts_with("/api/health")
         || path.starts_with("/api/csrf-token")
 }

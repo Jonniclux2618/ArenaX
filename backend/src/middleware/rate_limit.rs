@@ -120,6 +120,7 @@ fn resolve_bucket_for(
     if path == "/api/auth/login"
         || path == "/api/auth/register"
         || path == "/api/auth/refresh"
+        || path.starts_with("/api/auth/recovery/")
     {
         return Bucket { name: "auth_strict", limit: 5, window_secs: 60 };
     }

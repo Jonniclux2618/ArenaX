@@ -2,8 +2,11 @@
 /// Privacy: player-level data is only returned to the player themselves or admins.
 /// Enhanced with data aggregation and revenue metrics for #689.
 use crate::api_error::ApiError;
+use crate::service::analytics_governance::{AnalyticsGovernanceService, QualityEventInput};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -17,6 +20,7 @@ pub struct GameMetricsResponse {
     pub total_wagered: i64,
     pub total_rewards_paid: i64,
     pub avg_match_duration_secs: i64,
+    pub data_quality_status: String,
     pub last_updated: chrono::DateTime<Utc>,
 }
 
@@ -59,6 +63,7 @@ struct GameMetricsRow {
     pub total_wagered: i64,
     pub total_rewards_paid: i64,
     pub avg_match_duration_secs: i64,
+    pub data_quality_status: String,
     pub last_updated: chrono::DateTime<Utc>,
 }
 
@@ -85,12 +90,109 @@ impl AnalyticsService {
 
     /// Record a completed match (called by match service after resolution).
     pub async fn record_match(&self, req: &RecordMatchRequest) -> Result<(), ApiError> {
+        if req.game_id <= 0
+            || !(1..=86_400).contains(&req.duration_secs)
+            || req.wager_amount < 0
+            || req.reward_amount < 0
+            || !(1..=100).contains(&req.player_count)
+        {
+            return Err(ApiError::bad_request(
+                "Match metrics are outside supported ranges",
+            ));
+        }
+
+        let match_id_hash = hex::encode(Sha256::digest(req.match_id.as_bytes()));
+        let prior_game: Option<i32> = sqlx::query_scalar(
+            "SELECT game_id FROM analytics_match_aggregation_receipts WHERE match_id_hash = $1",
+        )
+        .bind(&match_id_hash)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(ApiError::database_error)?;
+        if let Some(game_id) = prior_game {
+            return if game_id == req.game_id {
+                Ok(())
+            } else {
+                Err(ApiError::conflict("Match ID was already recorded for another game"))
+            };
+        }
+
+        let payload = json!({
+            "game_id": req.game_id,
+            "duration_secs": req.duration_secs,
+            "player_count": req.player_count
+        });
+        let event = QualityEventInput {
+            source_event_id: req.match_id,
+            dataset_name: "match_completion".to_string(),
+            event_type: "match_completed".to_string(),
+            event_at: Utc::now(),
+            payload: payload.clone(),
+        };
+        let governance = AnalyticsGovernanceService::new(self.db.clone());
+        let quality = governance.publish_event(&event, Uuid::nil(), true).await?;
+        let quality_status = if quality.status == "quarantined" {
+            let prior: Option<(serde_json::Value, String)> = sqlx::query_as(
+                r#"
+                SELECT payload, status FROM analytics_quality_events
+                WHERE dataset_name = $1 AND source_event_id = $2
+                  AND status IN ('healthy', 'degraded')
+                ORDER BY received_at ASC
+                LIMIT 1
+                "#,
+            )
+            .bind(&event.dataset_name)
+            .bind(event.source_event_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(ApiError::database_error)?;
+            match prior {
+                Some((prior_payload, status)) if prior_payload == payload => status,
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "Match analytics event failed quality checks",
+                    ))
+                }
+            }
+        } else {
+            quality.status
+        };
+
+        let mut tx = self.db.begin().await.map_err(ApiError::database_error)?;
+        let inserted: Option<String> = sqlx::query_scalar(
+            r#"
+            INSERT INTO analytics_match_aggregation_receipts (match_id_hash, game_id)
+            VALUES ($1, $2)
+            ON CONFLICT (match_id_hash) DO NOTHING
+            RETURNING match_id_hash
+            "#,
+        )
+        .bind(&match_id_hash)
+        .bind(req.game_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if inserted.is_none() {
+            let existing_game: i32 = sqlx::query_scalar(
+                "SELECT game_id FROM analytics_match_aggregation_receipts WHERE match_id_hash = $1",
+            )
+            .bind(&match_id_hash)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+            if existing_game != req.game_id {
+                return Err(ApiError::conflict("Match ID was already recorded for another game"));
+            }
+            tx.commit().await.map_err(ApiError::database_error)?;
+            return Ok(());
+        }
+
         sqlx::query!(
             r#"
             INSERT INTO analytics_game_metrics
                 (game_id, total_matches, total_players, total_wagered,
-                 total_rewards_paid, avg_match_duration_secs, last_updated)
-            VALUES ($1, 1, $2, $3, $4, $5, NOW())
+                 total_rewards_paid, avg_match_duration_secs, data_quality_status, last_updated)
+            VALUES ($1, 1, $2, $3, $4, $5, $6, NOW())
             ON CONFLICT (game_id) DO UPDATE SET
                 total_matches            = analytics_game_metrics.total_matches + 1,
                 total_players            = analytics_game_metrics.total_players + EXCLUDED.total_players,
@@ -101,6 +203,7 @@ impl AnalyticsService {
                     * analytics_game_metrics.total_matches
                     + EXCLUDED.avg_match_duration_secs
                 ) / (analytics_game_metrics.total_matches + 1),
+                data_quality_status     = EXCLUDED.data_quality_status,
                 last_updated             = NOW()
             "#,
             req.game_id,
@@ -108,12 +211,12 @@ impl AnalyticsService {
             req.wager_amount,
             req.reward_amount,
             req.duration_secs,
+            quality_status,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
-        // Update platform totals
         sqlx::query!(
             r#"
             INSERT INTO analytics_platform (id, total_matches_all_time, total_volume, last_updated)
@@ -125,11 +228,11 @@ impl AnalyticsService {
             "#,
             req.wager_amount,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
-        Ok(())
+        tx.commit().await.map_err(ApiError::database_error)
     }
 
     /// Record player behaviour (privacy-safe: no PII in analytics tables).
@@ -187,6 +290,7 @@ impl AnalyticsService {
             total_wagered: r.total_wagered,
             total_rewards_paid: r.total_rewards_paid,
             avg_match_duration_secs: r.avg_match_duration_secs,
+            data_quality_status: r.data_quality_status,
             last_updated: r.last_updated,
         }))
     }

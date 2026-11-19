@@ -1,6 +1,6 @@
 # ArenaX Development Makefile
 
-.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down
+.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down local-env local-env-down
 
 # Default target
 help:
@@ -38,6 +38,8 @@ help:
 	@echo "  docker-build     Build Docker images"
 	@echo "  docker-up        Start services with Docker Compose"
 	@echo "  docker-down      Stop Docker services"
+	@echo "  local-env        Start local dependencies with generated credentials"
+	@echo "  local-env-down   Stop local dependencies without deleting data"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  clean            Clean all build artifacts"
@@ -139,6 +141,12 @@ docker-up:
 docker-down:
 	@echo "Stopping Docker services..."
 	@docker-compose down
+
+local-env:
+	@./scripts/dev-env.sh up
+
+local-env-down:
+	@./scripts/dev-env.sh down
 
 # Utilities
 clean:

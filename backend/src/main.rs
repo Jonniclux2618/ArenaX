@@ -269,6 +269,8 @@ async fn main() -> io::Result<()> {
 
     // Snapshot the rate limit config so it can be moved into the HttpServer closure.
     let rate_limit_config = config.rate_limit.clone();
+    let step_up_secret =
+        crate::security::step_up::StepUpSecret(config.sensitive_operation_secret.clone());
 
     // Tamper-evident dispute evidence storage (#1081, #1076).
     let evidence_store: Arc<dyn EvidenceStore> = Arc::new(S3EvidenceStore::new(&config.storage));
@@ -298,6 +300,7 @@ async fn main() -> io::Result<()> {
                 crate::service::evidence_storage::MAX_EVIDENCE_BYTES,
             ))
             .app_data(web::Data::new(redis_conn.clone()))
+            .app_data(web::Data::new(step_up_secret.clone()))
             .app_data(web::Data::new(Arc::new(redis_client.clone())))
             .app_data(web::Data::new(auth_service.clone()))
             .app_data(web::Data::new(otp_service.clone()))

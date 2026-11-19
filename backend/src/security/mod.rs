@@ -4,6 +4,7 @@
 //! key rotation management, and access audit logging.
 
 pub mod encryption;
+pub mod step_up;
 
 pub use encryption::{
     EncryptedField, EncryptionAuditEvent, EncryptionAuditLogger, EncryptionError,

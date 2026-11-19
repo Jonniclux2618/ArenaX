@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { authRateLimiter } from '../middleware/rate-limit.middleware';
+import { authenticateJWT } from '../middleware/auth.middleware';
+import { issueStepUpProof } from '../middleware/step-up.middleware';
 import * as authController from '../controllers/auth.controller';
 
 const router: Router = Router();
@@ -14,5 +16,6 @@ router.post('/verify-email', authRateLimiter, authController.verifyEmailHandler)
 router.post('/resend-verification-email', authRateLimiter, authController.resendVerificationEmailHandler);
 router.post('/forgot-password', authRateLimiter, authController.forgotPasswordHandler);
 router.post('/reset-password', authRateLimiter, authController.resetPasswordHandler);
+router.post('/step-up', authRateLimiter, authenticateJWT, issueStepUpProof);
 
 export default router;

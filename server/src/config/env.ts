@@ -58,7 +58,7 @@ const placeholderSecrets = new Set([
 const isPlaceholderSecret = (value: string): boolean => {
     const normalized = value.trim().toLowerCase();
     return placeholderSecrets.has(normalized) ||
-        /^(replace|your|example|placeholder|xxx|<)/.test(normalized);
+        /(^|[^a-z0-9])(replace|your|example|placeholder|changeme|supersecret|xxx|test)([^a-z0-9]|$)/.test(normalized);
 };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ const envSchema = z.object({
     ENCRYPTION_SECRET: z.string().min(32).optional(),
     WALLET_MASTER_KEYS: z.string().optional(),
     WALLET_ACTIVE_MASTER_KEY_VERSION: intStr('1').optional(),
-    SENSITIVE_OPERATION_SECRET: z.string().optional(),
+    SENSITIVE_OPERATION_SECRET: z.string().min(32),
 
     // ── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: z
@@ -200,6 +200,33 @@ const envSchema = z.object({
     const addIssue = (path: string, message: string) =>
         context.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
 
+    const secretValues: Array<[string, string | undefined]> = [
+        ['JWT_SECRET', values.JWT_SECRET],
+        ['JWT_PRIVATE_KEY', values.JWT_PRIVATE_KEY],
+        ['ENCRYPTION_SECRET', values.ENCRYPTION_SECRET],
+        ['WALLET_MASTER_KEYS', values.WALLET_MASTER_KEYS],
+        ['SENSITIVE_OPERATION_SECRET', values.SENSITIVE_OPERATION_SECRET],
+        ['EMAIL_PASSWORD', values.EMAIL_PASSWORD],
+        ['GOOGLE_CLIENT_SECRET', values.GOOGLE_CLIENT_SECRET],
+        ['DISCORD_CLIENT_SECRET', values.DISCORD_CLIENT_SECRET],
+        ['TWITCH_CLIENT_SECRET', values.TWITCH_CLIENT_SECRET],
+        ['ADMIN_SECRET_KEY', values.ADMIN_SECRET_KEY],
+        ['FEE_PAYER_SECRET_KEY', values.FEE_PAYER_SECRET_KEY],
+        ['PAYSTACK_SECRET_KEY', values.PAYSTACK_SECRET_KEY],
+        ['FLUTTERWAVE_SECRET_KEY', values.FLUTTERWAVE_SECRET_KEY],
+        ['FLUTTERWAVE_WEBHOOK_HASH', values.FLUTTERWAVE_WEBHOOK_HASH],
+        ['CDN_API_TOKEN', values.CDN_API_TOKEN]
+    ];
+    for (const [name, value] of secretValues) {
+        if (value && isPlaceholderSecret(value)) {
+            if (values.NODE_ENV === 'production') {
+                addIssue(name, 'placeholder values are not allowed');
+            } else {
+                console.warn(`[env] ${name} is configured with a placeholder value`);
+            }
+        }
+    }
+
     const oauthPairs = [
         ['GOOGLE_CLIENT_ID', values.GOOGLE_CLIENT_ID, 'GOOGLE_CLIENT_SECRET', values.GOOGLE_CLIENT_SECRET],
         ['DISCORD_CLIENT_ID', values.DISCORD_CLIENT_ID, 'DISCORD_CLIENT_SECRET', values.DISCORD_CLIENT_SECRET],
@@ -227,22 +254,6 @@ const envSchema = z.object({
     }
 
     if (values.NODE_ENV === 'production') {
-        const secretValues: Array<[string, string | undefined]> = [
-            ['JWT_SECRET', values.JWT_SECRET],
-            ['JWT_PRIVATE_KEY', values.JWT_PRIVATE_KEY],
-            ['JWT_PUBLIC_KEY', values.JWT_PUBLIC_KEY],
-            ['ENCRYPTION_SECRET', values.ENCRYPTION_SECRET],
-            ['SENSITIVE_OPERATION_SECRET', values.SENSITIVE_OPERATION_SECRET],
-            ['ADMIN_SECRET_KEY', values.ADMIN_SECRET_KEY],
-            ['FEE_PAYER_SECRET_KEY', values.FEE_PAYER_SECRET_KEY],
-            ['PAYSTACK_SECRET_KEY', values.PAYSTACK_SECRET_KEY],
-            ['FLUTTERWAVE_SECRET_KEY', values.FLUTTERWAVE_SECRET_KEY],
-            ['FLUTTERWAVE_WEBHOOK_HASH', values.FLUTTERWAVE_WEBHOOK_HASH],
-            ['EMAIL_PASSWORD', values.EMAIL_PASSWORD],
-            ['GOOGLE_CLIENT_SECRET', values.GOOGLE_CLIENT_SECRET],
-            ['DISCORD_CLIENT_SECRET', values.DISCORD_CLIENT_SECRET],
-            ['TWITCH_CLIENT_SECRET', values.TWITCH_CLIENT_SECRET]
-        ];
         for (const [name, value] of secretValues) {
             if (value && (value.trim().length < 32 || isPlaceholderSecret(value))) {
                 addIssue(name, 'must be a unique secret of at least 32 characters; replace the placeholder');
@@ -289,6 +300,24 @@ const envSchema = z.object({
 
 export type Env = z.infer<typeof envSchema>;
 
+const APPROVED_SECRET_ENV = new Set([
+    'JWT_SECRET', 'JWT_PRIVATE_KEY', 'JWT_PRIVATE_KEY_FILE', 'ENCRYPTION_SECRET', 'WALLET_MASTER_KEYS',
+    'SENSITIVE_OPERATION_SECRET', 'EMAIL_PASSWORD', 'GOOGLE_CLIENT_SECRET',
+    'DISCORD_CLIENT_SECRET', 'TWITCH_CLIENT_SECRET', 'ADMIN_SECRET_KEY',
+    'FEE_PAYER_SECRET_KEY', 'PAYSTACK_SECRET_KEY', 'FLUTTERWAVE_SECRET_KEY',
+    'FLUTTERWAVE_WEBHOOK_HASH', 'CDN_API_TOKEN'
+]);
+
+export const findUnapprovedSecretVariables = (names: Iterable<string>): string[] =>
+    [...names]
+        .filter((name) => {
+            const secretShaped =
+                /(?:_SECRET(?:_|$)|_TOKEN(?:_|$)|_PASSWORD(?:_|$)|_API_KEY(?:_|$)|_ACCESS_KEY(?:_|$)|_PRIVATE_KEY(?:_|$)|_SECRET_KEY$)/.test(name) ||
+                name.endsWith('_MASTER_KEYS');
+            return secretShaped && !APPROVED_SECRET_ENV.has(name);
+        })
+        .sort();
+
 export interface DerivedEnv extends Env {
     /** True only in production. */
     isProduction: boolean;
@@ -316,6 +345,15 @@ export interface DerivedEnv extends Env {
  * deployments fail loudly at startup rather than silently misbehaving.
  */
 export const validateEnv = (): DerivedEnv => {
+    const unapprovedSecrets = findUnapprovedSecretVariables(Object.keys(process.env));
+    if (unapprovedSecrets.length > 0) {
+        console.error(
+            `[env] Unapproved secret variable name(s): ${unapprovedSecrets.join(', ')}. ` +
+            'Register each consumer, owner, and startup requirement in the secret inventory.'
+        );
+        process.exit(1);
+    }
+
     const result = envSchema.safeParse(process.env);
 
     if (!result.success) {

@@ -9,6 +9,7 @@ use futures::future::LocalBoxFuture;
 use std::future::{ready, Ready};
 use std::rc::Rc;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 fn is_public_route(req: &ServiceRequest) -> bool {
     let path = req.path();
@@ -33,12 +34,30 @@ fn is_public_route(req: &ServiceRequest) -> bool {
         return true;
     }
 
+    if method == Method::GET && is_evidence_download_link_path(path) {
+        return true;
+    }
+
     (method == Method::GET
         && (path.starts_with("/api/docs")
             || path.starts_with("/api/leaderboards/")
             || (path.starts_with("/api/tournaments/")
                 && path["/api/tournaments/".len()..].matches('/').count() == 0)))
         || (method == Method::POST && path.starts_with("/api/webhooks/"))
+}
+
+fn is_evidence_download_link_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/matches/") else {
+        return false;
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    parts.len() == 5
+        && Uuid::parse_str(parts[0]).is_ok()
+        && parts[1..4] == ["dispute", "evidence", "download"]
+        && !parts[4].is_empty()
+        && parts[4].bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        })
 }
 
 fn required_roles(path: &str) -> Option<&'static [&'static str]> {

@@ -114,3 +114,133 @@ groups:
         annotations:
           summary: "arenax-backend named query P99 above 1s"
           description: "Query {{ $labels.query_name }} has had a P99 latency above 1 second for 5 minutes."
+
+      - record: journey:login_error_ratio:5m
+        expr: |
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route="/api/auth/login", status_code=~"429|5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route="/api/auth/login"}[5m]))
+
+      - record: journey:match_error_ratio:5m
+        expr: |
+          sum(rate(http_requests_total{job="arenax-backend", route=~"/api/matches/[^/]+/(start|complete)", status_code=~"429|5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="arenax-backend", route=~"/api/matches/[^/]+/(start|complete)"}[5m]))
+
+      - record: journey:payout_error_ratio:5m
+        expr: |
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route=~"/api/tournaments/[^/]+/distribute-prizes", status_code=~"429|5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route=~"/api/tournaments/[^/]+/distribute-prizes"}[5m]))
+
+      - record: journey:payout_settlement_error_ratio:5m
+        expr: |
+          sum(rate(payout_settlement_attempts_total{job="arenax-backend", outcome="failure"}[5m]))
+          /
+          sum(rate(payout_settlement_attempts_total{job="arenax-backend"}[5m]))
+
+      - alert: LoginJourneyFastBurn
+        expr: |
+          journey:login_error_ratio:5m > 0.0144
+          and
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route="/api/auth/login", status_code=~"429|5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="arenax-backend", method="POST", route="/api/auth/login"}[1h]))
+          > 0.0144
+        for: 5m
+        labels:
+          severity: critical
+          service: arenax-backend
+          journey: login
+          owner: identity
+        annotations:
+          summary: "Login journey is consuming its error budget rapidly"
+          description: "Login failures exceeded the 14.4x burn threshold over both 5m and 1h. Check identity service and dependency health."
+
+      - alert: MatchJourneyFastBurn
+        expr: |
+          journey:match_error_ratio:5m > 0.0144
+          and
+          sum(rate(http_requests_total{job="arenax-backend", route=~"/api/matches/[^/]+/(start|complete)", status_code=~"429|5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="arenax-backend", route=~"/api/matches/[^/]+/(start|complete)"}[1h]))
+          > 0.0144
+        for: 5m
+        labels:
+          severity: critical
+          service: arenax-backend
+          journey: match
+          owner: gameplay
+        annotations:
+          summary: "Match journey is consuming its error budget rapidly"
+          description: "Match start/complete failures exceeded the 14.4x burn threshold over both 5m and 1h. Check match authority and database health."
+
+      - alert: PayoutJourneyFastBurn
+        expr: |
+          (
+            journey:payout_error_ratio:5m > 0.0144
+            and
+            sum(rate(http_requests_total{job="arenax-backend", method="POST", route=~"/api/tournaments/[^/]+/distribute-prizes", status_code=~"429|5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="arenax-backend", method="POST", route=~"/api/tournaments/[^/]+/distribute-prizes"}[1h]))
+            > 0.0144
+          )
+          or
+          (
+            journey:payout_settlement_error_ratio:5m > 0.0144
+            and
+            sum(rate(payout_settlement_attempts_total{job="arenax-backend", outcome="failure"}[1h]))
+            /
+            sum(rate(payout_settlement_attempts_total{job="arenax-backend"}[1h]))
+            > 0.0144
+          )
+        for: 5m
+        labels:
+          severity: critical
+          service: arenax-backend
+          journey: payout
+          owner: payments
+        annotations:
+          summary: "Payout journey is consuming its error budget rapidly"
+          description: "Payout request failures exceeded the 14.4x burn threshold over both 5m and 1h. Check payout orchestration and provider health."
+
+      - alert: LoginJourneyLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="arenax-backend", method="POST", route="/api/auth/login"}[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          service: arenax-backend
+          journey: login
+          owner: identity
+        annotations:
+          summary: "Login journey p95 latency exceeds 1 second"
+          description: "Login endpoint p95 latency has exceeded its 1s SLO threshold for 10 minutes."
+
+      - alert: MatchJourneyLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="arenax-backend", route=~"/api/matches/[^/]+/(start|complete)"}[5m])) by (le)) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: arenax-backend
+          journey: match
+          owner: gameplay
+        annotations:
+          summary: "Match journey p95 latency exceeds 2 seconds"
+          description: "Match start/complete endpoint p95 latency has exceeded its 2s SLO threshold for 10 minutes."
+
+      - alert: PayoutJourneyLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="arenax-backend", method="POST", route=~"/api/tournaments/[^/]+/distribute-prizes"}[5m])) by (le)) > 5
+          or
+          histogram_quantile(0.95, sum(rate(payout_settlement_duration_seconds_bucket{job="arenax-backend"}[5m])) by (le)) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: arenax-backend
+          journey: payout
+          owner: payments
+        annotations:
+          summary: "Payout journey p95 latency exceeds 5 seconds"
+          description: "Payout request or settlement p95 latency has exceeded its 5s SLO threshold for 10 minutes."

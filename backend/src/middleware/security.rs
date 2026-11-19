@@ -149,7 +149,7 @@ where
 
         Box::pin(async move {
             let ip = extract_ip(&req);
-            let path = req.path().to_string();
+            let path = req.match_pattern().unwrap_or_else(|| "<unmatched>".to_string());
             let method = req.method().to_string();
             let correlation_id = crate::middleware::tracing_middleware::correlation_id(&req);
             let mut conn = (*redis).clone();

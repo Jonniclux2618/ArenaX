@@ -359,6 +359,7 @@ where
             }
 
             let path = req.path().to_string();
+            let route = req.match_pattern().unwrap_or_else(|| "<unmatched>".to_string());
             let method = req.method().as_str().to_string();
             let now = now_ms();
 
@@ -400,7 +401,7 @@ where
             if count > limit {
                 warn!(
                     identity = %identity,
-                    path = %path,
+                    route = %route,
                     bucket = %bucket.name,
                     count = count,
                     limit = limit,

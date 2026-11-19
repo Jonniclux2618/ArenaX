@@ -213,6 +213,7 @@ pub struct RedisConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct StorageConfig {
     pub s3_endpoint: String,
+    pub allow_loopback_endpoint: bool,
     pub s3_access_key: String,
     pub s3_secret_key: String,
     pub s3_bucket: String,
@@ -358,6 +359,14 @@ impl Config {
         let s3_endpoint = env_required("S3_ENDPOINT")?;
         validate_url("S3_ENDPOINT", &s3_endpoint, &["http", "https"])?;
         require_https_in_production("S3_ENDPOINT", &s3_endpoint, production)?;
+        let parsed_s3_endpoint = reqwest::Url::parse(&s3_endpoint)?;
+        if !parsed_s3_endpoint.username().is_empty()
+            || parsed_s3_endpoint.password().is_some()
+            || parsed_s3_endpoint.query().is_some()
+            || parsed_s3_endpoint.fragment().is_some()
+        {
+            anyhow::bail!("S3_ENDPOINT must not contain credentials, a query, or a fragment");
+        }
         let s3_access_key = env_required("S3_ACCESS_KEY")?;
         // Secret-bearing variables are validated for length / placeholder values
         // so a deployment can never boot on a publicly-known default (#1161).
@@ -452,6 +461,7 @@ impl Config {
             redis: RedisConfig { url: redis_url },
             storage: StorageConfig {
                 s3_endpoint,
+                allow_loopback_endpoint: !production,
                 s3_access_key,
                 s3_secret_key,
                 s3_bucket,

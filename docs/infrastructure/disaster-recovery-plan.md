@@ -166,6 +166,28 @@ incident channel and declared a Sev1/Sev2 incident.
   incident tracker; the next scheduled drill date is always visible there
   (not duplicated in this document, to avoid staleness).
 
+### Automated PostgreSQL failover evidence
+
+The `Isolated Database Failover Drill` workflow runs monthly and on demand.
+It creates a disposable PostgreSQL primary and streaming standby in its own
+Docker network, writes and confirms a known set of rows on the standby, stops
+the primary, promotes the standby, and verifies that the promoted database
+accepts writes. It never uses production or staging credentials or data.
+
+The workflow retains a JSON evidence artifact for 90 days. It records
+detection/promotion timing, acknowledged and recovered row counts, RTO, and
+the resulting data-loss count. The drill gates success on the Tier 0 RTO
+(60 minutes) and loss of acknowledged writes (RPO target: zero in this
+controlled exercise). A failed run must be reviewed by Infrastructure; the
+resulting corrective action is tracked to an owner and due date in the
+infrastructure incident tracker, as for the quarterly exercises above. A
+failed workflow also opens an `area:infrastructure` issue assigned to the
+repository owner, with links to the run and its retained evidence.
+
+This container drill verifies PostgreSQL streaming replication and client
+recovery only. It does not replace the quarterly staging exercise of the
+deployed application, migrations, ledger integrity, or region-level routing.
+
 ## 7. Post-Incident Reviews
 
 Every declared disaster-recovery event (real incident or drill) gets a

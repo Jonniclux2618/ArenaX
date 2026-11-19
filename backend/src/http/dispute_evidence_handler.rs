@@ -19,9 +19,28 @@ use crate::service::evidence_storage::{
 };
 use crate::service::match_service::MatchService;
 use actix_web::{web, HttpRequest, HttpResponse};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+const EVIDENCE_LINK_TTL_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EvidenceLinkClaims {
+    match_id: Uuid,
+    dispute_id: Uuid,
+    viewer_id: Uuid,
+    expires_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceLinkResponse {
+    download_url: String,
+    expires_at: u64,
+}
 
 #[derive(Debug, Serialize)]
 pub struct DisputeEvidenceResponse {
@@ -148,6 +167,139 @@ pub async fn get_dispute_evidence(
     .map_err(ApiError::database_error)?
     .ok_or_else(|| ApiError::not_found("No evidence found for this dispute"))?;
 
+    evidence_response(dispute, store.get_ref().as_ref()).await
+}
+
+/// POST /api/matches/{id}/dispute/evidence/download-link
+pub async fn create_evidence_download_link(
+    req: HttpRequest,
+    db: web::Data<DbPool>,
+    signing_secret: web::Data<String>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let match_id = path.into_inner();
+    let viewer_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    authorize_match_player(db.get_ref(), match_id, viewer_id).await?;
+
+    let dispute = sqlx::query_as!(
+        MatchDispute,
+        r#"
+        SELECT * FROM match_disputes
+        WHERE match_id = $1 AND disputing_player_id = $2
+          AND evidence_s3_key IS NOT NULL AND evidence_hash IS NOT NULL
+          AND status NOT IN ('resolved', 'rejected', 'closed')
+          AND (evidence_retention_until IS NULL OR evidence_retention_until > NOW())
+          AND evidence_deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        match_id,
+        viewer_id
+    )
+    .fetch_optional(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?
+    .ok_or_else(|| ApiError::not_found("No active evidence found for this match"))?;
+
+    let expires_at = unix_time()?.saturating_add(EVIDENCE_LINK_TTL_SECS);
+    let claims = EvidenceLinkClaims {
+        match_id,
+        dispute_id: dispute.id,
+        viewer_id,
+        expires_at,
+    };
+    let payload = serde_json::to_vec(&claims).map_err(|error| {
+        ApiError::internal_error(format!("Could not encode evidence link: {error}"))
+    })?;
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let mut signer = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
+        .map_err(|error| {
+            ApiError::internal_error(format!("Could not initialize evidence link signer: {error}"))
+        })?;
+    signer.update(payload.as_bytes());
+    let token = format!("{payload}.{}", URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes()));
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (action, resource_type, resource_id, details)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind("DISPUTE_EVIDENCE_DOWNLOAD_LINK_ISSUED")
+    .bind("match_dispute")
+    .bind(dispute.id)
+    .bind(serde_json::json!({ "viewer_id": viewer_id, "expires_at": expires_at }))
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "private, no-store"))
+        .insert_header(("Referrer-Policy", "no-referrer"))
+        .json(EvidenceLinkResponse {
+            download_url: format!(
+                "/api/matches/{match_id}/dispute/evidence/download/{token}"
+            ),
+            expires_at,
+        }))
+}
+
+/// GET /api/matches/{id}/dispute/evidence/download/{token}
+pub async fn download_evidence_with_link(
+    db: web::Data<DbPool>,
+    store: web::Data<Arc<dyn EvidenceStore>>,
+    signing_secret: web::Data<String>,
+    path: web::Path<(Uuid, String)>,
+) -> Result<HttpResponse, ApiError> {
+    let (match_id, token) = path.into_inner();
+    let claims = verify_evidence_link(&token, signing_secret.as_str())?;
+    if claims.match_id != match_id || claims.expires_at <= unix_time()? {
+        return Err(ApiError::unauthorized("Evidence download link is invalid or expired"));
+    }
+
+    authorize_match_player(db.get_ref(), match_id, claims.viewer_id).await?;
+    let dispute = sqlx::query_as!(
+        MatchDispute,
+        r#"
+        SELECT * FROM match_disputes
+        WHERE id = $1 AND match_id = $2 AND disputing_player_id = $3
+          AND evidence_s3_key IS NOT NULL AND evidence_hash IS NOT NULL
+          AND status NOT IN ('resolved', 'rejected', 'closed')
+          AND (evidence_retention_until IS NULL OR evidence_retention_until > NOW())
+          AND evidence_deleted_at IS NULL
+        "#,
+        claims.dispute_id,
+        match_id,
+        claims.viewer_id
+    )
+    .fetch_optional(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?
+    .ok_or_else(|| ApiError::not_found("Evidence is no longer available"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (action, resource_type, resource_id, details)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind("DISPUTE_EVIDENCE_DOWNLOAD_LINK_USED")
+    .bind("match_dispute")
+    .bind(dispute.id)
+    .bind(serde_json::json!({ "viewer_id": claims.viewer_id }))
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    evidence_response(dispute, store.get_ref().as_ref()).await
+}
+
+async fn evidence_response(
+    dispute: MatchDispute,
+    store: &dyn EvidenceStore,
+) -> Result<HttpResponse, ApiError> {
     let key = dispute.evidence_s3_key.as_deref().unwrap_or_default();
     let bytes = store.get(key).await?;
     if hash_evidence(&bytes) != dispute.evidence_hash.as_deref().unwrap_or_default() {
@@ -171,8 +323,38 @@ pub async fn get_dispute_evidence(
 
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "private, no-store"))
+        .insert_header(("Referrer-Policy", "no-referrer"))
         .content_type(content_type)
         .body(bytes))
+}
+
+fn unix_time() -> Result<u64, ApiError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| ApiError::internal_error(format!("System clock is invalid: {error}")))
+}
+
+fn verify_evidence_link(token: &str, signing_secret: &str) -> Result<EvidenceLinkClaims, ApiError> {
+    let (payload, signature) = token
+        .split_once('.')
+        .ok_or_else(|| ApiError::unauthorized("Evidence download link is invalid"))?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| ApiError::unauthorized("Evidence download link is invalid"))?;
+    let mut verifier = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
+        .map_err(|error| {
+            ApiError::internal_error(format!("Could not initialize evidence link verifier: {error}"))
+        })?;
+    verifier.update(payload.as_bytes());
+    verifier
+        .verify_slice(&signature)
+        .map_err(|_| ApiError::unauthorized("Evidence download link is invalid"))?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| ApiError::unauthorized("Evidence download link is invalid"))?;
+    serde_json::from_slice(&payload)
+        .map_err(|_| ApiError::unauthorized("Evidence download link is invalid"))
 }
 
 /// PUT /api/matches/{id}/dispute/evidence/legal-hold
@@ -285,6 +467,14 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
                 .route("", web::get().to(get_match_dispute))
                 .route("/evidence", web::post().to(upload_dispute_evidence))
                 .route("/evidence", web::get().to(get_dispute_evidence))
+                .route(
+                    "/evidence/download-link",
+                    web::post().to(create_evidence_download_link),
+                )
+                .route(
+                    "/evidence/download/{token}",
+                    web::get().to(download_evidence_with_link),
+                )
                 .route("/evidence/legal-hold", web::put().to(set_evidence_legal_hold)),
         ),
     );

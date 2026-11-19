@@ -10,8 +10,10 @@ use crate::api_error::ApiError;
 use crate::config::StorageConfig;
 use crate::db::DbPool;
 use chrono::Utc;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 /// Actix `PayloadConfig` limit for evidence uploads (#1076).
@@ -169,6 +171,7 @@ pub async fn sweep_expired_evidence(
 /// this backend so no new dependency is needed for signing.
 pub struct S3EvidenceStore {
     endpoint: String,
+    allow_loopback_endpoint: bool,
     region: String,
     bucket: String,
     access_key: String,
@@ -180,6 +183,7 @@ impl S3EvidenceStore {
     pub fn new(config: &StorageConfig) -> Self {
         Self {
             endpoint: config.s3_endpoint.trim_end_matches('/').to_string(),
+            allow_loopback_endpoint: config.allow_loopback_endpoint,
             // Not present in `StorageConfig` today; every deployment target
             // for this project (MinIO, AWS in af-south-1 mirrors) accepts
             // "us-east-1" as the SigV4 region for path-style requests.
@@ -187,7 +191,12 @@ impl S3EvidenceStore {
             bucket: config.s3_bucket.clone(),
             access_key: config.s3_access_key.clone(),
             secret_key: config.s3_secret_key.clone(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("static evidence HTTP client configuration is valid"),
         }
     }
 
@@ -198,13 +207,70 @@ impl S3EvidenceStore {
         content_type: Option<&str>,
         bytes: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
-        let url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
-        let host = url
-            .split("//")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or_default()
+        let endpoint = reqwest::Url::parse(&self.endpoint).map_err(|error| {
+            ApiError::internal_error(format!("Invalid evidence storage endpoint: {error}"))
+        })?;
+        let host = endpoint
+            .host_str()
+            .ok_or_else(|| ApiError::internal_error("Evidence storage endpoint has no host"))?
             .to_string();
+        let host_header = endpoint
+            .port()
+            .map(|port| format!("{host}:{port}"))
+            .unwrap_or_else(|| host.clone());
+        let mut url = endpoint.clone();
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                ApiError::internal_error("Evidence storage endpoint cannot be a base URL")
+            })?;
+            segments.pop_if_empty();
+            segments.push(&self.bucket);
+            for segment in key.split('/') {
+                segments.push(segment);
+            }
+        }
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::lookup_host((
+                host.as_str(),
+                endpoint.port_or_known_default().unwrap_or(443),
+            )),
+        )
+            .await
+            .map_err(|_| {
+                ApiError::ServiceUnavailable("Evidence storage DNS lookup timed out".to_string())
+            })?
+            .map_err(|error| {
+                ApiError::ServiceUnavailable(format!(
+                    "Evidence storage destination could not be resolved: {error}"
+                ))
+            })?
+            .collect::<Vec<SocketAddr>>();
+        if resolved.is_empty()
+            || resolved.iter().any(|address| {
+                crate::service::outbound_http::is_prohibited_destination(address.ip())
+                    && !(self.allow_loopback_endpoint && address.ip().is_loopback())
+            })
+        {
+            return Err(ApiError::ServiceUnavailable(
+                "Evidence storage destination resolved to a prohibited address".to_string(),
+            ));
+        }
+        let pinned_http = if host.parse::<IpAddr>().is_err() {
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .resolve_to_addrs(&host, &resolved)
+                .build()
+                .map_err(|error| {
+                    ApiError::internal_error(format!("Invalid evidence HTTP client: {error}"))
+                })?;
+            client
+        } else {
+            self.http.clone()
+        };
+        let canonical_path = url.path();
         let now = Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
@@ -212,21 +278,20 @@ impl S3EvidenceStore {
         let (canonical_headers, signed_headers) = if method == "PUT" {
             (
                 format!(
-                    "host:{host}\nx-amz-acl:private\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+                    "host:{host_header}\nx-amz-acl:private\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
                 ),
                 "host;x-amz-acl;x-amz-content-sha256;x-amz-date",
             )
         } else {
             (
                 format!(
-                    "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+                    "host:{host_header}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
                 ),
                 "host;x-amz-content-sha256;x-amz-date",
             )
         };
         let canonical_request = format!(
-            "{method}\n/{}/{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
-            self.bucket, key
+            "{method}\n{canonical_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
         );
         let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
         let string_to_sign = format!(
@@ -240,15 +305,14 @@ impl S3EvidenceStore {
             self.access_key
         );
 
-        let mut request = self
-            .http
+        let mut request = pinned_http
             .request(
                 reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
                     ApiError::internal_error(format!("Invalid evidence storage method: {e}"))
                 })?,
-                &url,
+                url,
             )
-            .header("host", host)
+            .header("host", host_header)
             .header("x-amz-content-sha256", payload_hash)
             .header("x-amz-date", amz_date)
             .header("Authorization", authorization);
@@ -273,13 +337,30 @@ impl S3EvidenceStore {
                 response.status()
             )));
         }
-        response
-            .bytes()
-            .await
-            .map(|body| body.to_vec())
-            .map_err(|e| {
-                ApiError::ServiceUnavailable(format!("Evidence storage response failed: {e}"))
-            })
+        let limit = if method == "GET" {
+            MAX_EVIDENCE_BYTES
+        } else {
+            64 * 1024
+        };
+        if response.content_length().is_some_and(|length| length > limit as u64) {
+            return Err(ApiError::ServiceUnavailable(
+                "Evidence storage response exceeded the configured size limit".to_string(),
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                ApiError::ServiceUnavailable(format!("Evidence storage response failed: {error}"))
+            })?;
+            if body.len().saturating_add(chunk.len()) > limit {
+                return Err(ApiError::ServiceUnavailable(
+                    "Evidence storage response exceeded the configured size limit".to_string(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 

@@ -97,7 +97,8 @@ impl PaymentProvider for PaystackProvider {
         let secret = std::env::var("PAYSTACK_SECRET")
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.paystack.co").await?;
         let body = serde_json::json!({
             "reference": reference,
             "amount":    amount,       // kobo
@@ -113,10 +114,8 @@ impl PaymentProvider for PaystackProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("paystack network error: {e}")))?;
 
-        let parsed: PaystackInitResponse = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("paystack parse error: {e}")))?;
+        let parsed: PaystackInitResponse =
+            crate::service::outbound_http::parse_provider_json(resp, "paystack").await?;
 
         if !parsed.status {
             return Err(PaymentError::Provider(format!(
@@ -171,7 +170,8 @@ impl PaymentProvider for PaystackProvider {
             reference
         );
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.paystack.co").await?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -180,10 +180,8 @@ impl PaymentProvider for PaystackProvider {
             .map_err(|e| PaymentError::Provider(format!("paystack network error: {e}")))?;
 
         let http_status = resp.status();
-        let parsed: PaystackVerifyResponse = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("paystack parse error: {e}")))?;
+        let parsed: PaystackVerifyResponse =
+            crate::service::outbound_http::parse_provider_json(resp, "paystack").await?;
 
         // Paystack returns HTTP 400 + status:false for unknown references.
         if !parsed.status || !http_status.is_success() {
@@ -257,7 +255,8 @@ impl PaymentProvider for PaystackProvider {
         let secret = std::env::var("PAYSTACK_SECRET")
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.paystack.co").await?;
         // Paystack transfer: create a transfer recipient then initiate.
         // Here we initiate a transfer directly using a pre-created recipient_code
         // (destination is expected to be the recipient_code from Paystack).
@@ -277,10 +276,8 @@ impl PaymentProvider for PaystackProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("paystack network error: {e}")))?;
 
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("paystack parse error: {e}")))?;
+        let val: serde_json::Value =
+            crate::service::outbound_http::parse_provider_json(resp, "paystack").await?;
 
         let status_ok = val["status"].as_bool().unwrap_or(false);
         if !status_ok {
@@ -303,7 +300,8 @@ impl PaymentProvider for PaystackProvider {
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
         let url = format!("https://api.paystack.co/transfer/{}", reference);
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.paystack.co").await?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -311,10 +309,8 @@ impl PaymentProvider for PaystackProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("paystack network error: {e}")))?;
 
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("paystack parse error: {e}")))?;
+        let val: serde_json::Value =
+            crate::service::outbound_http::parse_provider_json(resp, "paystack").await?;
 
         let transfer_status = val["data"]["status"].as_str().unwrap_or("pending");
         Ok(match transfer_status {

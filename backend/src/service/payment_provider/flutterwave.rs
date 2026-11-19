@@ -97,7 +97,8 @@ impl PaymentProvider for FlutterwaveProvider {
         let secret = std::env::var("FLUTTERWAVE_SECRET")
             .map_err(|_| PaymentError::Provider("FLUTTERWAVE_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.flutterwave.com").await?;
 
         // Flutterwave uses major units in its API (naira, not kobo).
         let amount_major = amount as f64 / 100.0;
@@ -123,10 +124,8 @@ impl PaymentProvider for FlutterwaveProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("flutterwave network error: {e}")))?;
 
-        let parsed: FlwPaymentLinkResponse = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("flutterwave parse error: {e}")))?;
+        let parsed: FlwPaymentLinkResponse =
+            crate::service::outbound_http::parse_provider_json(resp, "flutterwave").await?;
 
         if parsed.status != "success" {
             return Err(PaymentError::Provider(format!(
@@ -186,7 +185,8 @@ impl PaymentProvider for FlutterwaveProvider {
             reference
         );
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.flutterwave.com").await?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -195,10 +195,8 @@ impl PaymentProvider for FlutterwaveProvider {
             .map_err(|e| PaymentError::Provider(format!("flutterwave network error: {e}")))?;
 
         let http_status = resp.status();
-        let parsed: FlwVerifyResponse = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("flutterwave parse error: {e}")))?;
+        let parsed: FlwVerifyResponse =
+            crate::service::outbound_http::parse_provider_json(resp, "flutterwave").await?;
 
         if parsed.status != "success" || !http_status.is_success() {
             tracing::warn!(
@@ -279,7 +277,8 @@ impl PaymentProvider for FlutterwaveProvider {
         let secret = std::env::var("FLUTTERWAVE_SECRET")
             .map_err(|_| PaymentError::Provider("FLUTTERWAVE_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.flutterwave.com").await?;
         // destination is expected to be the bank account number; bank code
         // should be supplied as FLUTTERWAVE_BANK_CODE env var.
         let bank_code = std::env::var("FLUTTERWAVE_BANK_CODE").unwrap_or_else(|_| "044".to_string());
@@ -302,10 +301,8 @@ impl PaymentProvider for FlutterwaveProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("flutterwave network error: {e}")))?;
 
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("flutterwave parse error: {e}")))?;
+        let val: serde_json::Value =
+            crate::service::outbound_http::parse_provider_json(resp, "flutterwave").await?;
 
         let status_ok = val["status"].as_str().map(|s| s == "success").unwrap_or(false);
         if !status_ok {
@@ -331,7 +328,8 @@ impl PaymentProvider for FlutterwaveProvider {
             "https://api.flutterwave.com/v3/transfers?reference={}",
             reference
         );
-        let client = reqwest::Client::new();
+        let client =
+            crate::service::outbound_http::payment_provider_client("api.flutterwave.com").await?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -339,10 +337,8 @@ impl PaymentProvider for FlutterwaveProvider {
             .await
             .map_err(|e| PaymentError::Provider(format!("flutterwave network error: {e}")))?;
 
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| PaymentError::Provider(format!("flutterwave parse error: {e}")))?;
+        let val: serde_json::Value =
+            crate::service::outbound_http::parse_provider_json(resp, "flutterwave").await?;
 
         // FLW paginates; grab the first item's status.
         let transfer_status = val["data"]["items"][0]["status"]

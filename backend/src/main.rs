@@ -243,6 +243,23 @@ async fn main() -> io::Result<()> {
         crate::auth::jwt_service::JwtService::new(jwt_config, redis_conn.clone()),
     )
     .with_redis(Arc::new(redis_client.clone()));
+    let account_recovery_service = crate::service::account_recovery::AccountRecoveryService::new(
+        db_pool.clone(),
+        jwt_service.as_ref().clone(),
+    );
+    {
+        let retention_service =
+            crate::service::analytics_governance::AnalyticsGovernanceService::new(db_pool.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = retention_service.run_due_purges().await {
+                    tracing::error!(%error, "Scheduled analytics retention sweep failed");
+                }
+            }
+        });
+    }
 
     // OTP authentication service (Issue #6) — Redis-backed single-use
     // challenges with distributed rate limiting and non-enumerating responses.
@@ -300,6 +317,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(redis_conn.clone()))
             .app_data(web::Data::new(Arc::new(redis_client.clone())))
             .app_data(web::Data::new(auth_service.clone()))
+            .app_data(web::Data::new(account_recovery_service.clone()))
             .app_data(web::Data::new(otp_service.clone()))
             .app_data(web::Data::new(event_bus.clone()))
             .app_data(web::Data::new(response_cache.clone()))
@@ -365,6 +383,7 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::feature_flag_handler::configure_routes)
                     // Auth endpoints (login, register, refresh are rate-limited strictly)
                     .configure(crate::http::auth_handler::configure_routes)
+                    .configure(crate::http::recovery_handler::configure_routes)
                     .configure(crate::http::otp_handler::configure_routes)
                     .configure(crate::http::users::configure_routes)
                     .route(
@@ -442,6 +461,7 @@ async fn main() -> io::Result<()> {
                             .route("/platform", web::get().to(crate::http::analytics_handler::get_platform_metrics))
                             .route("/player/{user_id}", web::get().to(crate::http::analytics_handler::get_player_insights))
                     )
+                    .configure(crate::http::analytics_governance_handler::configure_routes)
                     // Tournament endpoints — full lifecycle
                     .configure(crate::http::tournament_handler::configure_routes)
                     // Match authority endpoints — on-chain match FSM

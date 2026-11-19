@@ -21,6 +21,7 @@ pub mod matchmaker;
 pub mod matchmaker_tests;
 pub mod notification_service;
 pub mod otp_service;
+pub mod outbound_http;
 pub mod payment_provider;
 pub mod player_stats_service;
 pub mod push_notification_service;

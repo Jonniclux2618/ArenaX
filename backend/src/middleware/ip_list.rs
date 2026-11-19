@@ -266,7 +266,8 @@ where
 
             // ── Blacklist check — reject immediately ──────────────────────────
             if is_blacklisted(&mut conn, &ip).await {
-                warn!(ip = %ip, path = %req.path(), "Blacklisted IP rejected");
+                let route = req.match_pattern().unwrap_or_else(|| "<unmatched>".to_string());
+                warn!(ip = %ip, route = %route, "Blacklisted IP rejected");
                 let resp = HttpResponse::Forbidden().json(serde_json::json!({
                     "error": "Access denied",
                     "code": "IP_BLACKLISTED",

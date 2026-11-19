@@ -100,3 +100,32 @@ confirm:
    span, and `queue.depth` is exported.
 4. No credentials, auth headers, payment secrets, or evidence contents appear in
    spans, logs, or Sentry/Datadog payloads.
+
+## 7. Critical user-journey SLOs
+
+The Rust backend exposes route-template request counters and duration
+histograms. `server/infra/monitoring/backend-alert.rules.yml` uses those
+metrics for these initial service-level objectives:
+
+| Journey | Availability objective | Latency objective | Included route templates | Owner |
+|---|---|---|---|---|
+| Login | 99.9% successful service responses over 30 days | p95 below 1s | `POST /api/auth/login` | Identity |
+| Match | 99.9% successful service responses over 30 days | p95 below 2s | `POST /api/matches/{id}/start`, `POST /api/matches/{id}/complete` | Gameplay |
+| Payout | 99.9% successful service responses and settlements over 30 days | p95 below 5s | `POST /api/tournaments/{id}/distribute-prizes` plus payout settlement attempts | Payments |
+
+Availability counts HTTP 429 and 5xx responses as bad events; other 4xx
+responses (including invalid user credentials and invalid requests) are
+excluded because they indicate a completed service response. Requests are
+counted only when traffic exists. Latency is measured at the HTTP route
+boundary and for payout settlement from the settlement attempt to database
+commit. The payout SLI includes both the initiation route and the asynchronous
+settlement attempt, using bounded outcome labels and no player or tournament IDs.
+The current Prometheus alerts page on a fast error-budget burn (14.4x over
+both 5m and 1h) and warn when route p95 exceeds its threshold for 10m.
+
+The journey SLI is the user-impact signal. Existing database, provider,
+match-authority, and transaction metrics are component diagnostics used to
+attribute failures; they must not be added as independent journey failures
+unless the user-facing operation also fails. Route templates and settlement
+outcomes are bounded labels; user, match, tournament, and payment identifiers
+are not included.

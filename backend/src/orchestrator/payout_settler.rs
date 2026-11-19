@@ -17,6 +17,16 @@ impl PayoutSettler {
 
     /// Called when a tournament completes. Computes rankings and distributes prizes idempotently.
     pub async fn finalize_tournament(&self, tournament_id: Uuid) -> Result<(), ApiError> {
+        let started_at = std::time::Instant::now();
+        let result = self.finalize_tournament_inner(tournament_id).await;
+        crate::metrics::record_payout_settlement(
+            result.is_ok(),
+            started_at.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    async fn finalize_tournament_inner(&self, tournament_id: Uuid) -> Result<(), ApiError> {
         // Step 1: Verify tournament status is "completed" (case-insensitive).
         let tournament_row = sqlx::query(
             "SELECT status FROM tournaments WHERE id = $1",

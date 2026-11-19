@@ -129,7 +129,7 @@ where
         let method = req.method().to_string();
         let route = req
             .match_pattern()
-            .unwrap_or_else(|| req.path().to_string());
+            .unwrap_or_else(|| "<unmatched>".to_string());
 
         // ── 2. Span creation per operation (this HTTP request) ──────────
         let span = tracing::info_span!(

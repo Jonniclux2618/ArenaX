@@ -55,11 +55,11 @@ where
 ///
 /// Prefers the matched resource pattern (`req.match_info().pattern()`), e.g.
 /// `/api/tournaments/{id}`. Falls back to the highest-scoped registered
-/// pattern, and finally to the raw path for unmatched (404) requests so the
-/// metric always has a `route` label.
+/// pattern, and finally to a fixed label for unmatched (404) requests so
+/// sensitive path segments are never exposed as metric labels.
 fn route_template(req: &ServiceRequest) -> String {
     req.match_pattern()
-        .unwrap_or_else(|| req.path().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string())
 }
 
 pub struct RequestMetricsMiddleware<S> {

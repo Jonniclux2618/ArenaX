@@ -243,6 +243,37 @@ pub static SOROBAN_DLQ_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
     gauge
 });
 
+pub static PAYOUT_SETTLEMENT_ATTEMPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "payout_settlement_attempts_total",
+            "Tournament payout settlement attempts by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static PAYOUT_SETTLEMENT_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let histogram = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "payout_settlement_duration_seconds",
+            "Tournament payout settlement duration by outcome",
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]),
+        &["outcome"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("metric can be registered");
+    histogram
+});
+
 /// Count of WebSocket messages dropped for exceeding the per-connection
 /// rate limit (#1083), labeled by user so a single flooding user stands out.
 pub static WS_MESSAGES_RATE_LIMITED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -346,6 +377,8 @@ pub fn init_metrics() {
     Lazy::force(&SOROBAN_TX_RETRIES_TOTAL);
     Lazy::force(&SOROBAN_TX_LATENCY_SECONDS);
     Lazy::force(&SOROBAN_DLQ_DEPTH);
+    Lazy::force(&PAYOUT_SETTLEMENT_ATTEMPTS_TOTAL);
+    Lazy::force(&PAYOUT_SETTLEMENT_DURATION_SECONDS);
 
     // Process-level metrics (process_resident_memory_bytes, process_cpu_seconds_total,
     // open fds, ...) — only available on Linux in prometheus crate.
@@ -355,6 +388,16 @@ pub fn init_metrics() {
     )) {
         tracing::warn!(error = %e, "failed to register process metrics collector");
     }
+}
+
+pub fn record_payout_settlement(success: bool, elapsed_secs: f64) {
+    let outcome = if success { "success" } else { "failure" };
+    PAYOUT_SETTLEMENT_ATTEMPTS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+    PAYOUT_SETTLEMENT_DURATION_SECONDS
+        .with_label_values(&[outcome])
+        .observe(elapsed_secs);
 }
 
 pub fn record_profile_cache_hit() {

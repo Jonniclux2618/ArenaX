@@ -15,3 +15,12 @@ evidence integrity is not erased.
 
 The retention worker runs every six hours. Object deletion is idempotent, and
 the evidence pointer is cleared only after the storage deletion succeeds.
+
+An authenticated match participant can request a five-minute, read-only
+download URL for their own active dispute. Its signed capability is scoped to
+one match, dispute, and viewer; use rechecks participant access, dispute state,
+retention, and object existence. Closing/resolving the dispute or revoking the
+participant's match access invalidates the link immediately. Issuance and use
+are recorded in the audit log without recording the capability itself. The
+download route uses a route template in application telemetry and returns
+`Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`.

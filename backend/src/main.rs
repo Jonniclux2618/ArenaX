@@ -291,9 +291,11 @@ async fn main() -> io::Result<()> {
         });
     }
 
+    let evidence_download_secret = config.auth.jwt_secret.clone();
     let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::Data::new(evidence_download_secret.clone()))
             .app_data(web::PayloadConfig::new(
                 crate::service::evidence_storage::MAX_EVIDENCE_BYTES,
             ))

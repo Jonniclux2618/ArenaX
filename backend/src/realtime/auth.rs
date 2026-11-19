@@ -12,6 +12,8 @@ pub enum AuthError {
     InvalidChannel(String),
     #[error("Database error: {0}")]
     Database(String),
+    #[error("Realtime event replay error: {0}")]
+    EventStore(String),
 }
 
 /// Centralized authorization guard for real-time channels.

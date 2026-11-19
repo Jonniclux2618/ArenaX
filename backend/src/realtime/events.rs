@@ -129,6 +129,16 @@ pub struct RankChange {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WsEnvelope {
     pub event: RealtimeEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// Durable event record sent through Redis Pub/Sub after it has been appended
+/// to the channel's Redis Stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PublishedEvent {
+    pub cursor: String,
+    pub event: RealtimeEvent,
 }
 
 /// Messages received from the client over WebSocket.
@@ -139,6 +149,8 @@ pub enum ClientMessage {
     Pong,
     Subscribe {
         channel: String,
+        #[serde(default)]
+        cursor: Option<String>,
     },
     Unsubscribe {
         channel: String,
@@ -152,7 +164,10 @@ pub enum ClientMessage {
 /// Actix message for delivering a realtime event to an actor.
 #[derive(Debug, Clone, Message)]
 #[rtype(result = "()")]
-pub struct DeliverEvent(pub RealtimeEvent);
+pub struct DeliverEvent {
+    pub event: RealtimeEvent,
+    pub cursor: Option<String>,
+}
 
 /// Channel naming helpers for pub/sub routing.
 pub mod channels {

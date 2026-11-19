@@ -102,7 +102,9 @@ pub async fn query_audit_logs(
     let entries = sqlx::query_as::<_, AuditEntry>(
         r#"
         SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-               old_values, new_values, source, entry_hash, previous_hash, created_at
+               redact_audit_jsonb(old_values, $10::text[]) AS old_values,
+               redact_audit_jsonb(new_values, $10::text[]) AS new_values,
+               source, entry_hash, previous_hash, created_at
         FROM audit_logs
         WHERE ($1::uuid IS NULL OR user_id = $1)
           AND ($2::text IS NULL OR action = $2)
@@ -124,6 +126,13 @@ pub async fn query_audit_logs(
     .bind(query.to)
     .bind(limit)
     .bind(offset)
+    .bind([
+        "password", "password_hash", "secret", "secret_key", "private_key",
+        "encrypted_secret_key", "key", "token", "access_token", "refresh_token",
+        "authorization", "cookie", "request_body", "raw_body", "body",
+        "email", "email_address", "phone", "phone_number", "api_key",
+        "api_key_hash", "client_secret", "ip_address", "user_agent",
+    ])
     .fetch_all(pool.get_ref())
     .await
     .map_err(|e| ApiError::InternalServerError(format!("Failed to query audit logs: {e}")))?;
@@ -173,16 +182,24 @@ pub async fn resource_history(
     let entries = sqlx::query_as::<_, AuditEntry>(
         r#"
         SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-               old_values, new_values, source, entry_hash, previous_hash, created_at
+               redact_audit_jsonb(old_values, $3::text[]) AS old_values,
+               redact_audit_jsonb(new_values, $3::text[]) AS new_values,
+               source, entry_hash, previous_hash, created_at
         FROM audit_logs
         WHERE resource_type = $1 AND resource_id = $2
         ORDER BY sequence_number ASC
-        LIMIT $3
+        LIMIT 200
         "#,
     )
     .bind(&resource_type)
     .bind(resource_id)
-    .bind(MAX_PAGE_SIZE)
+    .bind([
+        "password", "password_hash", "secret", "secret_key", "private_key",
+        "encrypted_secret_key", "key", "token", "access_token", "refresh_token",
+        "authorization", "cookie", "request_body", "raw_body", "body",
+        "email", "email_address", "phone", "phone_number", "api_key",
+        "api_key_hash", "client_secret", "ip_address", "user_agent",
+    ])
     .fetch_all(pool.get_ref())
     .await
     .map_err(|e| ApiError::InternalServerError(format!("Failed to load resource history: {e}")))?;
@@ -226,12 +243,21 @@ pub async fn get_audit_log_by_id(
     let entry = sqlx::query_as::<_, AuditEntry>(
         r#"
         SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-               old_values, new_values, source, entry_hash, previous_hash, created_at
+               redact_audit_jsonb(old_values, $2::text[]) AS old_values,
+               redact_audit_jsonb(new_values, $2::text[]) AS new_values,
+               source, entry_hash, previous_hash, created_at
         FROM audit_logs
         WHERE id = $1
         "#,
     )
     .bind(id)
+    .bind([
+        "password", "password_hash", "secret", "secret_key", "private_key",
+        "encrypted_secret_key", "key", "token", "access_token", "refresh_token",
+        "authorization", "cookie", "request_body", "raw_body", "body",
+        "email", "email_address", "phone", "phone_number", "api_key",
+        "api_key_hash", "client_secret", "ip_address", "user_agent",
+    ])
     .fetch_optional(pool.get_ref())
     .await
     .map_err(|e| ApiError::InternalServerError(format!("Failed to query audit log: {e}")))?;

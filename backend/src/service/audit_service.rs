@@ -45,6 +45,62 @@ const RETENTION_DAYS: i64 = RETENTION_YEARS * 365;
 /// connection pool — accidentally or otherwise.
 const MAX_PAGE_SIZE: i64 = 500;
 const DEFAULT_PAGE_SIZE: i64 = 50;
+const PROHIBITED_AUDIT_FIELDS: &[&str] = &[
+    "password",
+    "password_hash",
+    "secret",
+    "secret_key",
+    "private_key",
+    "encrypted_secret_key",
+    "key",
+    "api_key",
+    "api_key_hash",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "cookie",
+    "request_body",
+    "raw_body",
+    "body",
+    "email",
+    "email_address",
+    "phone",
+    "phone_number",
+    "ip_address",
+    "user_agent",
+];
+
+fn redact_audit_values(value: &JsonValue) -> JsonValue {
+    let is_prohibited = |key: &str| {
+        let normalized_key: String = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        PROHIBITED_AUDIT_FIELDS.iter().any(|field| {
+            let normalized_field: String = field
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            normalized_key == normalized_field
+        })
+    };
+    match value {
+        JsonValue::Object(fields) => JsonValue::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| !is_prohibited(key))
+                .map(|(key, value)| (key.clone(), redact_audit_values(value)))
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.iter().map(redact_audit_values).collect())
+        }
+        _ => value.clone(),
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AuditError {
@@ -240,6 +296,8 @@ impl AuditService {
             return Err(AuditError::Invalid("resource_type is required".into()));
         }
 
+        let old_values = entry.old_values.as_ref().map(redact_audit_values);
+        let new_values = entry.new_values.as_ref().map(redact_audit_values);
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO audit_logs (
@@ -255,10 +313,10 @@ impl AuditService {
         .bind(entry.action.as_str())
         .bind(&entry.resource_type)
         .bind(entry.resource_id)
-        .bind(&entry.old_values)
-        .bind(&entry.new_values)
-        .bind(entry.ip_address.as_deref())
-        .bind(entry.user_agent.as_deref())
+        .bind(&old_values)
+        .bind(&new_values)
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
         .fetch_one(&self.pool)
         .await
         .inspect_err(|e| {
@@ -287,6 +345,8 @@ impl AuditService {
         tx: &mut Transaction<'_, Postgres>,
         entry: AuditEntryInput,
     ) -> Result<Uuid, AuditError> {
+        let old_values = entry.old_values.as_ref().map(redact_audit_values);
+        let new_values = entry.new_values.as_ref().map(redact_audit_values);
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO audit_logs (
@@ -302,10 +362,10 @@ impl AuditService {
         .bind(entry.action.as_str())
         .bind(&entry.resource_type)
         .bind(entry.resource_id)
-        .bind(&entry.old_values)
-        .bind(&entry.new_values)
-        .bind(entry.ip_address.as_deref())
-        .bind(entry.user_agent.as_deref())
+        .bind(&old_values)
+        .bind(&new_values)
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -358,7 +418,9 @@ impl AuditService {
         let records = sqlx::query_as::<_, AuditRecord>(
             r#"
             SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-                   old_values, new_values, source, entry_hash, previous_hash, created_at
+                   redact_audit_jsonb(old_values, $10::text[]) AS old_values,
+                   redact_audit_jsonb(new_values, $10::text[]) AS new_values,
+                   source, entry_hash, previous_hash, created_at
             FROM audit_logs
             WHERE ($1::uuid IS NULL OR user_id = $1)
               AND ($2::text IS NULL OR action = $2)
@@ -380,6 +442,7 @@ impl AuditService {
         .bind(filter.to)
         .bind(limit)
         .bind(offset)
+        .bind(PROHIBITED_AUDIT_FIELDS)
         .fetch_all(&self.pool)
         .await?;
 
@@ -424,16 +487,18 @@ impl AuditService {
         let records = sqlx::query_as::<_, AuditRecord>(
             r#"
             SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-                   old_values, new_values, source, entry_hash, previous_hash, created_at
+                   redact_audit_jsonb(old_values, $3::text[]) AS old_values,
+                   redact_audit_jsonb(new_values, $3::text[]) AS new_values,
+                   source, entry_hash, previous_hash, created_at
             FROM audit_logs
             WHERE resource_type = $1 AND resource_id = $2
             ORDER BY sequence_number ASC
-            LIMIT $3
+            LIMIT 500
             "#,
         )
         .bind(resource_type)
         .bind(resource_id)
-        .bind(MAX_PAGE_SIZE)
+        .bind(PROHIBITED_AUDIT_FIELDS)
         .fetch_all(&self.pool)
         .await?;
 

@@ -86,6 +86,81 @@ export interface ComplianceReport {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+interface AuditEventSchema {
+  requiredFields: string[];
+  pseudonymizedFields: string[];
+  prohibitedFields: string[];
+  retentionClass: string;
+  retentionDays: number;
+}
+
+const COMMON_PROHIBITED_FIELDS = [
+  'password', 'passwordhash', 'secret', 'secretkey', 'encryptedsecretkey', 'privatekey',
+  'token', 'accesstoken', 'refreshtoken', 'authorization', 'cookie',
+  'requestbody', 'rawbody', 'body', 'email', 'emailaddress', 'phone',
+  'phonenumber', 'ipaddress', 'useragent', 'apikey', 'apikeyhash',
+  'clientsecret',
+] as const;
+
+const AUDIT_EVENT_SCHEMAS: Record<string, AuditEventSchema> = {
+  authentication: {
+    requiredFields: ['userId', 'action', 'targetType', 'targetId'],
+    pseudonymizedFields: [],
+    prohibitedFields: [...COMMON_PROHIBITED_FIELDS],
+    retentionClass: 'security-7y',
+    retentionDays: 2555,
+  },
+  financial: {
+    requiredFields: ['userId', 'action', 'targetType', 'targetId'],
+    pseudonymizedFields: [],
+    prohibitedFields: [...COMMON_PROHIBITED_FIELDS],
+    retentionClass: 'financial-7y',
+    retentionDays: 2555,
+  },
+  gameplay: {
+    requiredFields: ['userId', 'action', 'targetType', 'targetId'],
+    pseudonymizedFields: [],
+    prohibitedFields: [...COMMON_PROHIBITED_FIELDS],
+    retentionClass: 'gameplay-2y',
+    retentionDays: 730,
+  },
+  default: {
+    requiredFields: ['userId', 'action', 'targetType', 'targetId'],
+    pseudonymizedFields: [],
+    prohibitedFields: [...COMMON_PROHIBITED_FIELDS],
+    retentionClass: 'operational-1y',
+    retentionDays: 365,
+  },
+};
+
+function auditSchemaFor(action: string): AuditEventSchema {
+  if (action.startsWith('AUTH_') || action.startsWith('ADMIN_')) {
+    return AUDIT_EVENT_SCHEMAS.authentication;
+  }
+  if (/^(WALLET_|REFUND_|MANUAL_PAYOUT|KYC_)/.test(action)) {
+    return AUDIT_EVENT_SCHEMAS.financial;
+  }
+  if (/^(MATCH_|TOURNAMENT_)/.test(action)) {
+    return AUDIT_EVENT_SCHEMAS.gameplay;
+  }
+  return AUDIT_EVENT_SCHEMAS.default;
+}
+
+function redactAuditValue(
+  value: unknown,
+  prohibitedFields: readonly string[] = COMMON_PROHIBITED_FIELDS,
+): unknown {
+  if (Array.isArray(value)) return value.map(item => redactAuditValue(item, prohibitedFields));
+  if (value === null || typeof value !== 'object') return value;
+
+  const prohibited = new Set(prohibitedFields);
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !prohibited.has(key.replace(/[-_]/g, '').toLowerCase()))
+      .map(([key, nested]) => [key, redactAuditValue(nested, prohibitedFields)]),
+  );
+}
+
 /** Deterministic serialisation – keys sorted so hash is stable. */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -126,10 +201,21 @@ export class AuditService {
    *  - eventId  → record.id  (UUIDv4)
    *  - hash     → record.entryHash
    *  - status   → stored in details._status
-   *  - actor    → { userId, role, ipAddress, userAgent }
+   *  - actor    → { userId, role }
    */
   static async log(ctx: AuditContext) {
     const prisma = getDatabaseClient();
+    const schema = auditSchemaFor(ctx.action);
+    for (const field of schema.requiredFields) {
+      const value = ctx[field as keyof AuditContext];
+      if (typeof value !== 'string' || value.trim() === '') {
+        throw new Error(`Audit event ${ctx.action} is missing required field ${field}`);
+      }
+    }
+
+    const payloadBefore = redactAuditValue(ctx.payloadBefore, schema.prohibitedFields) as Record<string, unknown> | undefined;
+    const payloadAfter = redactAuditValue(ctx.payloadAfter, schema.prohibitedFields) as Record<string, unknown> | undefined;
+    const details = redactAuditValue(ctx.details, schema.prohibitedFields) as Record<string, unknown> | undefined;
     const timestamp = new Date().toISOString();
     const status = ctx.status ?? AuditStatus.SUCCESS;
 
@@ -142,8 +228,8 @@ export class AuditService {
     const actor: AuditActor = {
       userId:    ctx.userId,
       role:      ctx.role ?? 'SYSTEM',
-      ipAddress: ctx.ipAddress ?? null,
-      userAgent: ctx.userAgent ?? null,
+      ipAddress: null,
+      userAgent: null,
     };
 
     const entryHash = computeHash({
@@ -153,12 +239,12 @@ export class AuditService {
       status,
       targetType: ctx.targetType,
       targetId: ctx.targetId,
-      ipAddress: ctx.ipAddress || undefined,
-      userAgent: ctx.userAgent || undefined,
+      ipAddress: undefined,
+      userAgent: undefined,
       requestId: ctx.requestId || undefined,
       correlationId: ctx.correlationId || undefined,
-      payloadBefore: ctx.payloadBefore,
-      payloadAfter: ctx.payloadAfter,
+      payloadBefore,
+      payloadAfter,
       timestamp,
       previousHash,
     });
@@ -169,13 +255,24 @@ export class AuditService {
         action: ctx.action,
         targetType: ctx.targetType,
         targetId: ctx.targetId,
-        ipAddress: ctx.ipAddress,
-        userAgent: ctx.userAgent,
+        ipAddress: null,
+        userAgent: null,
         requestId: ctx.requestId,
         correlationId: ctx.correlationId,
-        snapshotBefore: (ctx.payloadBefore as any) ?? {},
-        snapshotAfter: (ctx.payloadAfter as any) ?? {},
-        details: { ...ctx.details ?? {}, _status: status, _role: actor.role },
+        snapshotBefore: (payloadBefore as any) ?? {},
+        snapshotAfter: (payloadAfter as any) ?? {},
+        details: {
+          ...details ?? {},
+          _status: status,
+          _role: actor.role,
+          _retentionClass: schema.retentionClass,
+          _retentionDays: schema.retentionDays,
+          _fieldPolicy: {
+            requiredFields: schema.requiredFields,
+            pseudonymizedFields: schema.pseudonymizedFields,
+            prohibitedFields: schema.prohibitedFields,
+          },
+        },
         entryHash,
         previousHash,
         anchoredAt: null,
@@ -282,7 +379,17 @@ export class AuditService {
       }),
     ]);
 
-    return { total, logs };
+    return {
+      total,
+      logs: logs.map(log => ({
+        ...log,
+        ipAddress: null,
+        userAgent: null,
+        snapshotBefore: redactAuditValue(log.snapshotBefore),
+        snapshotAfter: redactAuditValue(log.snapshotAfter),
+        details: redactAuditValue(log.details),
+      })),
+    };
   }
 
   /** Backward-compatible `listLogs` alias. */
@@ -364,15 +471,28 @@ export class AuditService {
    */
   static async applyRetentionPolicy(retentionDays = 365): Promise<{ deleted: number }> {
     const prisma = getDatabaseClient();
-    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-    const sensitiveActions = ['WALLET_TRANSACTION', 'WALLET_WITHDRAW', 'MANUAL_PAYOUT', 'KYC_APPROVE', 'KYC_REJECT'];
-
-    const result = await prisma.auditLog.deleteMany({
-      where: {
-        createdAt: { lt: cutoff },
-        NOT: { action: { in: sensitiveActions } },
-      },
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - Math.min(Math.max(retentionDays, 1), 365) * 24 * 60 * 60 * 1000);
+    const candidates = await prisma.auditLog.findMany({
+      where: { createdAt: { lt: cutoff } },
+      orderBy: { createdAt: 'asc' },
+      take: 500,
+      select: { id: true, action: true, createdAt: true, details: true },
     });
+    const expiredIds = candidates
+      .filter(log => {
+        const details = (log.details ?? {}) as Record<string, unknown>;
+        const storedDays = details._retentionDays;
+        const days = Number.isInteger(storedDays)
+          ? Number(storedDays)
+          : Math.max(retentionDays, 2555);
+        return days > 0 && log.createdAt.getTime() + days * 24 * 60 * 60 * 1000 <= now.getTime();
+      })
+      .map(log => log.id);
+
+    const result = expiredIds.length > 0
+      ? await prisma.auditLog.deleteMany({ where: { id: { in: expiredIds } } })
+      : { count: 0 };
     logger.info('audit.retention', { deleted: result.count, cutoff });
     return { deleted: result.count };
   }
@@ -393,41 +513,53 @@ export class AuditService {
         id: true, adminId: true, action: true, targetType: true, targetId: true,
         ipAddress: true, userAgent: true, requestId: true, correlationId: true,
         snapshotBefore: true, snapshotAfter: true, entryHash: true, previousHash: true,
-        createdAt: true, details: true,
+        createdAt: true, details: true, redactedAt: true,
       },
     });
 
     let checked = 0;
+    let previousHash: string | null = null;
     for (const log of logs) {
       if (!log.entryHash) continue; // pre-migration records have no hash
-
-      const details = (log.details ?? {}) as Record<string, unknown>;
-      const recomputed = computeHash({
-        userId: log.adminId,
-        role: String(details._role ?? 'SYSTEM'),
-        action: log.action,
-        status: (details._status as any) ?? AuditStatus.SUCCESS,
-        targetType: log.targetType,
-        targetId: log.targetId,
-        ipAddress: log.ipAddress || undefined,
-        userAgent: log.userAgent || undefined,
-        requestId: log.requestId || undefined,
-        correlationId: log.correlationId || undefined,
-        payloadBefore: (log.snapshotBefore as Record<string, unknown>) ?? undefined,
-        payloadAfter: (log.snapshotAfter as Record<string, unknown>) ?? undefined,
-        timestamp: log.createdAt.toISOString(),
-        previousHash: log.previousHash ?? null,
-      });
-
-      if (recomputed !== log.entryHash) {
+      if (previousHash !== null && log.previousHash !== previousHash) {
         return {
           ok: false,
           totalChecked: checked,
           firstTamperedId: log.id,
-          message: `Tampered record detected at id=${log.id}`,
+          message: `Broken hash-chain link detected at id=${log.id}`,
         };
       }
+
+      if (!log.redactedAt) {
+        const details = (log.details ?? {}) as Record<string, unknown>;
+        const recomputed = computeHash({
+          userId: log.adminId,
+          role: String(details._role ?? 'SYSTEM'),
+          action: log.action,
+          status: (details._status as any) ?? AuditStatus.SUCCESS,
+          targetType: log.targetType,
+          targetId: log.targetId,
+          ipAddress: log.ipAddress || undefined,
+          userAgent: log.userAgent || undefined,
+          requestId: log.requestId || undefined,
+          correlationId: log.correlationId || undefined,
+          payloadBefore: (log.snapshotBefore as Record<string, unknown>) ?? undefined,
+          payloadAfter: (log.snapshotAfter as Record<string, unknown>) ?? undefined,
+          timestamp: log.createdAt.toISOString(),
+          previousHash: log.previousHash ?? null,
+        });
+
+        if (recomputed !== log.entryHash) {
+          return {
+            ok: false,
+            totalChecked: checked,
+            firstTamperedId: log.id,
+            message: `Tampered record detected at id=${log.id}`,
+          };
+        }
+      }
       checked++;
+      previousHash = log.entryHash;
     }
 
     return { ok: true, totalChecked: checked, message: 'Chain intact' };
@@ -456,7 +588,7 @@ export class AuditService {
     const snapshots = logs.map(l => ({
       timestamp: l.createdAt.toISOString(),
       action: l.action,
-      state: l.snapshotAfter,
+      state: redactAuditValue(l.snapshotAfter),
     }));
 
     const currentState = snapshots.length > 0 ? snapshots[snapshots.length - 1].state : null;

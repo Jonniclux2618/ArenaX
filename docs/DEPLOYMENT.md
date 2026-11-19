@@ -17,9 +17,10 @@ blue-green-deploy.sh, on the deploy host:
   3. Health-check the idle slot (backend /api/health) before it gets any
      real traffic — a bad build never reaches users
   4. Canary: shift CANARY_WEIGHT% of traffic to the idle slot via a
-     weighted nginx upstream, re-checking health for CANARY_BAKE_SECONDS.
-     A failure here reverts to 100% on the still-active old slot — the
-     old slot was never touched, so this is a no-op rollback.
+     weighted nginx upstream for CANARY_BAKE_SECONDS. Critical GET paths
+     are checked throughout the window; the canary's HTTP 5xx rate and p95
+     latency histogram are compared to explicit limits before promotion.
+     Missing metrics or failed guardrails restore 100% traffic to the old slot.
   5. Cutover: reload nginx to send 100% of traffic to the new slot.
      `nginx -s reload` is graceful: in-flight requests finish on the old
      upstream, new requests go to the new one. No dropped connections,
@@ -34,6 +35,12 @@ blue-green-deploy.sh, on the deploy host:
 Nginx is the single stable entry point (`deploy/nginx/`) — its published
 port never changes; only which backend/frontend containers it proxies to
 changes, which is what makes the cutover invisible to clients.
+
+Schema changes must remain backward-compatible across the canary and rollback
+window. The deploy path restores application artifacts only; it does not
+reverse migrations or replay financial side effects. Any migration with
+irreversible effects requires a separately documented, operator-approved
+recovery procedure before promotion.
 
 ## Running it
 
@@ -56,8 +63,8 @@ Roll back immediately (flips traffic to the previous slot):
 Both are also exposed as GitHub Actions:
 - `.github/workflows/deploy.yml` — runs on push to `main` (paths under
   `backend/`, `frontend/`, `deploy/`) or manually via
-  `workflow_dispatch`, with `canary_weight` / `canary_bake_seconds`
-  inputs.
+  `workflow_dispatch`, with canary traffic, bake-window, 5xx-rate,
+  p95-latency, and critical-path inputs.
 - `.github/workflows/deploy-rollback.yml` — manual `workflow_dispatch`
   for an immediate rollback.
 
@@ -91,6 +98,14 @@ and alerts over time.
 |---|---|---|
 | `CANARY_WEIGHT` | 10 | % of traffic sent to the canary phase |
 | `CANARY_BAKE_SECONDS` | 60 | how long the canary split is held |
+| `CANARY_MAX_ERROR_RATE` | 0.01 | Maximum canary HTTP 5xx fraction |
+| `CANARY_MAX_P95_SECONDS` | 1.0 | Maximum p95 HTTP latency bucket, in seconds |
+| `CANARY_CRITICAL_PATHS` | `/api/health` | Comma-separated unauthenticated GET paths checked during the bake |
 | `ROLLBACK_WINDOW_SECONDS` | 120 | how long the old slot stays warm post-cutover before being stopped |
 | `HEALTH_CHECK_RETRIES` | 10 | readiness probe attempts before giving up |
 | `HEALTH_CHECK_INTERVAL_SECONDS` | 3 | delay between readiness probes |
+
+Canary analysis requires `python3` on the deploy host. A missing `/metrics`
+endpoint, absent observations, invalid thresholds, failed critical check, or
+threshold breach aborts promotion. Rollback failure is surfaced as a failed
+deployment and requires operator intervention; the prior slot is not stopped.

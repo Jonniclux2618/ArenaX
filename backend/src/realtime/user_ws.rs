@@ -1,6 +1,7 @@
 use crate::auth::jwt_service::{Claims, JwtService};
 use crate::realtime::auth::RealtimeAuth;
-use crate::realtime::events::{channels, ClientMessage, DeliverEvent, WsEnvelope};
+use crate::realtime::events::{channels, ClientMessage, DeliverEvent, PublishedEvent, WsEnvelope};
+use crate::realtime::event_bus::EventBus;
 use crate::realtime::rate_limiter::{ConnectionRateLimiter, RateLimitOutcome, RATE_LIMIT_CLOSE_CODE};
 use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::ws_broadcaster::WsAddressBook;
@@ -17,6 +18,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Timeout after 3 missed heartbeats (90 seconds = 3 * 30s).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Revoked sessions lose realtime capabilities within this interval.
+const SESSION_REVALIDATION_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Per-user WebSocket actor with heartbeat management, reconnect state restoration,
 /// connection limit enforcement, and event delivery.
@@ -31,6 +34,8 @@ pub struct UserWebSocket {
     /// broadcaster never holds a dangling `Addr` after disconnect.
     address_book: Arc<WsAddressBook>,
     auth: Arc<RealtimeAuth>,
+    jwt_service: Arc<JwtService>,
+    event_bus: EventBus,
     reconnect_session_id: Option<Uuid>,
     /// Per-connection message flood guard (#1083) — HTTP's `RateLimitMiddleware`
     /// only runs on the upgrade handshake, so every message on an already-open
@@ -45,8 +50,19 @@ impl UserWebSocket {
         registry: Arc<SessionRegistry>,
         address_book: Arc<WsAddressBook>,
         auth: Arc<RealtimeAuth>,
+        jwt_service: Arc<JwtService>,
+        event_bus: EventBus,
     ) -> Self {
-        Self::with_reconnect(user_id, claims, registry, address_book, auth, None)
+        Self::with_reconnect(
+            user_id,
+            claims,
+            registry,
+            address_book,
+            auth,
+            jwt_service,
+            event_bus,
+            None,
+        )
     }
 
     pub fn with_reconnect(
@@ -55,6 +71,8 @@ impl UserWebSocket {
         registry: Arc<SessionRegistry>,
         address_book: Arc<WsAddressBook>,
         auth: Arc<RealtimeAuth>,
+        jwt_service: Arc<JwtService>,
+        event_bus: EventBus,
         reconnect_session_id: Option<Uuid>,
     ) -> Self {
         Self {
@@ -65,6 +83,8 @@ impl UserWebSocket {
             registry,
             address_book,
             auth,
+            jwt_service,
+            event_bus,
             reconnect_session_id,
             rate_limiter: ConnectionRateLimiter::from_env(),
         }
@@ -165,6 +185,31 @@ impl Actor for UserWebSocket {
         }
 
         self.start_heartbeat(ctx);
+        ctx.run_interval(SESSION_REVALIDATION_INTERVAL, |act, ctx| {
+            let jwt_service = act.jwt_service.clone();
+            let session_id = act.claims.session_id.clone();
+            let expires_at = act.claims.exp;
+            let check = async move {
+                if chrono::Utc::now().timestamp() >= expires_at {
+                    return Ok(false);
+                }
+                jwt_service.session_is_active(&session_id).await
+            };
+            ctx.spawn(actix::fut::wrap_future(check).map(|result, act, ctx| {
+                if !matches!(result, Ok(true)) {
+                    warn!(
+                        user_id = %act.user_id,
+                        session_id = %act.session_id,
+                        "WebSocket session was revoked or could not be revalidated"
+                    );
+                    ctx.close(Some(ws::CloseReason {
+                        code: ws::CloseCode::Policy,
+                        description: Some("session revoked or unavailable".to_string()),
+                    }));
+                    ctx.stop();
+                }
+            }));
+        });
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
@@ -262,28 +307,50 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for UserWebSocket {
                         self.hb = Instant::now();
                         self.registry.record_heartbeat(&self.session_id);
                     }
-                    Ok(ClientMessage::Subscribe { channel }) => {
+                    Ok(ClientMessage::Subscribe { channel, cursor }) => {
                         let auth = self.auth.clone();
                         let claims = self.claims.clone();
+                        let event_bus = self.event_bus.clone();
                         let session_id = self.session_id;
                         let registry = self.registry.clone();
+                        let subscription_registry = registry.clone();
                         let target_channel = channel.clone();
 
                         let fut = async move {
-                            auth.authorize_subscription(&claims, &target_channel).await
+                            auth.authorize_subscription(&claims, &target_channel).await?;
+                            subscription_registry.subscribe(session_id, target_channel.clone());
+                            let replay = match cursor {
+                                Some(cursor) => event_bus
+                                    .replay_after(&target_channel, &cursor)
+                                    .await
+                                    .map_err(crate::realtime::auth::AuthError::EventStore),
+                                None => Ok(Vec::<PublishedEvent>::new()),
+                            };
+                            if replay.is_err() {
+                                subscription_registry.unsubscribe(session_id, &target_channel);
+                            }
+                            replay
                         };
 
                         ctx.wait(actix::fut::wrap_future(fut).then(
                             move |res, _act, ctx: &mut actix_web_actors::ws::WebsocketContext<UserWebSocket>| {
                                 match res {
-                                    Ok(_) => {
-                                        registry.subscribe(session_id, channel.clone());
+                                    Ok(events) => {
                                         info!(session_id = %session_id, channel = %channel, "Subscribed to channel");
                                         let success = serde_json::json!({
                                             "type": "subscribed",
                                             "channel": channel
                                         });
                                         ctx.text(success.to_string());
+                                        for published in events {
+                                            let envelope = WsEnvelope {
+                                                event: published.event,
+                                                cursor: Some(published.cursor),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&envelope) {
+                                                ctx.text(json);
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(session_id = %session_id, channel = %channel, error = %e, "Subscription denied");
@@ -351,7 +418,10 @@ impl Handler<DeliverEvent> for UserWebSocket {
     type Result = ();
 
     fn handle(&mut self, msg: DeliverEvent, ctx: &mut Self::Context) {
-        let envelope = WsEnvelope { event: msg.0 };
+        let envelope = WsEnvelope {
+            event: msg.event,
+            cursor: msg.cursor,
+        };
         match serde_json::to_string(&envelope) {
             Ok(json) => {
                 debug!(
@@ -381,6 +451,7 @@ pub async fn ws_handler(
     address_book: web::Data<Arc<WsAddressBook>>,
     jwt_service: web::Data<Arc<JwtService>>,
     auth_guard: web::Data<Arc<RealtimeAuth>>,
+    event_bus: web::Data<EventBus>,
 ) -> Result<HttpResponse, Error> {
     let query_string = req.query_string();
 
@@ -426,6 +497,8 @@ pub async fn ws_handler(
         registry.get_ref().clone(),
         address_book.get_ref().clone(),
         auth_guard.get_ref().clone(),
+        jwt_service.get_ref().clone(),
+        event_bus.get_ref().clone(),
         reconnect_session_id,
     );
 

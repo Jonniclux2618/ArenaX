@@ -691,12 +691,19 @@ impl JwtService {
         Ok(())
     }
 
-    /// Check if session exists
-    async fn session_exists(&self, session_id: &str) -> Result<bool, JwtError> {
+    /// Check whether a session still exists in the shared revocation store.
+    ///
+    /// WebSocket actors call this periodically so a revoked session loses
+    /// realtime access within the configured revalidation interval.
+    pub async fn session_is_active(&self, session_id: &str) -> Result<bool, JwtError> {
         let session_key = format!("session:{}", session_id);
         let mut conn = self.redis.clone();
         let exists: bool = conn.exists(&session_key).await?;
         Ok(exists)
+    }
+
+    async fn session_exists(&self, session_id: &str) -> Result<bool, JwtError> {
+        self.session_is_active(session_id).await
     }
 
     /// Update session activity timestamp

@@ -14,7 +14,8 @@
 //!      for it; the connection is the same service account either way. The
 //!      actor has to be declared by the application, per transaction.
 //!
-//! It also owns the retention policy: entries are kept for seven years.
+//! It also applies each record's retention deadline before moving entries to
+//! the append-only archive.
 //!
 //! # Why writes go through one type
 //!
@@ -22,7 +23,7 @@
 //! what the database observed from what the application claimed. Nothing else
 //! in the codebase should `INSERT INTO audit_logs` directly.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -30,21 +31,68 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// How long audit entries are retained before they may be archived.
-///
-/// Seven years, expressed in days. Calendar arithmetic over that span is the
-/// database's job — `retained_until` is computed as an INTERVAL in SQL — but
-/// the constant is here so the policy is greppable from the service that
-/// enforces it.
-pub const RETENTION_YEARS: i64 = 7;
-const RETENTION_DAYS: i64 = RETENTION_YEARS * 365;
-
 /// Upper bound on rows returned by one query.
 ///
 /// The trail only grows, so an unbounded read is a way to exhaust the
 /// connection pool — accidentally or otherwise.
 const MAX_PAGE_SIZE: i64 = 500;
 const DEFAULT_PAGE_SIZE: i64 = 50;
+const PROHIBITED_AUDIT_FIELDS: &[&str] = &[
+    "password",
+    "password_hash",
+    "secret",
+    "secret_key",
+    "private_key",
+    "encrypted_secret_key",
+    "key",
+    "api_key",
+    "api_key_hash",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "cookie",
+    "request_body",
+    "raw_body",
+    "body",
+    "email",
+    "email_address",
+    "phone",
+    "phone_number",
+    "ip_address",
+    "user_agent",
+];
+
+fn redact_audit_values(value: &JsonValue) -> JsonValue {
+    let is_prohibited = |key: &str| {
+        let normalized_key: String = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        PROHIBITED_AUDIT_FIELDS.iter().any(|field| {
+            let normalized_field: String = field
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            normalized_key == normalized_field
+        })
+    };
+    match value {
+        JsonValue::Object(fields) => JsonValue::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| !is_prohibited(key))
+                .map(|(key, value)| (key.clone(), redact_audit_values(value)))
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.iter().map(redact_audit_values).collect())
+        }
+        _ => value.clone(),
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AuditError {
@@ -240,6 +288,8 @@ impl AuditService {
             return Err(AuditError::Invalid("resource_type is required".into()));
         }
 
+        let old_values = entry.old_values.as_ref().map(redact_audit_values);
+        let new_values = entry.new_values.as_ref().map(redact_audit_values);
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO audit_logs (
@@ -255,10 +305,10 @@ impl AuditService {
         .bind(entry.action.as_str())
         .bind(&entry.resource_type)
         .bind(entry.resource_id)
-        .bind(&entry.old_values)
-        .bind(&entry.new_values)
-        .bind(entry.ip_address.as_deref())
-        .bind(entry.user_agent.as_deref())
+        .bind(&old_values)
+        .bind(&new_values)
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
         .fetch_one(&self.pool)
         .await
         .inspect_err(|e| {
@@ -287,6 +337,8 @@ impl AuditService {
         tx: &mut Transaction<'_, Postgres>,
         entry: AuditEntryInput,
     ) -> Result<Uuid, AuditError> {
+        let old_values = entry.old_values.as_ref().map(redact_audit_values);
+        let new_values = entry.new_values.as_ref().map(redact_audit_values);
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO audit_logs (
@@ -302,10 +354,10 @@ impl AuditService {
         .bind(entry.action.as_str())
         .bind(&entry.resource_type)
         .bind(entry.resource_id)
-        .bind(&entry.old_values)
-        .bind(&entry.new_values)
-        .bind(entry.ip_address.as_deref())
-        .bind(entry.user_agent.as_deref())
+        .bind(&old_values)
+        .bind(&new_values)
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -358,7 +410,9 @@ impl AuditService {
         let records = sqlx::query_as::<_, AuditRecord>(
             r#"
             SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-                   old_values, new_values, source, entry_hash, previous_hash, created_at
+                   redact_audit_jsonb(old_values, $10::text[]) AS old_values,
+                   redact_audit_jsonb(new_values, $10::text[]) AS new_values,
+                   source, entry_hash, previous_hash, created_at
             FROM audit_logs
             WHERE ($1::uuid IS NULL OR user_id = $1)
               AND ($2::text IS NULL OR action = $2)
@@ -380,6 +434,7 @@ impl AuditService {
         .bind(filter.to)
         .bind(limit)
         .bind(offset)
+        .bind(PROHIBITED_AUDIT_FIELDS)
         .fetch_all(&self.pool)
         .await?;
 
@@ -424,16 +479,18 @@ impl AuditService {
         let records = sqlx::query_as::<_, AuditRecord>(
             r#"
             SELECT id, sequence_number, user_id, action, resource_type, resource_id,
-                   old_values, new_values, source, entry_hash, previous_hash, created_at
+                   redact_audit_jsonb(old_values, $3::text[]) AS old_values,
+                   redact_audit_jsonb(new_values, $3::text[]) AS new_values,
+                   source, entry_hash, previous_hash, created_at
             FROM audit_logs
             WHERE resource_type = $1 AND resource_id = $2
             ORDER BY sequence_number ASC
-            LIMIT $3
+            LIMIT 500
             "#,
         )
         .bind(resource_type)
         .bind(resource_id)
-        .bind(MAX_PAGE_SIZE)
+        .bind(PROHIBITED_AUDIT_FIELDS)
         .fetch_all(&self.pool)
         .await?;
 
@@ -491,12 +548,13 @@ impl AuditService {
         Ok(status)
     }
 
-    /// The date before which entries are past their retention period.
+    /// Reference instant for selecting entries whose stored retention deadline
+    /// has elapsed.
     pub fn retention_cutoff() -> DateTime<Utc> {
-        Utc::now() - Duration::days(RETENTION_DAYS)
+        Utc::now()
     }
 
-    /// Move entries past their seven-year retention into the archive table.
+    /// Move entries past their configured retention into the archive table.
     ///
     /// Not a delete. `audit_logs` carries rules rejecting UPDATE and DELETE,
     /// and the hash chain is only verifiable while the rows it covers are
@@ -517,7 +575,7 @@ impl AuditService {
             warn!(
                 archived,
                 cutoff = %cutoff,
-                "archived audit entries past the {RETENTION_YEARS}-year retention period"
+                "archived audit entries past their configured retention"
             );
         }
 
@@ -573,9 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn retention_cutoff_is_seven_years_back() {
+    fn retention_cutoff_is_the_sweep_reference_time() {
         let cutoff = AuditService::retention_cutoff();
-        let years_back = (Utc::now() - cutoff).num_days() / 365;
-        assert_eq!(years_back, RETENTION_YEARS);
+        assert!((Utc::now() - cutoff).num_seconds() < 1);
     }
 }

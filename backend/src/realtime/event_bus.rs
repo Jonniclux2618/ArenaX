@@ -1,8 +1,16 @@
-use crate::realtime::events::{channels, RealtimeEvent};
+use crate::realtime::events::{channels, PublishedEvent, RealtimeEvent};
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use redis::{AsyncCommands, Script};
 use tracing::{error, debug};
 use uuid::Uuid;
+
+const REALTIME_STREAM_MAX_LENGTH: usize = 1_000;
+const REALTIME_STREAM_TTL_SECONDS: usize = 7 * 24 * 60 * 60;
+const MAX_REPLAY_EVENTS: usize = 1_000;
+
+fn channel_stream_key(channel: &str) -> String {
+    format!("realtime:stream:{}", channel)
+}
 
 /// Redis key holding the monotonic event sequence for one match (Issue #33).
 fn match_event_seq_key(match_id: Uuid) -> String {
@@ -79,10 +87,129 @@ impl EventBus {
         };
 
         let mut conn = self.redis.clone();
-        if let Err(e) = conn.publish::<_, _, ()>(channel, &payload).await {
-            error!(channel = %channel, error = %e, "Failed to publish event to Redis");
-        } else {
-            debug!(channel = %channel, "Event published to Redis");
-        }
+        let append_and_notify = Script::new(
+            r#"
+            local id = redis.call(
+                'XADD', KEYS[1], 'MAXLEN', '~', ARGV[1], '*', 'payload', ARGV[2]
+            )
+            redis.call('EXPIRE', KEYS[1], ARGV[4])
+            redis.call('PUBLISH', ARGV[3], id)
+            return id
+            "#,
+        );
+        let stream_id: String = match append_and_notify
+            .key(channel_stream_key(channel))
+            .arg(REALTIME_STREAM_MAX_LENGTH)
+            .arg(&payload)
+            .arg(channel)
+            .arg(REALTIME_STREAM_TTL_SECONDS)
+            .invoke_async(&mut conn)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                error!(channel = %channel, error = %e, "Failed to persist and notify realtime event");
+                return;
+            }
+        };
+
+        debug!(channel = %channel, stream_id = %stream_id, "Event persisted and published to Redis");
     }
+
+    /// Read events after a client-provided stream cursor. The cursor is
+    /// channel-specific and bounded by the stream retention limit.
+    pub async fn replay_after(
+        &self,
+        channel: &str,
+        cursor: &str,
+    ) -> Result<Vec<PublishedEvent>, String> {
+        let key = channel_stream_key(channel);
+        let mut conn = self.redis.clone();
+        let oldest: Vec<(String, Vec<(String, String)>)> = redis::cmd("XRANGE")
+            .arg(&key)
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if let Some((oldest_id, _)) = oldest.first() {
+            if compare_stream_ids(cursor, oldest_id)? == std::cmp::Ordering::Less {
+                return Err("event cursor is outside retained history; fetch the authoritative REST snapshot".to_string());
+            }
+        } else {
+            return Err("event stream history is unavailable; fetch the authoritative REST snapshot".to_string());
+        }
+
+        let newest: Vec<(String, Vec<(String, String)>)> = redis::cmd("XREVRANGE")
+            .arg(&key)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some((newest_id, _)) = newest.first() else {
+            return Err("event stream history is unavailable; fetch the authoritative REST snapshot".to_string());
+        };
+        if compare_stream_ids(cursor, newest_id)? == std::cmp::Ordering::Greater {
+            return Err("event cursor is newer than retained history; fetch the authoritative REST snapshot".to_string());
+        }
+
+        let rows: Vec<(String, Vec<(String, String)>)> = redis::cmd("XRANGE")
+            .arg(&key)
+            .arg(format!("({cursor}"))
+            .arg("+")
+            .arg("COUNT")
+            .arg(MAX_REPLAY_EVENTS + 1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if rows.is_empty() {
+            let exists: bool = conn.exists(&key).await.map_err(|error| error.to_string())?;
+            if !exists {
+                return Err("event stream history is unavailable; fetch the authoritative REST snapshot".to_string());
+            }
+        }
+
+        if rows.len() > MAX_REPLAY_EVENTS {
+            return Err("event backlog exceeds the replay limit; fetch the authoritative REST snapshot".to_string());
+        }
+
+        rows.into_iter()
+            .map(|(stream_id, fields)| {
+                let payload = fields
+                    .into_iter()
+                    .find_map(|(name, value)| (name == "payload").then_some(value))
+                    .ok_or_else(|| format!("event stream entry {stream_id} has no payload"))?;
+                let event = serde_json::from_str(&payload)
+                    .map_err(|error| format!("invalid event stream entry {stream_id}: {error}"))?;
+                Ok(PublishedEvent {
+                    cursor: stream_id,
+                    event,
+                })
+            })
+            .collect()
+    }
+}
+
+fn compare_stream_ids(left: &str, right: &str) -> Result<std::cmp::Ordering, String> {
+    fn parse(value: &str) -> Result<(u64, u64), String> {
+        let (milliseconds, sequence) = value
+            .split_once('-')
+            .ok_or_else(|| format!("invalid Redis Stream ID: {value}"))?;
+        let milliseconds = milliseconds
+            .parse()
+            .map_err(|_| format!("invalid Redis Stream ID: {value}"))?;
+        let sequence = sequence
+            .parse()
+            .map_err(|_| format!("invalid Redis Stream ID: {value}"))?;
+        Ok((milliseconds, sequence))
+    }
+
+    Ok(parse(left)?.cmp(&parse(right)?))
 }

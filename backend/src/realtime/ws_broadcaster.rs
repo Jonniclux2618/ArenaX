@@ -1,7 +1,8 @@
-use crate::realtime::events::{channels, DeliverEvent, RealtimeEvent};
+use crate::realtime::events::{channels, DeliverEvent, PublishedEvent};
 use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::user_ws::UserWebSocket;
 use actix::Addr;
+use redis::aio::ConnectionManager;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::task::JoinHandle;
@@ -36,8 +37,8 @@ impl WsAddressBook {
     }
 }
 
-/// Subscribes to Redis Pub/Sub patterns and delivers events to connected
-/// WebSocket actors via the WsAddressBook.
+/// Subscribes to Redis Pub/Sub patterns and delivers persisted stream events
+/// to connected WebSocket actors via the WsAddressBook.
 pub struct WsBroadcaster {
     redis_url: String,
     registry: Arc<SessionRegistry>,
@@ -117,29 +118,38 @@ impl WsBroadcaster {
         pattern: &str,
         registry: &Arc<SessionRegistry>,
         address_book: &Arc<WsAddressBook>,
-        route_fn: fn(&str, &RealtimeEvent, &Arc<SessionRegistry>, &Arc<WsAddressBook>),
+        route_fn: fn(&str, &PublishedEvent, &Arc<SessionRegistry>, &Arc<WsAddressBook>),
     ) {
-        // Create a dedicated Redis connection for pub/sub
-        let client = match redis::Client::open(redis_url) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = %e, "Failed to create Redis client for Pub/Sub");
-                return;
+        loop {
+            if let Err(error) =
+                Self::subscribe_once(redis_url, pattern, registry, address_book, route_fn).await
+            {
+                error!(pattern = %pattern, error = %error, "Realtime subscriber disconnected");
             }
-        };
-
-        let mut pubsub = match client.get_async_pubsub().await {
-            Ok(ps) => ps,
-            Err(e) => {
-                error!(pattern = %pattern, error = %e, "Failed to connect Redis Pub/Sub");
-                return;
-            }
-        };
-
-        if let Err(e) = pubsub.psubscribe(pattern).await {
-            error!(pattern = %pattern, error = %e, "Failed to psubscribe");
-            return;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+    }
+
+    async fn subscribe_once(
+        redis_url: &str,
+        pattern: &str,
+        registry: &Arc<SessionRegistry>,
+        address_book: &Arc<WsAddressBook>,
+        route_fn: fn(&str, &PublishedEvent, &Arc<SessionRegistry>, &Arc<WsAddressBook>),
+    ) -> Result<(), String> {
+        // Create a dedicated Redis connection for pub/sub
+        let client = redis::Client::open(redis_url).map_err(|error| error.to_string())?;
+        let mut commands = ConnectionManager::new(client.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut pubsub = client
+            .get_async_pubsub()
+            .await
+            .map_err(|error| error.to_string())?;
+        pubsub
+            .psubscribe(pattern)
+            .await
+            .map_err(|error| error.to_string())?;
 
         info!(pattern = %pattern, "Subscribed to Redis Pub/Sub pattern");
 
@@ -149,25 +159,36 @@ impl WsBroadcaster {
         while let Some(msg) = stream.next().await {
             let channel: String = match msg.get_channel() {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(error) => {
+                    warn!(pattern = %pattern, error = %error, "Invalid Pub/Sub channel");
+                    continue;
+                }
             };
-            let payload: String = match msg.get_payload() {
+            let cursor: String = match msg.get_payload() {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(error) => {
+                    warn!(pattern = %pattern, error = %error, "Invalid Pub/Sub stream cursor");
+                    continue;
+                }
             };
 
-            match serde_json::from_str::<RealtimeEvent>(&payload) {
-                Ok(event) => route_fn(&channel, &event, registry, address_book),
-                Err(e) => {
-                    warn!(channel = %channel, error = %e, "Failed to deserialize Pub/Sub message");
+            match load_published_event(&mut commands, &channel, &cursor).await {
+                Ok(Some(published)) => route_fn(&channel, &published, registry, address_book),
+                Ok(None) => {
+                    warn!(channel = %channel, cursor = %cursor, "Realtime stream entry was trimmed before fan-out");
+                }
+                Err(error) => {
+                    warn!(channel = %channel, cursor = %cursor, error = %error, "Failed to load realtime stream entry");
                 }
             }
         }
+
+        Err("Redis Pub/Sub stream ended".to_string())
     }
 
     fn route_user_event(
         channel: &str,
-        event: &RealtimeEvent,
+        event: &PublishedEvent,
         registry: &Arc<SessionRegistry>,
         address_book: &Arc<WsAddressBook>,
     ) {
@@ -184,15 +205,19 @@ impl WsBroadcaster {
         let sessions = registry.get_sessions(&user_id);
         for session_id in sessions {
             if let Some(addr) = address_book.get(&session_id) {
-                addr.do_send(DeliverEvent(event.clone()));
+                addr.do_send(DeliverEvent {
+                    event: event.event.clone(),
+                    cursor: Some(event.cursor.clone()),
+                });
             }
         }
+
         debug!(user_id = %user_id, "Routed event to user sessions");
     }
 
     fn route_match_event(
         channel: &str,
-        event: &RealtimeEvent,
+        event: &PublishedEvent,
         registry: &Arc<SessionRegistry>,
         address_book: &Arc<WsAddressBook>,
     ) {
@@ -201,10 +226,40 @@ impl WsBroadcaster {
         
         for session_id in subscribers {
             if let Some(addr) = address_book.get(&session_id) {
-                addr.do_send(DeliverEvent(event.clone()));
+                addr.do_send(DeliverEvent {
+                    event: event.event.clone(),
+                    cursor: Some(event.cursor.clone()),
+                });
             }
         }
-        
         debug!(channel = %channel, subscriber_count = %registry.get_subscribers(channel).len(), "Routed event to match subscribers");
     }
+}
+
+async fn load_published_event(
+    connection: &mut ConnectionManager,
+    channel: &str,
+    cursor: &str,
+) -> Result<Option<PublishedEvent>, String> {
+    let rows: Vec<(String, Vec<(String, String)>)> = redis::cmd("XRANGE")
+        .arg(format!("realtime:stream:{channel}"))
+        .arg(cursor)
+        .arg(cursor)
+        .query_async(connection)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((_, fields)) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let payload = fields
+        .into_iter()
+        .find_map(|(name, value)| (name == "payload").then_some(value))
+        .ok_or_else(|| format!("event stream entry {cursor} has no payload"))?;
+    let event = serde_json::from_str(&payload)
+        .map_err(|error| format!("invalid event stream entry {cursor}: {error}"))?;
+
+    Ok(Some(PublishedEvent {
+        cursor: cursor.to_string(),
+        event,
+    }))
 }

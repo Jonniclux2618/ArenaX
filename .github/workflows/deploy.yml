@@ -16,6 +16,15 @@ on:
       canary_bake_seconds:
         description: "Seconds to hold the canary split before full cutover"
         default: "60"
+      canary_max_error_rate:
+        description: "Maximum canary HTTP 5xx rate (0-1)"
+        default: "0.01"
+      canary_max_p95_seconds:
+        description: "Maximum canary p95 HTTP latency in seconds"
+        default: "1.0"
+      canary_critical_paths:
+        description: "Comma-separated unauthenticated critical GET paths"
+        default: "/api/health"
       rehearsal_network:
         description: "Testnet network for the contract rehearsal (testnet only)"
         default: "testnet"
@@ -180,12 +189,17 @@ jobs:
           COOKIE_SAME_SITE: ${{ env.COOKIE_SAME_SITE }}
           CORS_ALLOW_CREDENTIALS: ${{ env.CORS_ALLOW_CREDENTIALS }}
           CORS_ALLOWED_ORIGINS: ${{ env.CORS_ALLOWED_ORIGINS }}
+          CANARY_WEIGHT: ${{ github.event.inputs.canary_weight || '10' }}
+          CANARY_BAKE_SECONDS: ${{ github.event.inputs.canary_bake_seconds || '60' }}
+          CANARY_MAX_ERROR_RATE: ${{ github.event.inputs.canary_max_error_rate || '0.01' }}
+          CANARY_MAX_P95_SECONDS: ${{ github.event.inputs.canary_max_p95_seconds || '1.0' }}
+          CANARY_CRITICAL_PATHS: ${{ github.event.inputs.canary_critical_paths || '/api/health' }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_SSH_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           command_timeout: 30m
-          envs: SECURITY_ENV,FORCE_HTTPS,HSTS_MAX_AGE,HSTS_INCLUDE_SUBDOMAINS,HSTS_PRELOAD,COOKIE_SECURE,COOKIE_SAME_SITE,CORS_ALLOW_CREDENTIALS,CORS_ALLOWED_ORIGINS
+          envs: SECURITY_ENV,FORCE_HTTPS,HSTS_MAX_AGE,HSTS_INCLUDE_SUBDOMAINS,HSTS_PRELOAD,COOKIE_SECURE,COOKIE_SAME_SITE,CORS_ALLOW_CREDENTIALS,CORS_ALLOWED_ORIGINS,CANARY_WEIGHT,CANARY_BAKE_SECONDS,CANARY_MAX_ERROR_RATE,CANARY_MAX_P95_SECONDS,CANARY_CRITICAL_PATHS
           script: |
             cd /opt/arenax
             git fetch --depth 1 origin main
@@ -196,8 +210,11 @@ jobs:
             export BACKEND_DIGEST=${{ needs.build-and-push.outputs.backend_digest }}
             export FRONTEND_DIGEST=${{ needs.build-and-push.outputs.frontend_digest }}
             export SOURCE_REVISION=${{ github.sha }}
-            export CANARY_WEIGHT=${{ github.event.inputs.canary_weight || '10' }}
-            export CANARY_BAKE_SECONDS=${{ github.event.inputs.canary_bake_seconds || '60' }}
+            export CANARY_WEIGHT="${CANARY_WEIGHT:-10}"
+            export CANARY_BAKE_SECONDS="${CANARY_BAKE_SECONDS:-60}"
+            export CANARY_MAX_ERROR_RATE="${CANARY_MAX_ERROR_RATE:-0.01}"
+            export CANARY_MAX_P95_SECONDS="${CANARY_MAX_P95_SECONDS:-1.0}"
+            export CANARY_CRITICAL_PATHS="${CANARY_CRITICAL_PATHS:-/api/health}"
             # Transactional rollout: the deploy script must gate traffic shift on
             # migration compatibility and readiness. If either gate fails it
             # exits non-zero BEFORE shifting traffic, leaving the prior release

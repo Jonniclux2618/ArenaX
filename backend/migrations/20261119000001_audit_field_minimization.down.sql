@@ -42,5 +42,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION archive_audit_logs_past_retention(cutoff TIMESTAMPTZ)
+RETURNS BIGINT AS $$
+DECLARE
+    moved BIGINT;
+BEGIN
+    INSERT INTO audit_logs_archive (
+        id, sequence_number, user_id, action, resource_type, resource_id,
+        details, old_values, new_values, ip_address, user_agent, source,
+        entry_hash, previous_hash, created_at, retained_until
+    )
+    SELECT
+        id, sequence_number, user_id, action, resource_type, resource_id,
+        details, old_values, new_values, ip_address, user_agent, source,
+        entry_hash, previous_hash, created_at, retained_until
+    FROM audit_logs
+    WHERE created_at < cutoff
+    ON CONFLICT (id) DO NOTHING;
+
+    GET DIAGNOSTICS moved = ROW_COUNT;
+    RETURN moved;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION archive_audit_logs_past_retention(TIMESTAMPTZ) IS
+    'Copies audit entries older than the cutoff into audit_logs_archive. Idempotent; never deletes.';
+
 DROP FUNCTION redact_audit_jsonb(JSONB, TEXT[]);
 DROP TABLE audit_event_policies;

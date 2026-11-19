@@ -19,10 +19,11 @@ records in the TypeScript service store their retention class and field policy
 with the event. The Rust audit service applies the same prohibited-field
 baseline. Any new event family must add a policy before its payload is logged.
 
-The DB policy sets `retained_until` on each new trigger record. Updating a
-policy does not change existing rows' expiry dates or restore fields already
-removed. Older rows are redacted at read/export time, even though their
-append-only stored representation is preserved for chain verification.
+The DB policy sets `retained_until` on each new trigger record, and archive
+sweeps use that stored per-row deadline. Updating a policy does not change
+existing rows' expiry dates or restore fields already removed. Older rows are
+redacted at read/export time, even though their append-only stored
+representation is preserved for chain verification.
 
 ## Data handling
 

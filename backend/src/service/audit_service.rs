@@ -14,7 +14,8 @@
 //!      for it; the connection is the same service account either way. The
 //!      actor has to be declared by the application, per transaction.
 //!
-//! It also owns the retention policy: entries are kept for seven years.
+//! It also applies each record's retention deadline before moving entries to
+//! the append-only archive.
 //!
 //! # Why writes go through one type
 //!
@@ -22,22 +23,13 @@
 //! what the database observed from what the application claimed. Nothing else
 //! in the codebase should `INSERT INTO audit_logs` directly.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
-
-/// How long audit entries are retained before they may be archived.
-///
-/// Seven years, expressed in days. Calendar arithmetic over that span is the
-/// database's job — `retained_until` is computed as an INTERVAL in SQL — but
-/// the constant is here so the policy is greppable from the service that
-/// enforces it.
-pub const RETENTION_YEARS: i64 = 7;
-const RETENTION_DAYS: i64 = RETENTION_YEARS * 365;
 
 /// Upper bound on rows returned by one query.
 ///
@@ -556,12 +548,13 @@ impl AuditService {
         Ok(status)
     }
 
-    /// The date before which entries are past their retention period.
+    /// Reference instant for selecting entries whose stored retention deadline
+    /// has elapsed.
     pub fn retention_cutoff() -> DateTime<Utc> {
-        Utc::now() - Duration::days(RETENTION_DAYS)
+        Utc::now()
     }
 
-    /// Move entries past their seven-year retention into the archive table.
+    /// Move entries past their configured retention into the archive table.
     ///
     /// Not a delete. `audit_logs` carries rules rejecting UPDATE and DELETE,
     /// and the hash chain is only verifiable while the rows it covers are
@@ -582,7 +575,7 @@ impl AuditService {
             warn!(
                 archived,
                 cutoff = %cutoff,
-                "archived audit entries past the {RETENTION_YEARS}-year retention period"
+                "archived audit entries past their configured retention"
             );
         }
 
@@ -638,9 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn retention_cutoff_is_seven_years_back() {
+    fn retention_cutoff_is_the_sweep_reference_time() {
         let cutoff = AuditService::retention_cutoff();
-        let years_back = (Utc::now() - cutoff).num_days() / 365;
-        assert_eq!(years_back, RETENTION_YEARS);
+        assert!((Utc::now() - cutoff).num_seconds() < 1);
     }
 }

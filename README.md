@@ -45,6 +45,26 @@ Retain a report per drill containing:
 
 A drill passes only when measured RTO and RPO are within the objectives above and application validation succeeds.
 
+## Typed Soroban Client Bindings
+
+Client bindings are generated from the checked-in contract interface artifact (`contracts/interfaces/soroban-interface.json`). The artifact is the single source of truth for Soroban function signatures, return values, emitted events, and contract error codes.
+
+### Versioning and Pinning
+
+- Every generated binding set is stamped with the artifact's `network` and `contractVersion`.
+- Bindings refuse to construct a client when the requested network or contract version does not match the artifact they were generated from, so a consumer cannot accidentally mix network or contract versions.
+- Regenerate bindings whenever the interface artifact changes; never hand-edit generated output.
+
+### Generation and CI Verification
+
+- Regenerate Rust and TypeScript bindings from the artifact with the project's binding generator.
+- CI runs the generator in check mode and fails the build when the committed bindings are stale relative to the interface artifact, so generated output stays current.
+
+### Consumer Validation
+
+- A small Rust consumer and a small TypeScript consumer compile against the generated bindings.
+- Focused automated tests exercise a deliberate interface change plus retry, failure, and duplicate-delivery cases to confirm typed arguments, return values, events, and contract errors stay in sync with the artifact.
+
 ## Handsoff notes
 
 <!-- handsoff-issue-19 -->
@@ -52,3 +72,9 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-223 -->
+- #223: Expose a stable payment lifecycle timeline to wallet clients
+
+<!-- handsoff-issue-226 -->
+- #226: Generate typed client bindings from deployed contract interfaces

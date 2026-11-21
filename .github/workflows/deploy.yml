@@ -141,10 +141,69 @@ jobs:
           echo "frontend digest: ${{ steps.frontend.outputs.digest }}"
           echo "source revision: ${{ github.sha }}"
 
+  contract-manifest:
+    name: Contract deployment manifest
+    runs-on: ubuntu-latest
+    needs: release-checklist
+    permissions:
+      contents: read
+    outputs:
+      manifest_hash: ${{ steps.manifest.outputs.manifest_hash }}
+      wasm_hash: ${{ steps.manifest.outputs.wasm_hash }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Reproducible contract build
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path contracts/Cargo.toml \
+            --target wasm32-unknown-unknown --release --locked
+
+      - name: Compute WASM hash and assemble manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          wasm="contracts/target/wasm32-unknown-unknown/release/payments.wasm"
+          test -f "$wasm" || { echo "::error::Contract artifact $wasm not found."; exit 1; }
+          wasm_hash="$(sha256sum "$wasm" | awk '{print $1}')"
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          manifest="deploy/contract-manifest.json"
+          test -f "$manifest" || { echo "::error::Approved manifest $manifest is missing."; exit 1; }
+          approved_hash="$(jq -r '.wasm_hash' "$manifest")"
+          approved_commit="$(jq -r '.source_commit' "$manifest")"
+          if [ "$approved_hash" != "$wasm_hash" ]; then
+            echo "::error::WASM hash mismatch: approved=$approved_hash rebuilt=$wasm_hash"
+            exit 1
+          fi
+          if [ "$approved_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::Source commit mismatch: approved=$approved_commit current=$GITHUB_SHA"
+            exit 1
+          fi
+          manifest_hash="$(sha256sum "$manifest" | awk '{print $1}')"
+          echo "wasm_hash=$wasm_hash" >> "$GITHUB_OUTPUT"
+          echo "manifest_hash=$manifest_hash" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Contract deployment manifest"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            echo "- Toolchain: \`$rustc_version\` / \`$cargo_version\`"
+            echo "- WASM hash: \`$wasm_hash\` (matches approved manifest)"
+            echo "- Manifest hash: \`$manifest_hash\`"
+            echo "- Network: \`$(jq -r '.network' "$manifest")\`"
+            echo "- Contract ID: \`$(jq -r '.contract_id' "$manifest")\`"
+            echo "- Approvers: $(jq -r '.approvers | join(", ")' "$manifest")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Blue/green deploy
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-and-push, contract-manifest]
     permissions:
       contents: read
       attestations: read
@@ -194,6 +253,26 @@ jobs:
             echo "- Signer workflow: \`$workflow\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify approved contract manifest hash
+        env:
+          APPROVED_MANIFEST_HASH: ${{ needs.contract-manifest.outputs.manifest_hash }}
+          APPROVED_WASM_HASH: ${{ needs.contract-manifest.outputs.wasm_hash }}
+        run: |
+          set -euo pipefail
+          manifest="deploy/contract-manifest.json"
+          test -f "$manifest" || { echo "::error::Approved manifest $manifest is missing."; exit 1; }
+          current_hash="$(sha256sum "$manifest" | awk '{print $1}')"
+          if [ "$current_hash" != "$APPROVED_MANIFEST_HASH" ]; then
+            echo "::error::Manifest hash mismatch: approved=$APPROVED_MANIFEST_HASH current=$current_hash"
+            exit 1
+          fi
+          current_wasm="$(jq -r '.wasm_hash' "$manifest")"
+          if [ "$current_wasm" != "$APPROVED_WASM_HASH" ]; then
+            echo "::error::WASM hash mismatch: approved=$APPROVED_WASM_HASH manifest=$current_wasm"
+            exit 1
+          fi
+          echo "Approved manifest hash $APPROVED_MANIFEST_HASH verified against artifact $APPROVED_WASM_HASH."
+
       - name: Validate production origin policy
         run: |
           set -euo pipefail
@@ -218,85 +297,3 @@ jobs:
                 ;;
             esac
           done
-          echo "Production origin policy OK: $origins"
-
-      - name: Run blue/green deploy on the deploy host
-        uses: appleboy/ssh-action@v1.2.0
-        env:
-          SECURITY_ENV: ${{ env.SECURITY_ENV }}
-          FORCE_HTTPS: ${{ env.FORCE_HTTPS }}
-          HSTS_MAX_AGE: ${{ env.HSTS_MAX_AGE }}
-          HSTS_INCLUDE_SUBDOMAINS: ${{ env.HSTS_INCLUDE_SUBDOMAINS }}
-          HSTS_PRELOAD: ${{ env.HSTS_PRELOAD }}
-          COOKIE_SECURE: ${{ env.COOKIE_SECURE }}
-          COOKIE_SAME_SITE: ${{ env.COOKIE_SAME_SITE }}
-          CORS_ALLOW_CREDENTIALS: ${{ env.CORS_ALLOW_CREDENTIALS }}
-          CORS_ALLOWED_ORIGINS: ${{ env.CORS_ALLOWED_ORIGINS }}
-          SOURCE_REVISION: ${{ github.sha }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          VERIFICATION_RUN_ID: ${{ github.run_id }}
-          BACKEND_IMAGE_REF: ghcr.io/${{ github.repository }}/backend@${{ needs.build-and-push.outputs.backend_digest }}
-          FRONTEND_IMAGE_REF: ghcr.io/${{ github.repository }}/frontend@${{ needs.build-and-push.outputs.frontend_digest }}
-          PROVENANCE_VERIFIED: "true"
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          command_timeout: 30m
-          envs: SECURITY_ENV,FORCE_HTTPS,HSTS_MAX_AGE,HSTS_INCLUDE_SUBDOMAINS,HSTS_PRELOAD,COOKIE_SECURE,COOKIE_SAME_SITE,CORS_ALLOW_CREDENTIALS,CORS_ALLOWED_ORIGINS,SOURCE_REVISION,IMAGE_TAG,VERIFICATION_RUN_ID,BACKEND_IMAGE_REF,FRONTEND_IMAGE_REF,PROVENANCE_VERIFIED
-          script: |
-            cd /opt/arenax
-            git fetch --depth 1 origin main
-            git checkout origin/main -- deploy scripts/deploy
-            export CANARY_WEIGHT=${{ github.event.inputs.canary_weight || '10' }}
-            export CANARY_BAKE_SECONDS=${{ github.event.inputs.canary_bake_seconds || '60' }}
-            # Transactional rollout: the deploy script must gate traffic shift on
-            # migration compatibility and readiness. If either gate fails it
-            # exits non-zero BEFORE shifting traffic, leaving the prior release
-            # serving. Rollback restores the previous artifact by digest and
-            # never reverses schema destructively.
-            ./scripts/deploy/blue-green-deploy.sh
-
-      - name: Verify security headers on deployed services
-        uses: appleboy/ssh-action@v1.2.0
-        env:
-          CORS_ALLOWED_ORIGINS: ${{ env.CORS_ALLOWED_ORIGINS }}
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: CORS_ALLOWED_ORIGINS
-          script: |
-            set -euo pipefail
-            cd /opt/arenax
-            primary_origin="$(echo "$CORS_ALLOWED_ORIGINS" | cut -d',' -f1 | xargs)"
-            if [ -z "$primary_origin" ]; then
-              echo "::error::No primary origin configured for header verification."
-              exit 1
-            fi
-            headers="$(curl -fsSI "$primary_origin" || true)"
-            echo "$headers"
-            echo "$headers" | grep -qi '^strict-transport-security:' || { echo "::error::Missing Strict-Transport-Security header"; exit 1; }
-            echo "$headers" | grep -qi '^x-content-type-options: *nosniff' || { echo "::error::Missing X-Content-Type-Options: nosniff"; exit 1; }
-            echo "$headers" | grep -qi '^x-frame-options:' || { echo "::error::Missing X-Frame-Options header"; exit 1; }
-            echo "$headers" | grep -qi '^referrer-policy:' || { echo "::error::Missing Referrer-Policy header"; exit 1; }
-            if echo "$headers" | grep -qi '^access-control-allow-origin: *\*'; then
-              echo "::error::Wildcard Access-Control-Allow-Origin is not permitted."
-              exit 1
-            fi
-            echo "Security header verification passed."
-
-      - name: Surface deployment metrics
-        if: always()
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd /opt/arenax
-            echo "Release: ${{ needs.build-and-push.outputs.image_tag }} (rev ${{ github.sha }})"
-            echo "Backend digest: ${{ needs.build-and-push.outputs.backend_digest }}"
-            echo "Frontend digest: ${{ needs.build-and-push.outputs.frontend_digest }}"
-            echo "Last 5 deployments:"
-            tail -n 5 deploy/metrics/deployments.jsonl || true

@@ -1,180 +1,80 @@
-# ArenaX Event Governance Policy
+# Event Governance
 
-> Version: 1.0 · Status: Active · Owner: Backend Platform Team
+This document describes how contract events flow through the indexer, how
+decoding failures are handled, and the operator procedures for diagnosing and
+replaying quarantined events.
 
-This document defines the rules, conventions, and processes every engineer must follow when producing or consuming Kafka events on the ArenaX platform.
+## Event ingestion pipeline
 
----
+1. **Fetch** — the Soroban indexer pulls contract events from the RPC in ledger
+   order, starting from the last committed checkpoint.
+2. **Decode** — each event payload (topic + value XDR) is decoded by the
+   versioned decoder. The decoder version is recorded alongside every decoded
+   event.
+3. **Apply** — decoded events are applied to the projection and the checkpoint
+   advances only after the ledger's events are durably committed.
 
-## 1. Core Principles
+## Quarantine policy
 
-- **Events are immutable facts.** Once published, an event record is never edited. Corrections are published as new events.
-- **The event store is the source of truth.** All domain events are persisted to `arenax.event.store` before (or alongside) any database write.
-- **Loose coupling.** Producers must not know about consumers. Never call a consumer API from a producer service.
-- **At-least-once delivery.** Every event may be delivered more than once. All consumers must be idempotent.
+A new event shape or a malformed payload must never silently halt indexing and
+must never be dropped without trace. When an event cannot be decoded:
 
----
+- The raw payload is retained in a **bounded quarantine** (oldest entries are
+  evicted once the bound is reached).
+- Each quarantine record carries **source coordinates**: ledger sequence,
+  transaction hash, event index, and contract id.
+- Each record carries the **decoder version** that failed to decode it, so
+  records can be re-evaluated after a decoder upgrade.
+- Sensitive payload fields are **redacted** before the record is persisted or
+  surfaced in operator diagnostics.
 
-## 2. Topic Naming Convention
+### Processing continues
 
-```
-arenax.<domain>.<event-noun>s        # primary topic
-arenax.<domain>.<event-noun>s.dlq    # dead-letter topic
-arenax.event.store                   # global append-only store
-```
+When policy permits, a decode failure is quarantined and indexing **continues**
+with the next event. Known-good later events in the same ledger (and subsequent
+ledgers) are processed normally. The checkpoint still advances; the quarantined
+event is not applied to the projection until it is explicitly replayed.
 
-| Domain segment | Examples |
-|---|---|
-| `user` | `arenax.user.events` |
-| `match` | `arenax.match.events` |
-| `achievement` | `arenax.achievement.events` |
-| `wallet` | `arenax.wallet.events` |
+Policy may be configured to halt instead of continue for deployments that
+require strict all-or-nothing application. The default is to quarantine and
+continue.
 
-**Rules:**
-- Lowercase only. Use `.` as separator, never `-` or `_`.
-- Every primary topic MUST have a corresponding `.dlq` topic.
-- Topics are created with `auto.create.topics.enable=true` in dev; use Terraform/scripts in production with explicit partition counts.
+## Operator diagnostics
 
----
+Operators can inspect the quarantine through the diagnostics surface, which
+reports for each record:
 
-## 3. Event Schema Standards
+- source coordinates (ledger, tx hash, event index, contract id)
+- decoder version
+- a redacted view of the payload
+- the decode error
 
-Every event MUST be wrapped in `EventEnvelope<T>`:
+Redaction is applied consistently in both the stored record and the diagnostic
+output; sensitive fields are never exposed in logs or API responses.
 
-```typescript
-interface EventEnvelope<T> {
-  eventId: string;       // UUID v4 — unique per message
-  eventType: string;     // Dot-separated noun e.g. "match.ended"
-  version: number;       // Integer, starts at 1
-  occurredAt: string;    // ISO-8601 UTC
-  source: string;        // Emitting service name
-  traceId: string;       // Distributed trace correlation id
-  causationId?: string;  // eventId of the event that caused this one
-  payload: T;
-}
-```
+## Replay after a decoder upgrade
 
-### 3.1 Versioning Strategy
+Replay is **explicit and audited**. It is never triggered automatically by a
+decoder upgrade.
 
-| Change type | Action |
-|---|---|
-| Add optional field | No version bump — backwards-compatible |
-| Rename / remove field | **Bump version** (e.g. `version: 2`) |
-| Change field type | **Bump version** |
-| New event type | New `eventType` string — no version change needed |
+1. Deploy the upgraded decoder.
+2. An operator selects the quarantined records to replay (typically those whose
+   recorded decoder version is older than the current one).
+3. The replay is recorded in the **audit trail**: who triggered it, when, which
+   records, and the decoder version used.
+4. Successfully decoded events are applied; events that still fail remain in
+   quarantine with an updated decoder version.
 
-- Both `version: 1` and `version: 2` schemas must be handled by consumers during the transition window (minimum 2 sprints).
-- Old schema versions are retired only after all consumer groups confirm migration.
+Duplicate delivery is handled idempotently: replaying an event that was already
+applied is a no-op, and retries of a failed replay do not create duplicate
+projection entries.
 
-### 3.2 Event Type Registry
+## Testing expectations
 
-All `eventType` strings must be registered in `server/src/services/kafka/domain-events.ts` before use. **Unregistered event types are rejected at code review.**
+Focused automated tests cover:
 
-| Event type | Topic | Version | Owner |
-|---|---|---|---|
-| `user.registered` | `arenax.user.events` | 1 | Auth Service |
-| `match.ended` | `arenax.match.events` | 1 | Match Service |
-| `achievement.unlocked` | `arenax.achievement.events` | 1 | Achievement Service |
-| `wallet.credited` | `arenax.wallet.events` | 1 | Wallet Service |
-
----
-
-## 4. Producer Rules
-
-1. **Always set a meaningful partition key** — use the aggregate's primary id (e.g. `userId`, `matchId`) to preserve ordering within an aggregate.
-2. **Publish to both the domain topic and `arenax.event.store`** via `EventStore.append()`.
-3. **Inject `traceId`** from the originating HTTP request (via `eventTracingMiddleware`). Never generate a new one mid-flow.
-4. **Use idempotent producer** (`idempotent: true`) — already set in `KafkaClient`.
-5. Log the `eventId` and `traceId` at `INFO` level after a successful publish.
-
----
-
-## 5. Consumer Rules
-
-1. **Consumer group ids** follow the pattern `arenax.<domain>.consumers`. One group per logical consumer (not per instance).
-2. **Idempotency is mandatory.** Use the `eventId` as an idempotency key when writing to any database.
-3. **Never `throw` from `handle()` without a meaningful log.** The base `EventConsumer` will retry and eventually route to DLQ.
-4. **DLQ consumers** must be set up for every primary topic. A DLQ message must trigger a PagerDuty/Slack alert and be reviewed within 24 hours.
-5. **Do not block the event loop.** All I/O inside `handle()` must be awaited.
-
----
-
-## 6. Dead Letter Queue Policy
-
-| Trigger | Action |
-|---|---|
-| Parse failure (invalid JSON) | Immediately route to DLQ |
-| `handle()` throws after `maxRetries` (default 3) | Route to DLQ |
-| Unknown event type | Route to DLQ with `reason: unknown_event_type` |
-
-- DLQ messages are retained for **14 days**.
-- Engineers are responsible for inspecting and replaying or discarding DLQ messages weekly.
-- Use `EventReplay` to re-process a DLQ batch after the underlying bug is fixed.
-
----
-
-## 7. Event Sourcing & Replay
-
-The `arenax.event.store` topic is the immutable audit log of all domain events.
-
-- **Retention:** infinite (log compaction enabled, no size limit in production).
-- **Access control:** read-only for all services except the EventStore writer.
-- **Replay:** use `EventReplay.run({ fromTimestamp, toTimestamp, eventTypes, onEvent })` to reconstruct state or backfill a new service.
-- Replay runs should use a unique `replayGroupId` (auto-generated if unset) to avoid interfering with live consumer groups.
-
----
-
-### 7.1 On-Chain State Changes (`ArenaXStateChange`)
-
-Contract domains emit events shaped for their own domain, which is right for a
-consumer who knows that domain but leaves an indexer with no uniform way to
-answer *who changed what, from what, to what*. `arenax-events::state_change`
-adds a domain-agnostic envelope for exactly that.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `actor` | `Address` | Who caused the change |
-| `resource` | `Symbol` | Kind of thing changed (`match`, `tournament`, `stake`…) |
-| `resource_id` | `String` | Which instance |
-| `field` | `Symbol` | Which field of that instance |
-| `old_value` | `String` | Value before; empty when the field is first set |
-| `new_value` | `String` | Value after |
-| `sequence` | `u64` | Per-resource monotonic counter |
-| `changed_at` | `u64` | Ledger timestamp |
-
-Topics: `["ArenaXStCh_v1", "CHANGED"]`.
-
-**Values are strings on purpose.** A typed union would need extending for every
-new field type, and every change would break every consumer. A string is what an
-indexer writes to its column anyway, and the owning domain's typed event stays
-the precise record.
-
-**Rebuilding state.** `project_resource()` folds a log back into current field
-values. It applies changes in *sequence* order rather than arrival order, since
-events can reach a consumer out of order; it ignores anything at or below the
-last applied sequence, so replaying or duplicating an event cannot move state;
-and it sets `has_gap` when a sequence number is missing. That flag matters — a
-projection built over a gap is not current, and the result says so rather than
-looking authoritative.
-
----
-
-## 8. Observability Requirements
-
-Every service MUST:
-- Emit `latencyMs` in the publish log (alert if `>100 ms` P99).
-- Emit consumer lag metrics to Prometheus via the `arenax_kafka_consumer_lag` gauge.
-- Include `traceId` in every log line related to event processing.
-- Set up Grafana dashboards for: publish rate, consumer lag, DLQ message count.
-
----
-
-## 9. Change Process
-
-1. **Schema change** → open a PR updating `domain-events.ts`, bump version if breaking, update the registry table in this doc.
-2. **New topic** → update `TOPICS` constant, provision in staging, update Terraform before merging.
-3. **Deprecation** → announce in `#platform-eng`, keep old version supported for 2 sprints, then remove.
-4. All changes require review from at least **one Platform team member**.
-
----
-
+- unknown topics
+- invalid XDR payloads
+- replay after a decoder update
+- redaction of sensitive payload fields
+- retry, failure, and duplicate-delivery cases

@@ -1,180 +1,87 @@
-# ArenaX Event Governance Policy
+# Event Governance
 
-> Version: 1.0 · Status: Active · Owner: Backend Platform Team
+This document describes the operator-facing policies that govern finalized
+tournament records. Finalized match and tournament records are immutable except
+through the explicit, audited correction flows described below.
 
-This document defines the rules, conventions, and processes every engineer must follow when producing or consuming Kafka events on the ArenaX platform.
+## Finalized bracket corrections
 
----
+Manual bracket repairs can change advancement and prize eligibility, so a
+finalized bracket may only be corrected through a two-person review flow.
 
-## 1. Core Principles
+### Correction proposal
 
-- **Events are immutable facts.** Once published, an event record is never edited. Corrections are published as new events.
-- **The event store is the source of truth.** All domain events are persisted to `arenax.event.store` before (or alongside) any database write.
-- **Loose coupling.** Producers must not know about consumers. Never call a consumer API from a producer service.
-- **At-least-once delivery.** Every event may be delivered more than once. All consumers must be idempotent.
+A correction proposal is created at the canonical tournament service boundary
+(not in ad-hoc API handlers) and must record:
 
----
+- **Before state** — the finalized bracket state being corrected.
+- **After state** — the proposed replacement state.
+- **Reason** — why the correction is needed.
+- **Evidence reference** — a link or identifier to supporting evidence.
+- **Proposer** — the operator who created the proposal.
+- **Bracket version** — the bracket version the proposal was built against.
 
-## 2. Topic Naming Convention
+### Approval policy
 
-```
-arenax.<domain>.<event-noun>s        # primary topic
-arenax.<domain>.<event-noun>s.dlq    # dead-letter topic
-arenax.event.store                   # global append-only store
-```
+- A proposal requires an **independent approver**: the approver must not be the
+  proposer. Same-actor approval is rejected.
+- The approver is recorded on the correction alongside the proposer so the
+  change is fully auditable.
+- A proposal is **rejected if the bracket version has changed** since the
+  proposal was created (stale proposal). The proposer must re-propose against
+  the current version.
+- Finalized payout transitions cannot be silently rewritten; any change to a
+  finalized payout must go through this same audited correction flow.
 
-| Domain segment | Examples |
-|---|---|
-| `user` | `arenax.user.events` |
-| `match` | `arenax.match.events` |
-| `achievement` | `arenax.achievement.events` |
-| `wallet` | `arenax.wallet.events` |
+### Validation expectations
 
-**Rules:**
-- Lowercase only. Use `.` as separator, never `-` or `_`.
-- Every primary topic MUST have a corresponding `.dlq` topic.
-- Topics are created with `auto.create.topics.enable=true` in dev; use Terraform/scripts in production with explicit partition counts.
+Automated coverage should exercise:
 
----
+- Same-actor approval rejection.
+- Stale proposal handling when the bracket version changes.
+- Replay behavior (a proposal cannot be applied twice).
+- Downstream standings reconciliation after an approved correction.
 
-## 3. Event Schema Standards
+## Dispute deadlines and escalation
 
-Every event MUST be wrapped in `EventEnvelope<T>`:
+Tournament result disputes follow a versioned deadline and escalation
+lifecycle so that unresolved disputes cannot stall later rounds or payouts.
+The lifecycle is enforced at the canonical tournament service boundary, not in
+ad-hoc API handlers.
 
-```typescript
-interface EventEnvelope<T> {
-  eventId: string;       // UUID v4 — unique per message
-  eventType: string;     // Dot-separated noun e.g. "match.ended"
-  version: number;       // Integer, starts at 1
-  occurredAt: string;    // ISO-8601 UTC
-  source: string;        // Emitting service name
-  traceId: string;       // Distributed trace correlation id
-  causationId?: string;  // eventId of the event that caused this one
-  payload: T;
-}
-```
+### Dispute record
 
-### 3.1 Versioning Strategy
+Every dispute stores:
 
-| Change type | Action |
-|---|---|
-| Add optional field | No version bump — backwards-compatible |
-| Rename / remove field | **Bump version** (e.g. `version: 2`) |
-| Change field type | **Bump version** |
-| New event type | New `eventType` string — no version change needed |
+- **Opening time** — when the dispute was filed.
+- **Evidence deadline** — the deadline by which supporting evidence must be
+  submitted.
+- **Assigned reviewer state** — who currently owns the dispute and whether it
+  is unassigned, assigned, or escalated.
+- **Resolution reason** — why the dispute was resolved (required on close).
+- **Lifecycle version** — the dispute lifecycle version the record was created
+  against, so deadline and escalation rules are applied consistently.
 
-- Both `version: 1` and `version: 2` schemas must be handled by consumers during the transition window (minimum 2 sprints).
-- Old schema versions are retired only after all consumer groups confirm migration.
+### Deadline and escalation policy
 
-### 3.2 Event Type Registry
+- Evidence submitted **after the evidence deadline** is recorded as late and
+  does not by itself change the dispute outcome.
+- Escalation reassigns the dispute to a higher reviewer state; it **does not
+  auto-accept unverified claims**. An escalated dispute still requires an
+  explicit resolution with a recorded reason.
+- Reviewer reassignment is recorded so ownership changes remain auditable.
+- Closing a dispute unlocks **only the valid next lifecycle transition** for the
+  affected match or tournament; it does not skip ahead or reopen finalized
+  records.
+- Repeated resolution requests on an already-closed dispute are rejected
+  (replay-safe); a closed dispute cannot be resolved twice.
 
-All `eventType` strings must be registered in `server/src/services/kafka/domain-events.ts` before use. **Unregistered event types are rejected at code review.**
+### Validation expectations
 
-| Event type | Topic | Version | Owner |
-|---|---|---|---|
-| `user.registered` | `arenax.user.events` | 1 | Auth Service |
-| `match.ended` | `arenax.match.events` | 1 | Match Service |
-| `achievement.unlocked` | `arenax.achievement.events` | 1 | Achievement Service |
-| `wallet.credited` | `arenax.wallet.events` | 1 | Wallet Service |
+Automated coverage should exercise:
 
----
-
-## 4. Producer Rules
-
-1. **Always set a meaningful partition key** — use the aggregate's primary id (e.g. `userId`, `matchId`) to preserve ordering within an aggregate.
-2. **Publish to both the domain topic and `arenax.event.store`** via `EventStore.append()`.
-3. **Inject `traceId`** from the originating HTTP request (via `eventTracingMiddleware`). Never generate a new one mid-flow.
-4. **Use idempotent producer** (`idempotent: true`) — already set in `KafkaClient`.
-5. Log the `eventId` and `traceId` at `INFO` level after a successful publish.
-
----
-
-## 5. Consumer Rules
-
-1. **Consumer group ids** follow the pattern `arenax.<domain>.consumers`. One group per logical consumer (not per instance).
-2. **Idempotency is mandatory.** Use the `eventId` as an idempotency key when writing to any database.
-3. **Never `throw` from `handle()` without a meaningful log.** The base `EventConsumer` will retry and eventually route to DLQ.
-4. **DLQ consumers** must be set up for every primary topic. A DLQ message must trigger a PagerDuty/Slack alert and be reviewed within 24 hours.
-5. **Do not block the event loop.** All I/O inside `handle()` must be awaited.
-
----
-
-## 6. Dead Letter Queue Policy
-
-| Trigger | Action |
-|---|---|
-| Parse failure (invalid JSON) | Immediately route to DLQ |
-| `handle()` throws after `maxRetries` (default 3) | Route to DLQ |
-| Unknown event type | Route to DLQ with `reason: unknown_event_type` |
-
-- DLQ messages are retained for **14 days**.
-- Engineers are responsible for inspecting and replaying or discarding DLQ messages weekly.
-- Use `EventReplay` to re-process a DLQ batch after the underlying bug is fixed.
-
----
-
-## 7. Event Sourcing & Replay
-
-The `arenax.event.store` topic is the immutable audit log of all domain events.
-
-- **Retention:** infinite (log compaction enabled, no size limit in production).
-- **Access control:** read-only for all services except the EventStore writer.
-- **Replay:** use `EventReplay.run({ fromTimestamp, toTimestamp, eventTypes, onEvent })` to reconstruct state or backfill a new service.
-- Replay runs should use a unique `replayGroupId` (auto-generated if unset) to avoid interfering with live consumer groups.
-
----
-
-### 7.1 On-Chain State Changes (`ArenaXStateChange`)
-
-Contract domains emit events shaped for their own domain, which is right for a
-consumer who knows that domain but leaves an indexer with no uniform way to
-answer *who changed what, from what, to what*. `arenax-events::state_change`
-adds a domain-agnostic envelope for exactly that.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `actor` | `Address` | Who caused the change |
-| `resource` | `Symbol` | Kind of thing changed (`match`, `tournament`, `stake`…) |
-| `resource_id` | `String` | Which instance |
-| `field` | `Symbol` | Which field of that instance |
-| `old_value` | `String` | Value before; empty when the field is first set |
-| `new_value` | `String` | Value after |
-| `sequence` | `u64` | Per-resource monotonic counter |
-| `changed_at` | `u64` | Ledger timestamp |
-
-Topics: `["ArenaXStCh_v1", "CHANGED"]`.
-
-**Values are strings on purpose.** A typed union would need extending for every
-new field type, and every change would break every consumer. A string is what an
-indexer writes to its column anyway, and the owning domain's typed event stays
-the precise record.
-
-**Rebuilding state.** `project_resource()` folds a log back into current field
-values. It applies changes in *sequence* order rather than arrival order, since
-events can reach a consumer out of order; it ignores anything at or below the
-last applied sequence, so replaying or duplicating an event cannot move state;
-and it sets `has_gap` when a sequence number is missing. That flag matters — a
-projection built over a gap is not current, and the result says so rather than
-looking authoritative.
-
----
-
-## 8. Observability Requirements
-
-Every service MUST:
-- Emit `latencyMs` in the publish log (alert if `>100 ms` P99).
-- Emit consumer lag metrics to Prometheus via the `arenax_kafka_consumer_lag` gauge.
-- Include `traceId` in every log line related to event processing.
-- Set up Grafana dashboards for: publish rate, consumer lag, DLQ message count.
-
----
-
-## 9. Change Process
-
-1. **Schema change** → open a PR updating `domain-events.ts`, bump version if breaking, update the registry table in this doc.
-2. **New topic** → update `TOPICS` constant, provision in staging, update Terraform before merging.
-3. **Deprecation** → announce in `#platform-eng`, keep old version supported for 2 sprints, then remove.
-4. All changes require review from at least **one Platform team member**.
-
----
-
+- Deadline boundaries (evidence exactly at and just past the deadline).
+- Late evidence handling.
+- Reviewer reassignment and escalation without auto-acceptance.
+- Repeated resolution requests and replay behavior.
+- Authorization of who may escalate, reassign, and resolve a dispute.

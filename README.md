@@ -52,3 +52,15 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-211 -->
+- #211: Publish a participant-safe post-event results and finance report
+
+<!-- handsoff-issue-212 -->
+- #212: Define exact multi-currency ledger conversion and rounding rules
+
+<!-- handsoff-issue-213 -->
+- #213: Normalize provider payment states into one canonical lifecycle
+
+<!-- handsoff-issue-214 -->
+- #214: Add safe provider failover for payment initiation

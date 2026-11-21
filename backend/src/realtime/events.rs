@@ -271,6 +271,11 @@ pub enum ClientMessage {
 #[rtype(result = "()")]
 pub struct DeliverEvent(pub RealtimeEvent);
 
+/// Force one or all sessions for a user to close after credential revocation.
+#[derive(Debug, Clone, Message)]
+#[rtype(result = "()")]
+pub struct CredentialRevoked(pub Uuid, pub Option<String>);
+
 /// Actix message for delivering a sequenced envelope to an actor.
 #[derive(Debug, Clone, Message)]
 #[rtype(result = "()")]

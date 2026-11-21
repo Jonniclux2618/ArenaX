@@ -26,6 +26,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Postgres, Transaction};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -104,10 +105,84 @@ impl AuditAction {
             Self::OperatorRequestRejected => "operator_request_rejected",
         }
     }
+}
 
-    let mut redacted = 0usize;
-    let out = walk(value, &mut redacted);
-    (out, redacted)
+/// Retention class for an audit event category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRetentionClass {
+    Security,
+    Operational,
+    Compliance,
+}
+
+impl AuditRetentionClass {
+    pub fn retention_days(self) -> i64 {
+        match self {
+            Self::Security => 365,
+            Self::Operational => 90,
+            Self::Compliance => RETENTION_DAYS,
+        }
+    }
+}
+
+/// Field-level policy declared by each audit event schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEventSchema {
+    pub action: AuditAction,
+    pub required_fields: Vec<&'static str>,
+    pub pseudonymized_fields: Vec<&'static str>,
+    pub prohibited_fields: Vec<&'static str>,
+    pub retention_class: AuditRetentionClass,
+}
+
+impl AuditEventSchema {
+    pub fn validate(&self, value: &JsonValue) -> Result<(), AuditError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| AuditError::Invalid("Audit payload must be a JSON object".into()))?;
+
+        for field in &self.required_fields {
+            if !object.contains_key(*field) {
+                return Err(AuditError::Invalid(format!(
+                    "Required audit field '{}' is missing",
+                    field
+                )));
+            }
+        }
+
+        for field in &self.prohibited_fields {
+            if object.contains_key(*field) {
+                return Err(AuditError::Invalid(format!(
+                    "Prohibited audit field '{}' was supplied",
+                    field
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn redact(&self, value: &JsonValue) -> JsonValue {
+        let mut out = value.clone();
+        if let Some(object) = out.as_object_mut() {
+            for field in &self.pseudonymized_fields {
+                if object.contains_key(*field) {
+                    if let Some(raw) = object.get(*field).and_then(|v| v.as_str()) {
+                        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+                        object.insert(
+                            (*field).to_string(),
+                            JsonValue::String(format!("sha256:{}", &digest[..16.min(digest.len())])),
+                        );
+                    }
+                }
+            }
+            for field in &self.prohibited_fields {
+                object.remove(*field);
+            }
+        }
+        out
+    }
 }
 
 /// Why a privileged operator request was refused.

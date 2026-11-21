@@ -17,6 +17,12 @@ on:
       canary_bake_seconds:
         description: "Seconds to hold the canary split before full cutover"
         default: "60"
+      canary_max_error_rate_percent:
+        description: "Maximum canary HTTP error rate percent"
+        default: "1"
+      canary_max_p95_latency_ms:
+        description: "Maximum canary p95 latency in milliseconds"
+        default: "500"
       rehearsal_network:
         description: "Testnet network for the contract rehearsal (testnet only)"
         default: "testnet"
@@ -250,6 +256,9 @@ jobs:
             git checkout origin/main -- deploy scripts/deploy
             export CANARY_WEIGHT=${{ github.event.inputs.canary_weight || '10' }}
             export CANARY_BAKE_SECONDS=${{ github.event.inputs.canary_bake_seconds || '60' }}
+            export CANARY_MAX_ERROR_RATE_PERCENT=${{ github.event.inputs.canary_max_error_rate_percent || '1' }}
+            export CANARY_MAX_P95_LATENCY_MS=${{ github.event.inputs.canary_max_p95_latency_ms || '500' }}
+            export CANARY_CRITICAL_JOURNEY_URL="http://localhost:8080/api/health/ready"
             # Transactional rollout: the deploy script must gate traffic shift on
             # migration compatibility and readiness. If either gate fails it
             # exits non-zero BEFORE shifting traffic, leaving the prior release

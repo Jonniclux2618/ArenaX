@@ -145,6 +145,23 @@ impl EventBus {
         };
 
         let mut conn = self.redis.clone();
+        // Keep a bounded Redis Stream mirror for reconnect recovery. Pub/Sub
+        // remains the live fan-out transport; the stream is authoritative for
+        // replaying only the bounded, ordered tail after a subscriber reconnect.
+        let stream_key = format!("realtime-stream:{}", channel);
+        let stream_result = redis::cmd("XADD")
+            .arg(&stream_key)
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(1000)
+            .arg("*")
+            .arg("payload")
+            .arg(&payload)
+            .query_async::<_, String>(&mut conn)
+            .await;
+        if let Err(e) = stream_result {
+            error!(channel = %channel, error = %e, "Failed to append event to Redis Stream");
+        }
         if let Err(e) = conn.publish::<_, _, ()>(channel, &payload).await {
             error!(channel = %channel, error = %e, "Failed to publish event to Redis");
         } else {

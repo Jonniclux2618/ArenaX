@@ -1,4 +1,7 @@
-use crate::realtime::events::{channels, DeliverEvent, RealtimeEvent};
+use crate::realtime::events::{
+    channels, CredentialRevoked, DeliverEvent, RealtimeEvent,
+};
+use crate::auth::jwt_service::CREDENTIAL_REVOCATION_CHANNEL;
 use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::user_ws::UserWebSocket;
 use actix::Addr;
@@ -33,6 +36,18 @@ impl WsAddressBook {
 
     pub fn get(&self, session_id: &Uuid) -> Option<Addr<UserWebSocket>> {
         self.inner.read().unwrap().get(session_id).cloned()
+    }
+
+    pub fn close_user(&self, user_id: Uuid, session_id: Option<&str>) {
+        let addresses = self.inner.read().unwrap().clone();
+        for (address_session_id, addr) in addresses {
+            if let Some(requested) = session_id {
+                if Uuid::parse_str(requested).ok() != Some(address_session_id) {
+                    continue;
+                }
+            }
+            addr.do_send(CredentialRevoked(user_id, session_id.map(str::to_string)));
+        }
     }
 }
 
@@ -108,6 +123,52 @@ impl WsBroadcaster {
             .await;
         }));
 
+        // Credential revocation is instance-independent: every backend instance
+        // subscribes and closes or removes the matching local WebSocket sessions.
+        let redis_url = self.redis_url.clone();
+        let registry = self.registry.clone();
+        let address_book = self.address_book.clone();
+        handles.push(tokio::spawn(async move {
+            loop {
+                match redis::Client::open(redis_url.as_str()) {
+                    Ok(client) => match client.get_async_pubsub().await {
+                        Ok(mut pubsub) => {
+                            if pubsub.subscribe(CREDENTIAL_REVOCATION_CHANNEL).await.is_ok() {
+                                use futures_util::StreamExt;
+                                let mut stream = pubsub.on_message();
+                                while let Some(msg) = stream.next().await {
+                                    let payload: String = match msg.get_payload() {
+                                        Ok(payload) => payload,
+                                        Err(_) => continue,
+                                    };
+                                    if let Ok(revocation) =
+                                        serde_json::from_str::<crate::auth::jwt_service::CredentialRevocation>(&payload)
+                                    {
+                                        if let Some(session_id) = revocation.session_id.as_deref() {
+                                            if let Some(ws_session_id) =
+                                                registry.revoke_auth_session(session_id)
+                                            {
+                                                address_book.close_user(
+                                                    revocation.user_id,
+                                                    Some(&ws_session_id.to_string()),
+                                                );
+                                            }
+                                        } else {
+                                            registry.revoke_user(&revocation.user_id);
+                                            address_book.close_user(revocation.user_id, None);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => error!(%error, "Credential revocation Pub/Sub reconnect failed"),
+                    },
+                    Err(error) => error!(%error, "Credential revocation Redis client failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }));
+
         info!("WsBroadcaster started — listening to Redis Pub/Sub");
         handles
     }
@@ -128,40 +189,62 @@ impl WsBroadcaster {
             }
         };
 
-        let mut pubsub = match client.get_async_pubsub().await {
-            Ok(ps) => ps,
-            Err(e) => {
-                error!(pattern = %pattern, error = %e, "Failed to connect Redis Pub/Sub");
-                return;
-            }
-        };
-
-        if let Err(e) = pubsub.psubscribe(pattern).await {
-            error!(pattern = %pattern, error = %e, "Failed to psubscribe");
-            return;
-        }
-
-        info!(pattern = %pattern, "Subscribed to Redis Pub/Sub pattern");
-
-        use futures_util::StreamExt;
-        let mut stream = pubsub.on_message();
-
-        while let Some(msg) = stream.next().await {
-            let channel: String = match msg.get_channel() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let payload: String = match msg.get_payload() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            match serde_json::from_str::<RealtimeEvent>(&payload) {
-                Ok(event) => route_fn(&channel, &event, registry, address_book),
+        loop {
+            let mut pubsub = match client.get_async_pubsub().await {
+                Ok(ps) => ps,
                 Err(e) => {
-                    warn!(channel = %channel, error = %e, "Failed to deserialize Pub/Sub message");
+                    error!(pattern = %pattern, error = %e, "Failed to connect Redis Pub/Sub; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = pubsub.psubscribe(pattern).await {
+                error!(pattern = %pattern, error = %e, "Failed to psubscribe; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+
+            info!(pattern = %pattern, "Subscribed to Redis Pub/Sub pattern");
+
+            #[derive(serde::Deserialize)]
+            struct SequencedEnvelope {
+                #[serde(default)]
+                seq: u64,
+                event: RealtimeEvent,
+            }
+
+            use futures_util::StreamExt;
+            let mut stream = pubsub.on_message();
+            let mut disconnected = false;
+            while let Some(msg) = stream.next().await {
+                let channel: String = match msg.get_channel() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let payload: String = match msg.get_payload() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                let event = if let Ok(envelope) =
+                    serde_json::from_str::<SequencedEnvelope>(&payload)
+                {
+                    Some(envelope.event)
+                } else {
+                    serde_json::from_str::<RealtimeEvent>(&payload).ok()
+                };
+                if let Some(event) = event {
+                    route_fn(&channel, &event, registry, address_book);
+                } else {
+                    warn!(channel = %channel, "Failed to deserialize Pub/Sub message");
                 }
             }
+            disconnected = true;
+            if disconnected {
+                warn!(pattern = %pattern, "Redis Pub/Sub stream ended; reconnecting");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
 

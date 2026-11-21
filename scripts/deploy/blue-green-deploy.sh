@@ -57,6 +57,11 @@ canary_bake_seconds="${CANARY_BAKE_SECONDS:-60}"
 rollback_window_seconds="${ROLLBACK_WINDOW_SECONDS:-120}"
 health_retries="${HEALTH_CHECK_RETRIES:-10}"
 health_interval="${HEALTH_CHECK_INTERVAL_SECONDS:-3}"
+canary_max_error_rate="${CANARY_MAX_ERROR_RATE_PERCENT:-1}"
+canary_max_p95_latency_ms="${CANARY_MAX_P95_LATENCY_MS:-500}"
+critical_journey_url="${CANARY_CRITICAL_JOURNEY_URL:-http://localhost:8080/api/health/ready}"
+canary_telemetry_url="${CANARY_TELEMETRY_URL:-}"
+canary_telemetry_required="${CANARY_TELEMETRY_REQUIRED:-false}"
 
 compose="docker compose -f deploy/docker-compose.deploy.yml"
 state_dir="deploy/state"
@@ -103,6 +108,47 @@ health_check() {
   return 1
 }
 
+canary_guardrail_check() {
+  local color="$1"
+  local telemetry error_rate latency
+
+  if ! $compose exec -T "backend-$color" curl -fsS "$critical_journey_url" >/dev/null 2>&1; then
+    echo "Critical journey failed on canary slot $color: $critical_journey_url" >&2
+    return 1
+  fi
+
+  if [ "$canary_telemetry_required" = "true" ] && [ -z "$canary_telemetry_url" ]; then
+    echo "Telemetry is missing: CANARY_TELEMETRY_URL is required for canary guardrails" >&2
+    return 1
+  fi
+
+  if [ -n "$canary_telemetry_url" ]; then
+    if ! telemetry="$(curl -fsS --max-time 5 "$canary_telemetry_url")"; then
+      echo "Telemetry endpoint unavailable: $canary_telemetry_url" >&2
+      return 1
+    fi
+
+    error_rate="$(printf '%s\n' "$telemetry" | awk '$1=="arenax_http_error_rate_percent"{print $2; exit}')"
+    latency="$(printf '%s\n' "$telemetry" | awk '$1=="arenax_http_p95_latency_ms"{print $2; exit}')"
+    if [ -z "$error_rate" ] || [ -z "$latency" ]; then
+      echo "Telemetry is missing required error-rate or p95-latency series" >&2
+      return 1
+    fi
+
+    if ! awk -v value="$error_rate" -v limit="$canary_max_error_rate" 'BEGIN { exit !(value <= limit) }'; then
+      echo "Canary error rate $error_rate% exceeds $canary_max_error_rate%" >&2
+      return 1
+    fi
+    if ! awk -v value="$latency" -v limit="$canary_max_p95_latency_ms" 'BEGIN { exit !(value <= limit) }'; then
+      echo "Canary p95 latency ${latency}ms exceeds ${canary_max_p95_latency_ms}ms" >&2
+      return 1
+    fi
+  fi
+
+  echo "Canary guardrails passed: critical journey healthy${telemetry:+; telemetry within thresholds}"
+  return 0
+}
+
 abort() {
   echo "DEPLOY FAILED: $1" >&2
   $compose stop "backend-$idle_color" "frontend-$idle_color" >/dev/null 2>&1 || true
@@ -131,9 +177,9 @@ bake_elapsed=0
 while [ "$bake_elapsed" -lt "$canary_bake_seconds" ]; do
   sleep "$health_interval"
   bake_elapsed=$((bake_elapsed + health_interval))
-  if ! $compose exec -T "backend-$idle_color" curl -fsS "http://localhost:8080/api/health" >/dev/null 2>&1; then
+  if ! canary_guardrail_check "$idle_color"; then
     ./scripts/deploy/render-upstream.sh "$active_color"
-    abort "$idle_color failed a health check during the canary bake — reverted to 100% $active_color"
+    abort "$idle_color failed canary guardrails during the bake — reverted to 100% $active_color"
   fi
 done
 

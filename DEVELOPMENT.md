@@ -54,6 +54,22 @@ boundaries. At minimum cover:
 - multi-device registration,
 - fallback behavior for unsupported clients.
 
+## Reproducible local environment
+
+Start the supported PostgreSQL, PgBouncer, Redis, object-storage, and message
+queue dependencies with:
+
+```sh
+make local-up
+./scripts/local-dev.sh seed
+```
+
+The first command creates an ignored `.env.local` containing development-only
+defaults and waits for Docker health checks. Repeat `make local-up` safely;
+it only reconciles containers. `make local-seed` seeds deterministic synthetic
+data once. Use `make local-down` for a teardown that preserves named volumes.
+No production credentials or real identities are required or committed.
+
 ## Contributing
 
 Keep changes scoped, follow existing patterns, and include tests for security-relevant

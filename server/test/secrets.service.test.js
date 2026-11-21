@@ -49,3 +49,17 @@ test('onAccess is called for every read with hit metadata', async () => {
 
   delete process.env.__TEST_SECRET_2
 })
+
+test('secret inventory reports unknown, missing, placeholders, and rotation overlap safely', async () => {
+  const { validateSecretInventory } = await import('../dist/config/secret-inventory.js')
+  const result = validateSecretInventory({
+    DATABASE_URL: '',
+    JWT_SECRET: 'changeme',
+    UNKNOWN_API_SECRET: 'do-not-log-this-value',
+  })
+
+  assert.ok(result.unknownVariables.includes('UNKNOWN_API_SECRET'))
+  assert.ok(result.missingRequired.includes('DATABASE_URL'))
+  assert.ok(result.placeholders.includes('JWT_SECRET'))
+  assert.ok(!JSON.stringify(result).includes('do-not-log-this-value'))
+})

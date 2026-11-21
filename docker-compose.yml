@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_DB: arenax
       POSTGRES_USER: arenax
-      POSTGRES_PASSWORD: arenax
+      POSTGRES_PASSWORD: ${ARENA_POSTGRES_PASSWORD:-arenax_local_only}
     ports:
       - "5433:5432"
     volumes:
@@ -28,7 +28,7 @@ services:
       DATABASES_PORT: 5432
       DATABASES_DBNAME: arenax
       DATABASES_USER: arenax
-      DATABASES_PASSWORD: arenax
+      DATABASES_PASSWORD: ${ARENA_POSTGRES_PASSWORD:-arenax_local_only}
       POOL_MODE: transaction
       MAX_CLIENT_CONN: 100
       DEFAULT_POOL_SIZE: 25
@@ -77,8 +77,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ACCESS_KEY: minio
-      MINIO_SECRET_KEY: arenax_secret_key
+      MINIO_ACCESS_KEY: ${ARENA_MINIO_ROOT_USER:-arenax-local}
+      MINIO_SECRET_KEY: ${ARENA_MINIO_ROOT_PASSWORD:-arenax_local_only}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -96,8 +96,8 @@ services:
   rabbitmq:
     image: rabbitmq:3.12-management-alpine
     environment:
-      RABBITMQ_DEFAULT_USER: arenax
-      RABBITMQ_DEFAULT_PASS: arenax
+      RABBITMQ_DEFAULT_USER: ${ARENA_RABBITMQ_USER:-arenax-local}
+      RABBITMQ_DEFAULT_PASS: ${ARENA_RABBITMQ_PASSWORD:-arenax_local_only}
       RABBITMQ_DEFAULT_VHOST: arenax
     ports:
       - "5672:5672"
@@ -177,18 +177,18 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgres://arenax:arenax@pgbouncer:6432/arenax
-      DATABASE_DIRECT_URL: postgres://arenax:arenax@postgres:5432/arenax
+      DATABASE_URL: postgres://arenax:${ARENA_POSTGRES_PASSWORD:-arenax_local_only}@pgbouncer:6432/arenax
+      DATABASE_DIRECT_URL: postgres://arenax:${ARENA_POSTGRES_PASSWORD:-arenax_local_only}@postgres:5432/arenax
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minio
-      S3_SECRET_KEY: arenax_secret_key
-      JWT_SECRET: dev-secret-key
+      S3_ACCESS_KEY: ${ARENA_MINIO_ROOT_USER:-arenax-local}
+      S3_SECRET_KEY: ${ARENA_MINIO_ROOT_PASSWORD:-arenax_local_only}
+      JWT_SECRET: ${ARENA_JWT_SECRET:-arenax_local_jwt_secret_change_for_real_use}
       STELLAR_NETWORK_URL: https://horizon-testnet.stellar.org
       KAFKA_BROKERS: kafka:29092
       KAFKA_CLIENT_ID: arenax-server
       PGBOUNCER_ENABLED: "true"
-      RABBITMQ_URL: amqp://arenax:arenax@rabbitmq:5672/arenax
+      RABBITMQ_URL: amqp://${ARENA_RABBITMQ_USER:-arenax-local}:${ARENA_RABBITMQ_PASSWORD:-arenax_local_only}@rabbitmq:5672/arenax
     depends_on:
       pgbouncer:
         condition: service_healthy

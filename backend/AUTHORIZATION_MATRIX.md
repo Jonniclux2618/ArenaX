@@ -24,3 +24,11 @@ All routes are protected by `AuthMiddleware` unless listed as public below. Prot
 - Public webhook handlers must validate their provider signature before changing state.
 
 When adding a route, update the matrix and public allowlist together. Do not infer ownership from request-supplied user IDs; derive the caller from claims and scope database queries to that identity.
+
+## Executable policy matrix
+
+The shared fixture at `server/test/fixtures/authorization-policy.json` is the
+source for TypeScript and Rust authorization decision tests. Each row names
+the operation, principal, resource, action, permission, ownership boundary,
+and expected allow/deny decision. Direct and indirect resource access must
+remain covered as separate fixtures.

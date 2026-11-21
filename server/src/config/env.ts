@@ -16,6 +16,7 @@
  */
 
 import z from 'zod';
+import { validateSecretInventory } from './secret-inventory';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -328,6 +329,24 @@ export const validateEnv = (): DerivedEnv => {
     }
 
     const parsed = result.data;
+    const inventory = validateSecretInventory(process.env as Record<string, string | undefined>);
+    if (
+        inventory.unknownVariables.length > 0 ||
+        inventory.missingRequired.length > 0 ||
+        (parsed.NODE_ENV === 'production' && inventory.placeholders.length > 0)
+    ) {
+        const diagnostic = {
+            unknownSecretVariables: inventory.unknownVariables,
+            missingRequiredSecrets: inventory.missingRequired,
+            placeholderSecrets: inventory.placeholders,
+            rotationWarnings: inventory.rotationWarnings,
+        };
+        console.error(
+            '[env] Secret inventory validation failed:\n',
+            JSON.stringify(diagnostic, null, 2)
+        );
+        process.exit(1);
+    }
 
     const derived: DerivedEnv = {
         ...parsed,

@@ -17,12 +17,30 @@ use crate::service::evidence_storage::{
     evidence_object_key, hash_evidence, validate_content_type, validate_evidence_size,
     validate_magic_bytes, EvidenceStore,
 };
+use crate::service::evidence_download::EvidenceDownloadCapability;
 use crate::service::match_service::MatchService;
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use once_cell::sync::OnceCell;
+
+static EVIDENCE_DOWNLOAD_CAPABILITY: OnceCell<EvidenceDownloadCapability> = OnceCell::new();
+
+#[derive(Debug, Deserialize)]
+pub struct EvidenceDownloadLinkRequest {}
+
+#[derive(Debug, Serialize)]
+pub struct EvidenceDownloadLinkResponse {
+    pub capability: String,
+    pub expires_in_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedeemEvidenceDownloadRequest {
+    pub capability: String,
+}
 
 #[derive(Debug, Serialize)]
 pub struct DisputeEvidenceResponse {
@@ -369,6 +387,156 @@ async fn authorize_evidence_access(
     authorize_match_player(db, match_id, user_id).await.map(|_| ())
 }
 
+fn evidence_download_capability() -> Result<&'static EvidenceDownloadCapability, ApiError> {
+    EVIDENCE_DOWNLOAD_CAPABILITY
+        .get_or_try_init(EvidenceDownloadCapability::from_env)
+        .map_err(|message| ApiError::ServiceUnavailable(message))
+}
+
+/// POST /api/matches/{id}/dispute/evidence/download-link
+/// Issues a read-only capability scoped to the authenticated viewer and active case.
+pub async fn issue_evidence_download_link(
+    req: HttpRequest,
+    db: web::Data<DbPool>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let match_id = path.into_inner();
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    let staff_access = has_staff_access(&req);
+    authorize_evidence_access(db.get_ref(), match_id, user_id, staff_access).await?;
+
+    let dispute = sqlx::query_as!(
+        MatchDispute,
+        r#"
+        SELECT * FROM match_disputes
+        WHERE match_id = $1
+          AND evidence_s3_key IS NOT NULL
+          AND evidence_deleted_at IS NULL
+          AND status NOT IN (2, 3)
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        match_id
+    )
+    .fetch_optional(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?
+    .ok_or_else(|| ApiError::forbidden("Evidence is not available for an active dispute"))?;
+
+    let object_key = dispute
+        .evidence_s3_key
+        .as_deref()
+        .ok_or_else(|| ApiError::not_found("Evidence object not found"))?;
+    let capability = evidence_download_capability()?
+        .issue(user_id, dispute.id, object_key)
+        .map_err(ApiError::bad_request)?;
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+        VALUES ($1, 'DISPUTE_EVIDENCE_DOWNLOAD_LINK_ISSUED', 'match_dispute', $2, $3)
+        "#,
+    )
+    .bind(user_id)
+    .bind(dispute.id)
+    .bind(serde_json::json!({ "match_id": match_id, "expires_in_seconds": 300 }).to_string())
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    Ok(HttpResponse::Ok().json(EvidenceDownloadLinkResponse {
+        capability,
+        expires_in_seconds: 300,
+    }))
+}
+
+/// POST /api/matches/{id}/dispute/evidence/download
+/// Redeems a capability once and rechecks viewer, active case, and object scope.
+pub async fn redeem_evidence_download(
+    req: HttpRequest,
+    db: web::Data<DbPool>,
+    store: web::Data<Arc<dyn EvidenceStore>>,
+    path: web::Path<Uuid>,
+    body: web::Json<RedeemEvidenceDownloadRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let match_id = path.into_inner();
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    let claims = evidence_download_capability()?.verify(
+        &body.capability,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(ApiError::forbidden)?;
+    if claims.viewer_id != user_id {
+        return Err(ApiError::forbidden("Evidence capability belongs to another viewer"));
+    }
+
+    let dispute = sqlx::query_as!(
+        MatchDispute,
+        r#"
+        SELECT * FROM match_disputes
+        WHERE id = $1 AND match_id = $2
+          AND evidence_s3_key IS NOT NULL
+          AND evidence_deleted_at IS NULL
+          AND status NOT IN (2, 3)
+        "#,
+        claims.case_id,
+        match_id
+    )
+    .fetch_optional(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?
+    .ok_or_else(|| ApiError::forbidden("Evidence case is closed or unavailable"))?;
+    if dispute.evidence_s3_key.as_deref() != Some(claims.object_key.as_str()) {
+        return Err(ApiError::forbidden("Evidence capability object scope changed"));
+    }
+    let staff_access = has_staff_access(&req);
+    authorize_evidence_access(db.get_ref(), match_id, user_id, staff_access).await?;
+    evidence_download_capability()?
+        .consume(&claims)
+        .map_err(ApiError::forbidden)?;
+
+    let bytes = store.get(&claims.object_key).await?;
+    if hash_evidence(&bytes) != dispute.evidence_hash.as_deref().unwrap_or_default() {
+        return Err(ApiError::ServiceUnavailable(
+            "Stored dispute evidence failed its integrity check".to_string(),
+        ));
+    }
+    validate_evidence_size(bytes.len())?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+        VALUES ($1, 'DISPUTE_EVIDENCE_DOWNLOADED_BY_LINK', 'match_dispute', $2, $3)
+        "#,
+    )
+    .bind(user_id)
+    .bind(dispute.id)
+    .bind(serde_json::json!({ "match_id": match_id }).to_string())
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    let content_type = if claims.object_key.ends_with(".png") {
+        "image/png"
+    } else if claims.object_key.ends_with(".jpg") {
+        "image/jpeg"
+    } else if claims.object_key.ends_with(".webp") {
+        "image/webp"
+    } else {
+        return Err(ApiError::ServiceUnavailable(
+            "Stored dispute evidence has an unsupported file type".to_string(),
+        ));
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "private, no-store"))
+        .insert_header(("Content-Disposition", "attachment"))
+        .content_type(content_type)
+        .body(bytes))
+}
+
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/matches").service(
@@ -376,6 +544,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
                 .route("", web::get().to(get_match_dispute))
                 .route("/evidence", web::post().to(upload_dispute_evidence))
                 .route("/evidence", web::get().to(get_dispute_evidence))
+                .route("/evidence/download-link", web::post().to(issue_evidence_download_link))
+                .route("/evidence/download", web::post().to(redeem_evidence_download))
                 .route("/evidence/custody", web::get().to(get_evidence_custody))
                 .route("/evidence/legal-hold", web::put().to(set_evidence_legal_hold)),
         ),

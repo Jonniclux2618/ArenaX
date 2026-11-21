@@ -66,6 +66,15 @@ Run this drill at least monthly and before any release that changes the schema. 
 7. **Safe traffic cutover (production only).** If this drill is being used for an actual recovery: put the service in maintenance mode, drain in-flight requests, point the application at the restored database, verify `/ready`, then shift traffic gradually (canary → full) while watching error rates. Roll back by repointing to the previous database if validation fails.
 8. **Retain the report.** Store the drill report (date, operator, measured RTO, measured data loss, pass/fail, and any remediation) alongside the backup records.
 
+### Automated isolated failover drills
+
+The scheduled staging drill is implemented by
+`backend/scripts/run-dr-failover-drill.sh`. It refuses every non-staging target,
+records detection, promotion, connection recovery, and point-in-time integrity,
+and compares measured RPO/RTO with the 15-minute/60-minute PostgreSQL contract.
+CI or the infrastructure scheduler must retain the JSON report and assign a
+remediation owner whenever the drill fails. A drill is not a production cutover.
+
 ## Redis Failure Semantics & Recovery Policy
 
 Redis is used for **derived, rebuildable state only**. PostgreSQL (and the Stellar ledger for on-chain effects) is the single source of truth for all financial, match, session, and wallet state. No authoritative state may exist only in Redis.

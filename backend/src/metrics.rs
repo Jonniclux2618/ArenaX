@@ -130,6 +130,38 @@ pub static DEPENDENCY_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     gauge
 });
 
+// Feature-journey SLO indicators (Issue #285).
+pub static FEATURE_JOURNEY_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "feature_journey_requests_total",
+            "Critical user journeys with synthetic and real outcome",
+        ),
+        &["journey", "outcome", "component"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static FEATURE_JOURNEY_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let histogram = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "feature_journey_duration_seconds",
+            "End-to-end duration for critical user journeys",
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+        &["journey", "component"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("metric can be registered");
+    histogram
+});
+
 pub static PROFILE_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
         Opts::new("profile_cache_requests_total", "Profile cache reads by outcome"),

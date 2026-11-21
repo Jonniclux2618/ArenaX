@@ -252,7 +252,11 @@ impl S3EvidenceStore {
             bucket: config.s3_bucket.clone(),
             access_key: config.s3_access_key.clone(),
             secret_key: config.s3_secret_key.clone(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -338,13 +342,15 @@ impl S3EvidenceStore {
                 response.status()
             )));
         }
-        response
-            .bytes()
-            .await
-            .map(|body| body.to_vec())
-            .map_err(|e| {
-                ApiError::ServiceUnavailable(format!("Evidence storage response failed: {e}"))
-            })
+        let bytes = response.bytes().await.map_err(|e| {
+            ApiError::ServiceUnavailable(format!("Evidence storage response failed: {e}"))
+        })?;
+        if bytes.len() > MAX_EVIDENCE_BYTES {
+            return Err(ApiError::BadRequest(
+                "Evidence storage response exceeds the size limit".to_string(),
+            ));
+        }
+        Ok(bytes.to_vec())
     }
 }
 

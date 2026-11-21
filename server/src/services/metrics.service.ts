@@ -68,6 +68,20 @@ const activeConnections = getOrCreateGauge({
   help: 'Number of active connections',
 });
 
+// Feature-journey SLO metrics (issue #285)
+const featureJourneyRequests = getOrCreateCounter({
+  name: 'feature_journey_requests_total',
+  help: 'Critical user journey outcomes',
+  labelNames: ['journey', 'outcome', 'component'],
+});
+
+const featureJourneyDuration = getOrCreateHistogram({
+  name: 'feature_journey_duration_seconds',
+  help: 'End-to-end critical user journey duration',
+  labelNames: ['journey', 'component'],
+  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+});
+
 // Response size
 const responseSizeBytes = getOrCreateHistogram({
   name: 'response_size_bytes',
@@ -138,6 +152,17 @@ export class MetricsService {
   recordHttpRequest(method: string, route: string, statusCode: number, duration: number) {
     httpRequestDuration.observe({ method, route, status_code: statusCode }, duration);
     httpRequestTotal.inc({ method, route, status_code: statusCode });
+  }
+
+  // Feature-journey SLO accounting (issue #285)
+  recordFeatureJourney(
+    journey: 'login' | 'match' | 'payout',
+    component: string,
+    outcome: 'success' | 'failure',
+    durationSeconds: number,
+  ) {
+    featureJourneyRequests.inc({ journey, outcome, component });
+    featureJourneyDuration.observe({ journey, component }, durationSeconds);
   }
 
   recordResponseSize(route: string, size: number) {

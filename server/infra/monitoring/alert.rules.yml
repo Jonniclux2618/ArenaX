@@ -53,3 +53,32 @@ groups:
         annotations:
           summary: "High/critical application errors trending up"
           description: "More than 1/s of high or critical severity errors recorded via errors_total over the last 5 minutes."
+
+      - alert: FeatureJourneyFastBurn
+        expr: |
+          (
+            sum(rate(feature_journey_requests_total{outcome="failure",journey=~"login|match|payout"}[5m]))
+            /
+            clamp_min(sum(rate(feature_journey_requests_total{journey=~"login|match|payout"}[5m])), 1)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          slo: feature-journey
+        annotations:
+          summary: "Critical feature journey has a fast burn"
+          description: "Login, match, or payout user-impacting failure rate exceeded the 5% burn threshold for 5 minutes."
+
+      - alert: FeatureJourneyLatencyBurn
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(feature_journey_duration_seconds_bucket{journey=~"login|match|payout"}[5m])) by (le, journey)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          slo: feature-journey
+        annotations:
+          summary: "Critical feature journey p95 latency is burning"
+          description: "A login, match, or payout journey exceeded its 5-second p95 latency definition."

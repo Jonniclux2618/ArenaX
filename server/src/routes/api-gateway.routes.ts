@@ -11,14 +11,15 @@ import {
   adminListAllKeys,
   adminUpdateKeyPermissions,
 } from '../controllers/api-gateway.controller';
+import { requireStepUp } from '../services/step-up.service';
 
 const router: Router = Router();
 
 // User-facing API key management
-router.post('/keys', authenticateJWT, createApiKey);
+router.post('/keys', authenticateJWT, requireStepUp('api-key:create'), createApiKey);
 router.get('/keys', authenticateJWT, listApiKeys);
-router.delete('/keys/:id', authenticateJWT, revokeApiKey);
-router.post('/keys/:id/rotate', authenticateJWT, rotateApiKey);
+router.delete('/keys/:id', authenticateJWT, requireStepUp('api-key:revoke'), revokeApiKey);
+router.post('/keys/:id/rotate', authenticateJWT, requireStepUp('api-key:rotate'), rotateApiKey);
 router.get('/keys/:id/usage', authenticateJWT, getApiKeyUsage);
 
 // Admin routes

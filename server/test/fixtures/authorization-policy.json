@@ -1,0 +1,67 @@
+{
+  "operations": [
+    {
+      "operation": "tournament.read",
+      "principal": "USER",
+      "resource": "tournament",
+      "action": "read",
+      "permission": "tournaments:read",
+      "owner": "public",
+      "decision": "allow"
+    },
+    {
+      "operation": "tournament.write",
+      "principal": "TOURNAMENT_ORGANIZER",
+      "resource": "tournament",
+      "action": "write",
+      "permission": "tournaments:write",
+      "owner": "own",
+      "decision": "allow"
+    },
+    {
+      "operation": "user.write",
+      "principal": "USER",
+      "resource": "user",
+      "action": "write",
+      "permission": "users:write",
+      "owner": "own",
+      "decision": "deny"
+    },
+    {
+      "operation": "user.delete",
+      "principal": "ADMIN",
+      "resource": "user",
+      "action": "delete",
+      "permission": "users:delete",
+      "owner": "any",
+      "decision": "allow"
+    },
+    {
+      "operation": "payment.write",
+      "principal": "OPERATOR",
+      "resource": "payment",
+      "action": "write",
+      "permission": "payments:write",
+      "owner": "own",
+      "decision": "allow"
+    },
+    {
+      "operation": "payment.write",
+      "principal": "USER",
+      "resource": "payment",
+      "action": "write",
+      "permission": "payments:write",
+      "owner": "own",
+      "decision": "deny"
+    },
+    {
+      "operation": "moderation.write",
+      "principal": "MODERATOR",
+      "resource": "user",
+      "action": "write",
+      "permission": "moderation:write",
+      "owner": "any",
+      "decision": "allow"
+    }
+  ]
+}

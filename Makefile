@@ -1,6 +1,6 @@
 # ArenaX Development Makefile
 
-.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down
+.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down local-up local-down local-status local-seed
 
 # Default target
 help:
@@ -38,6 +38,10 @@ help:
 	@echo "  docker-build     Build Docker images"
 	@echo "  docker-up        Start services with Docker Compose"
 	@echo "  docker-down      Stop Docker services"
+	@echo "  local-up         Start local dependencies with health checks"
+	@echo "  local-down       Stop local dependencies (preserve volumes)"
+	@echo "  local-status     Show local dependency status"
+	@echo "  local-seed       Seed deterministic synthetic data once"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  clean            Clean all build artifacts"
@@ -139,6 +143,18 @@ docker-up:
 docker-down:
 	@echo "Stopping Docker services..."
 	@docker-compose down
+
+local-up:
+	@./scripts/local-dev.sh up
+
+local-down:
+	@./scripts/local-dev.sh down
+
+local-status:
+	@./scripts/local-dev.sh status
+
+local-seed:
+	@./scripts/local-dev.sh seed
 
 # Utilities
 clean:

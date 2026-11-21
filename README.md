@@ -52,3 +52,9 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-167 -->
+- #167: Propagate request deadlines and cancellation through service calls
+
+<!-- handsoff-issue-169 -->
+- #169: Build retry and dead-letter controls for background jobs

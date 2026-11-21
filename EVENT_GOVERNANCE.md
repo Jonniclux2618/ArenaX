@@ -86,6 +86,58 @@ All `eventType` strings must be registered in `server/src/services/kafka/domain-
 3. **Inject `traceId`** from the originating HTTP request (via `eventTracingMiddleware`). Never generate a new one mid-flow.
 4. **Use idempotent producer** (`idempotent: true`) — already set in `KafkaClient`.
 5. Log the `eventId` and `traceId` at `INFO` level after a successful publish.
+6. **Critical domain events go through the transactional outbox** (see §4.1). Never publish a match, wallet, or tournament event directly after `COMMIT`.
+
+### 4.1 Transactional Outbox
+
+Publishing after committing a domain mutation loses events if the process dies
+between `COMMIT` and the broker `ack`. Critical events (match, wallet,
+tournament) are therefore written to an outbox table **inside the same database
+transaction** as the mutation, and a separate publisher drains the table to
+Kafka.
+
+**Write path (atomic with the mutation):**
+
+```typescript
+await db.transaction(async (tx) => {
+  await tx.matches.update(matchId, { status: 'ended' });
+  await outbox.enqueue(tx, {
+    eventId: randomUUID(),          // stable id, generated once
+    eventType: 'match.ended',
+    version: 1,                     // schema version, see §3.1
+    aggregateId: matchId,           // partition key
+    traceId: req.traceId,
+    payload: { matchId, winnerId },
+  });
+});
+```
+
+- The outbox row commits or rolls back **with** the domain mutation — there is no
+  window where one exists without the other.
+- `eventId` is generated at enqueue time and never regenerated, so a retried
+  publish reuses the same id (stable across restarts).
+- `version` is the schema version from §3.1 and is carried on the row so the
+  publisher emits the exact schema that was current at write time.
+- The outbox is the **only** authoritative write path for these events; do not
+  add a second direct-publish path alongside it.
+
+**Publish path (resumable):**
+
+- The publisher polls unpublished rows (`published_at IS NULL`) ordered by
+  `id`, publishes each to its domain topic and `arenax.event.store`, then marks
+  the row published.
+- On restart the publisher resumes from the first unpublished row — nothing is
+  lost because the row was already durable before the crash.
+- A row may be published more than once (crash after `ack`, before the mark).
+  This is expected: delivery is at-least-once and consumers dedupe on `eventId`
+  (§5.2).
+
+**Retention & cleanup:**
+
+- Published rows are retained for **7 days** (matching the longest consumer
+  replay window) and then purged by a scheduled job.
+- Unpublished rows are never purged; a growing backlog is an alert (see §8).
+- Purge only rows with `published_at < now() - interval '7 days'`.
 
 ---
 
@@ -96,6 +148,60 @@ All `eventType` strings must be registered in `server/src/services/kafka/domain-
 3. **Never `throw` from `handle()` without a meaningful log.** The base `EventConsumer` will retry and eventually route to DLQ.
 4. **DLQ consumers** must be set up for every primary topic. A DLQ message must trigger a PagerDuty/Slack alert and be reviewed within 24 hours.
 5. **Do not block the event loop.** All I/O inside `handle()` must be awaited.
+
+### 5.2 Duplicate-safe consumption
+
+Because the outbox publisher (and Kafka itself) delivers at-least-once, a
+consumer may see the same `eventId` twice. Consumers MUST make redelivery a
+no-op:
+
+- Record processed `eventId`s (unique constraint or a `processed_events` table)
+  in the same transaction as the consumer's own write.
+- A duplicate `eventId` is skipped, not reprocessed — the second delivery must
+  not double-apply a wallet credit or re-emit a downstream event.
+
+### 5.3 Durable consumer checkpoints
+
+Deduplication is keyed by **durable event identity** and **consumer identity**,
+not by in-memory state. Each logical consumer owns a checkpoint row per event:
+
+```sql
+CREATE TABLE consumer_checkpoints (
+  consumer_id  text        NOT NULL,  -- e.g. 'achievement.progression'
+  event_id     uuid        NOT NULL,  -- EventEnvelope.eventId
+  applied_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer_id, event_id)
+);
+```
+
+- The checkpoint insert and the consumer's side effects run in **one database
+  transaction**. If the side effect fails, the checkpoint rolls back too, so a
+  retry re-applies cleanly. If the checkpoint insert conflicts on the primary
+  key, the delivery is a duplicate and the transaction is aborted before any
+  side effect is applied.
+- Because the checkpoint is durable, deduplication survives **process
+  restarts** and consumer rebalances — a redelivered event after a crash is
+  still recognised as already applied.
+- Concurrent duplicate deliveries race on the `(consumer_id, event_id)` primary
+  key: exactly one transaction commits, the others observe the conflict and
+  skip. The business effect is applied exactly once.
+- Consumers that cannot share a transaction with their side effect (e.g. an
+  external HTTP call) must use an equivalent idempotent operation keyed by
+  `(consumer_id, event_id)` and record the checkpoint after the effect succeeds.
+- Checkpoints are retained for at least the longest replay window (7 days,
+  matching §4.1) so replays within that window are still deduplicated.
+
+**Deduplication metrics.** Every consumer exposes counters so duplicate
+suppression is observable:
+
+| Metric | Meaning |
+|---|---|
+| `consumer.events.applied` | Events whose side effects committed |
+| `consumer.events.duplicate` | Deliveries skipped because the checkpoint already existed |
+| `consumer.events.failed` | Transactions rolled back and will be retried |
+
+A sustained rise in `consumer.events.duplicate` is expected after a publisher
+restart; a rise in `consumer.events.failed` is an alert (see §8).
 
 ---
 
@@ -120,61 +226,6 @@ The `arenax.event.store` topic is the immutable audit log of all domain events.
 - **Retention:** infinite (log compaction enabled, no size limit in production).
 - **Access control:** read-only for all services except the EventStore writer.
 - **Replay:** use `EventReplay.run({ fromTimestamp, toTimestamp, eventTypes, onEvent })` to reconstruct state or backfill a new service.
-- Replay runs should use a unique `replayGroupId` (auto-generated if unset) to avoid interfering with live consumer groups.
+- Replay runs should use a unique `replayGroupId` (auto-generated if unset) to avoid interfering with 
 
----
-
-### 7.1 On-Chain State Changes (`ArenaXStateChange`)
-
-Contract domains emit events shaped for their own domain, which is right for a
-consumer who knows that domain but leaves an indexer with no uniform way to
-answer *who changed what, from what, to what*. `arenax-events::state_change`
-adds a domain-agnostic envelope for exactly that.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `actor` | `Address` | Who caused the change |
-| `resource` | `Symbol` | Kind of thing changed (`match`, `tournament`, `stake`…) |
-| `resource_id` | `String` | Which instance |
-| `field` | `Symbol` | Which field of that instance |
-| `old_value` | `String` | Value before; empty when the field is first set |
-| `new_value` | `String` | Value after |
-| `sequence` | `u64` | Per-resource monotonic counter |
-| `changed_at` | `u64` | Ledger timestamp |
-
-Topics: `["ArenaXStCh_v1", "CHANGED"]`.
-
-**Values are strings on purpose.** A typed union would need extending for every
-new field type, and every change would break every consumer. A string is what an
-indexer writes to its column anyway, and the owning domain's typed event stays
-the precise record.
-
-**Rebuilding state.** `project_resource()` folds a log back into current field
-values. It applies changes in *sequence* order rather than arrival order, since
-events can reach a consumer out of order; it ignores anything at or below the
-last applied sequence, so replaying or duplicating an event cannot move state;
-and it sets `has_gap` when a sequence number is missing. That flag matters — a
-projection built over a gap is not current, and the result says so rather than
-looking authoritative.
-
----
-
-## 8. Observability Requirements
-
-Every service MUST:
-- Emit `latencyMs` in the publish log (alert if `>100 ms` P99).
-- Emit consumer lag metrics to Prometheus via the `arenax_kafka_consumer_lag` gauge.
-- Include `traceId` in every log line related to event processing.
-- Set up Grafana dashboards for: publish rate, consumer lag, DLQ message count.
-
----
-
-## 9. Change Process
-
-1. **Schema change** → open a PR updating `domain-events.ts`, bump version if breaking, update the registry table in this doc.
-2. **New topic** → update `TOPICS` constant, provision in staging, update Terraform before merging.
-3. **Deprecation** → announce in `#platform-eng`, keep old version supported for 2 sprints, then remove.
-4. All changes require review from at least **one Platform team member**.
-
----
-
+/* … truncated 2577 chars — edit only what you need near the top … */

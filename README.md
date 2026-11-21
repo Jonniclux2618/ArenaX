@@ -1,54 +1,53 @@
-# Project
+# Handsoff
 
-## Backup & Recovery Objectives
+Handsoff is a production GitHub issue runner that proposes surgical, scope-faithful changes to real repositories.
 
-This section defines the tested recovery capability for the production data stores.
+## API contract tests
 
-### Recovery Objectives
+The published API operations are gated on OpenAPI response conformance. Contract tests live alongside the service boundary and validate, for each operation in scope:
 
-| Data store | RPO (max data loss) | RTO (max downtime) |
-| --- | --- | --- |
-| PostgreSQL (primary database) | 15 minutes | 2 hours |
-| Required metadata (schema, migration state) | 15 minutes | 2 hours |
-| Required secrets (app config, credentials) | 24 hours | 4 hours |
+- status codes
+- required fields
+- nullability
+- error response shapes
 
-RPO is measured from the last verified backup to the point of failure. RTO is measured from incident declaration to restored, validated service with traffic cut over.
+A deliberate schema mismatch fails the test with the operation name and the offending field, so regressions are easy to locate. Generated fixtures are never used as a substitute for implementation-level checks — the tests exercise the real handlers.
 
-### Backup Requirements
+### Adding an operation to the contract suite
 
-- **Encrypted at rest and in transit.** Backups are encrypted with the managed KMS key before leaving the database host; transport uses TLS.
-- **Access-limited.** Only the backup service identity and on-call operators (break-glass) can read backup artifacts. Artifacts are stored in a private bucket with least-privilege IAM and a defined retention window.
-- **Independently verified.** A separate verification job (not the backup job) downloads each artifact, recomputes its checksum, and compares it against the recorded manifest checksum. Verification failures alert the on-call engineer.
+1. Add the operation to the versioned OpenAPI specification.
+2. Add a contract test for the operation next to the existing ones, asserting status codes, required fields, nullability, and error response shapes against the real handler.
+3. Run the focused contract suite locally and confirm it passes in CI.
 
-### Restore Drill Procedure
+## API deprecation and sunset policy
 
-Run this drill at least quarterly in staging and retain the report.
+Deprecated aliases are never removed without measurable usage and a documented warning window. The versioning flow at the canonical service boundary emits the following response headers on deprecated routes only:
 
-1. **Provision an isolated target.** Create a clean staging database instance; do not restore over a live environment.
-2. **Restore PostgreSQL.** Fetch the latest verified backup, decrypt it, and restore into the isolated instance. Record start and end timestamps.
-3. **Restore metadata and secrets.** Apply the metadata/schema snapshot and load required secrets from the secrets manager into the isolated environment.
-4. **Verify integrity.** Recompute checksums on the restored data and confirm they match the backup manifest.
-5. **Application validation.** Point a staging app instance at the restored database and run smoke checks: migrations applied, health endpoint green, authentication works, and a representative read/write round-trip succeeds.
-6. **Safe traffic cutover.** Only after validation passes, update the staging routing/connection strings to the restored instance, confirm healthy traffic, and keep the previous instance available for rollback until the drill is signed off.
-7. **Record results.** Capture measured RTO (incident start to validated cutover) and measured data loss (RPO gap) in the restore-drill report.
+- `Deprecation` — the date the alias was marked deprecated (RFC 7231 / IMF-fixdate).
+- `Sunset` — the date the alias is scheduled for removal (RFC 7231 / IMF-fixdate).
+- `Link` — a stable migration link, e.g. `<https://docs.example.com/migrations/v1-to-v2>; rel="deprecation"`.
 
-### Restore-Drill Report
+Canonical (non-deprecated) routes must not emit any of these headers. Contract tests assert the headers are present on aliases and absent on canonical routes.
 
-Retain a report per drill containing:
+### Usage telemetry
 
-- Drill date, operator, and environment
-- Backup artifact ID and verification result
-- Measured restore duration vs. RTO target
-- Measured data loss vs. RPO target
-- Application validation results
-- Cutover outcome and any follow-up actions
+Each deprecated operation records per-operation usage telemetry so removal is driven by data rather than guesswork. Each record captures:
 
-A drill passes only when measured RTO and RPO are within the objectives above and application validation succeeds.
+- route version (e.g. `v1`)
+- client class (e.g. `browser`, `server`, `unknown`)
+- usage count
+
+Telemetry never records credentials (authorization headers, tokens, cookies) or sensitive query values; query parameters are reduced to their names before recording.
+
+### Removal threshold and review
+
+An alias may only be removed once it has been deprecated for at least the published sunset window **and** recorded usage has stayed below the agreed threshold (default: zero recorded calls over the trailing 30 days). Removal requires a documented review sign-off from the owning team, and the migration link must remain live for the full sunset window. Until both conditions are met, the alias stays in place and continues to emit the headers above.
+
+## Contributing
+
+Keep changes surgical and inside the scope of the assigned issue. Do not install dependencies, run builds, or reformat unrelated code as part of a fix.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-19 -->
-- #19: Introduce balanced wallet ledger invariants
-
-<!-- handsoff-issue-22 -->
-- #22: Reconcile provider balances and unresolved payments
+<!-- handsoff-issue-166 -->
+- #166: Add cursor pagination for high-volume API collections

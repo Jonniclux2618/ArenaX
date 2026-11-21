@@ -11,6 +11,7 @@
 - `src/` — application source.
 - `src/auth/` — authentication service boundary (password, OTP, and passkey flows).
 - `tests/` — automated coverage.
+- `tests/contract/` — OpenAPI response-conformance contract tests.
 
 ## Authentication
 
@@ -53,6 +54,30 @@ boundaries. At minimum cover:
 - cloned credential metadata (sign-counter regression),
 - multi-device registration,
 - fallback behavior for unsupported clients.
+
+## API contract tests
+
+The versioned OpenAPI specification is the source of truth for published operations. Contract
+tests in `tests/contract/` exercise the real service boundary (not generated fixtures) and
+assert, for each operation in scope:
+
+- the response **status code**,
+- **required fields** are present,
+- **nullability** matches the schema (nullable fields may be `null`; non-nullable fields may not),
+- **error response shapes** for the documented failure statuses.
+
+A deliberate schema mismatch must fail the test and report the offending **operation** and
+**field** so the failure is actionable. Generated fixtures are never a substitute for these
+implementation-level checks.
+
+### Adding an operation to the contract suite
+
+1. Add or update the operation in the versioned OpenAPI specification.
+2. Add a case under `tests/contract/` that calls the real handler/service for that operation and
+   asserts status code, required fields, nullability, and error shapes against the spec.
+3. Include at least one failure-path case (e.g. authorization or validation error) so error
+   response shapes are covered.
+4. Run the focused contract suite locally and confirm CI runs it on every change.
 
 ## Contributing
 

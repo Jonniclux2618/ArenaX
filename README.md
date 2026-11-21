@@ -52,3 +52,9 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-195 -->
+- #195: Create immutable ranked-season rating snapshots
+
+<!-- handsoff-issue-197 -->
+- #197: Make player-stat read models rebuildable from authoritative events

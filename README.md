@@ -45,6 +45,29 @@ Retain a report per drill containing:
 
 A drill passes only when measured RTO and RPO are within the objectives above and application validation succeeds.
 
+## API Boundary Conventions
+
+All canonical service responses use explicit boundary representations so clients never have to infer formatting.
+
+### Money
+
+- Monetary amounts are returned as an **exact decimal string** (e.g. `"1234.50"`) paired with an explicit ISO 4217 `currency` code (e.g. `"USD"`).
+- Amounts are never returned as floats or as bare minor units; clients must not assume a scale.
+
+### Timestamps
+
+- All timestamps are emitted as **unambiguous UTC instants** in RFC 3339 form with a `Z` offset (e.g. `"2024-03-10T07:30:00Z"`).
+- Local times and offset-less values are never returned; daylight-saving transitions therefore cannot change the meaning of a stored instant.
+
+### Locale
+
+- `locale` is an explicit client **preference** (BCP 47, e.g. `"en-US"`), not a server-inferred formatting decision.
+- When a requested locale is unsupported, the service falls back to the documented default locale and reports the resolved locale in the response.
+
+### Validation
+
+- Invalid or unsupported `locale`, `currency`, or `timezone` input is rejected with a **typed validation error** (a stable error code plus the offending field) rather than being silently coerced or formatted server-dependently.
+
 ## Handsoff notes
 
 <!-- handsoff-issue-19 -->
@@ -52,3 +75,15 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-175 -->
+- #175: Correlate audit records across a complete user action
+
+<!-- handsoff-issue-176 -->
+- #176: Add contract tests for every external provider adapter
+
+<!-- handsoff-issue-177 -->
+- #177: Normalize locale, currency, and timezone at API boundaries
+
+<!-- handsoff-issue-178 -->
+- #178: Complete the Rust party lifecycle API

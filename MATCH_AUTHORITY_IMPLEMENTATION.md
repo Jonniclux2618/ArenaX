@@ -20,6 +20,7 @@ The Match Authority Backend Service has been successfully implemented as the cen
    - `match_chain_sync` - Blockchain transaction tracking
    - `match_reconciliation_log` - Divergence detection between on-chain/off-chain
    - `match_operations` - Idempotency key tracking
+   - `match_event_timeline` - Bounded, privacy-aware event timeline (see below)
    - Database triggers for automatic FSM validation
    - Views for monitoring (active matches, pending ops, divergent matches)
 
@@ -30,6 +31,7 @@ The Match Authority Backend Service has been successfully implemented as the cen
    - State transition recording
    - Idempotency guarantees
    - Reconciliation mechanisms
+   - Timeline recording at the canonical service boundary
 
 4. **API Layer** ([backend/src/http/match_authority_handler.rs](backend/src/http/match_authority_handler.rs))
    - REST endpoints for match lifecycle operations
@@ -109,6 +111,8 @@ pub struct MatchTransition {
 | `POST` | `/api/matches/:id/dispute` | Raise dispute |
 | `POST` | `/api/matches/:id/finalize` | Finalize & settle on-chain |
 | `POST` | `/api/matches/:id/reconcile` | Reconcile on-chain/off-chain state |
+| `GET` | `/api/matches/:id/timeline` | Authorized, redacted event timeline |
+| `GET` | `/api/matches/:id/timeline/export` | Authorized timeline export (support/dispute) |
 | `WS` | `/ws/matches/:id` | Subscribe to real-time updates |
 
 ### 4. Blockchain Integration
@@ -132,6 +136,7 @@ Each state transition triggers a corresponding Soroban contract call:
 5. Update local state
 6. Monitor transaction status
 7. Record state transition
+8. Append a redacted timeline entry (see §7)
 
 ### 5. Safety Guarantees
 
@@ -202,6 +207,56 @@ pub async fn reconcile_match(&self, match_id: Uuid) -> Result<bool, ApiError> {
 {"type": "pong"}
 ```
 
+### 7. Privacy-Aware Match Event Timeline
+
+A finalized score is hard to investigate without a structured record of authoritative state changes. The service persists a **bounded, privacy-aware event timeline** at the canonical service boundary (`MatchAuthorityService`), suitable for support and dispute review.
+
+#### Entry Shape
+
+Each timeline entry references only non-sensitive, authoritative fields:
+
+```rust
+pub struct MatchTimelineEntry {
+    pub match_id: Uuid,
+    pub sequence: i64,          // monotonic per-match ordering
+    pub event_type: String,     // e.g. "state_transition", "chain_sync", "reconcile"
+    pub actor_class: String,    // "player" | "operator" | "system" | "chain"
+    pub timestamp: DateTime<Utc>,
+    pub summary: serde_json::Value, // redacted, bounded payload
+}
+```
+
+- **actor class** — coarse classification only; never raw user identifiers beyond the match participants already stored on the entity.
+- **event type** — enumerated authoritative event kinds.
+- **sequence** — strictly increasing per match; assigned server-side.
+- **timestamp** — server clock at append time.
+
+#### Redaction
+
+Timeline entries **must not** store secrets or unrestricted chat content. The service applies a redaction step before persistence:
+
+- API tokens, session identifiers, and signing material are stripped.
+- Free-form chat/message bodies are excluded; only derived, bounded signals (e.g. message counts, moderation flags) may be recorded.
+- Payloads are size-bounded; oversized fields are truncated or dropped.
+
+#### Authorization
+
+Timeline read and export are authorized: only the match participants, operators, and dispute reviewers may access a match's timeline. Unauthorized callers receive `403 Forbidden`. Export uses the same authorization gate as read.
+
+#### Retention
+
+Retention is explicit and enforced:
+
+- Timeline entries are retained for a defined window (e.g. 180 days after `FINALIZED`).
+- A retention sweep deletes entries past the window; expired entries are not returned by read or export.
+- Retention policy is documented alongside the schema.
+
+#### Immutability & Replay Protection
+
+- Finalized match and tournament records are immutable except through an explicit audited correction flow.
+- Late or replayed events **cannot rewrite** the finalized record: appends after `FINALIZED` are rejected unless they arrive through the audited correction flow, and sequence numbers prevent out-of-order overwrites.
+- Duplicate/replayed events are detected via sequence + idempotency and dropped rather than re-applied.
+
 ## Testing
 
 Comprehensive test coverage includes:
@@ -224,6 +279,14 @@ Comprehensive test coverage includes:
    - Message serialization
    - Connection lifecycle
 
+5. **Timeline Tests**
+   - Ordering (monotonic sequence) for a completed match
+   - Redaction (no secrets / chat content persisted)
+   - Retention expiry (expired entries excluded from read/export)
+   - Export behavior for a completed match
+   - Authorization (unauthorized read/export denied)
+   - Failure handling and replay/concurrency (late/replayed events cannot rewrite finalized record)
+
 ## Database Schema
 
 ### Key Tables
@@ -239,6 +302,12 @@ Comprehensive test coverage includes:
 - Records actor, timestamp, chain_tx
 - Stores metadata and errors
 - Enables forensics and debugging
+
+**match_event_timeline**
+- Bounded, privacy-aware event timeline
+- Columns: `match_id`, `sequence`, `event_type`, `actor_class`, `timestamp`, `summary`
+- Unique `(match_id, sequence)` prevents replay/overwrite
+- Retention window enforced by sweep; expired rows excluded from reads
 
 **match_chain_sync**
 - Tracks blockchain operation status
@@ -261,141 +330,4 @@ Comprehensive test coverage includes:
 ### Database Views
 
 1. **active_matches** - Non-finalized matches with stats
-2. **pending_chain_ops** - Operations awaiting blockchain confirmation
-3. **divergent_matches** - Matches needing reconciliation
-
-## Security Considerations
-
-### Access Control
-- Protocol-controlled signing key for blockchain operations
-- Player validation for dispute raising
-- Winner validation (must be one of the match players)
-
-### Data Integrity
-- Database-level constraints
-- FSM validation triggers
-- Unique constraints on critical fields
-
-### Blockchain Safety
-- Pre-submission validation
-- Transaction hash persistence
-- Operation retry tracking
-- Reconciliation mechanisms
-
-## Operational Notes
-
-### Running Migrations
-```bash
-cd backend
-sqlx migrate run
-```
-
-### Environment Variables Required
-```env
-DATABASE_URL=postgresql://user:pass@localhost:5432/arenax
-SOROBAN_RPC_URL=https://soroban-testnet.stellar.org:443
-MATCH_LIFECYCLE_CONTRACT=C123...
-PROTOCOL_SIGNER_SECRET=S123...
-```
-
-### Monitoring Queries
-
-**Check pending operations:**
-```sql
-SELECT * FROM pending_chain_ops;
-```
-
-**Find divergent matches:**
-```sql
-SELECT * FROM divergent_matches;
-```
-
-**View match history:**
-```sql
-SELECT * FROM match_transitions WHERE match_id = $1 ORDER BY timestamp ASC;
-```
-
-## Integration Guide
-
-### Creating a Match
-```rust
-let dto = CreateMatchDTO {
-    player_a: "GAAAAA...".to_string(),
-    player_b: "GBBBBB...".to_string(),
-    idempotency_key: Some("unique-key".to_string()),
-};
-
-let match_response = service
-    .create_match(dto, &signer_secret)
-    .await?;
-```
-
-### Subscribing to Match Updates (WebSocket)
-```javascript
-const ws = new WebSocket('ws://localhost:8080/ws/matches/{match_id}');
-
-ws.send(JSON.stringify({
-  type: 'subscribe',
-  match_id: match_id
-}));
-
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data);
-  if (msg.type === 'match_state_changed') {
-    console.log(`Match transitioned: ${msg.from_state} → ${msg.to_state}`);
-  }
-};
-```
-
-## Files Created/Modified
-
-### New Files
-1. `backend/migrations/20240930000001_create_match_authority.up.sql`
-2. `backend/migrations/20240930000001_create_match_authority.down.sql`
-3. `backend/src/models/match_authority.rs`
-4. `backend/src/service/match_authority_service.rs`
-5. `backend/src/service/match_authority_service_test.rs`
-6. `backend/src/http/match_authority_handler.rs`
-7. `backend/src/http/match_ws_handler.rs`
-
-### Modified Files
-1. `backend/src/models/mod.rs` - Added match_authority module
-2. `backend/src/service/mod.rs` - Added match_authority_service module
-3. `backend/src/http/mod.rs` - Added match_authority_handler and match_ws_handler modules
-4. `backend/Cargo.toml` - Added actix and actix-web-actors dependencies
-
-## Key Features Delivered
-
-✅ **Temporal Authority**: Backend controls when actions happen
-✅ **FSM Enforcement**: Strict state machine validation
-✅ **Blockchain Integration**: Full Soroban contract lifecycle
-✅ **Idempotency**: Duplicate prevention with unique keys
-✅ **State Reconciliation**: Detect and resolve divergence
-✅ **Audit Trail**: Complete transition history
-✅ **Real-time Updates**: WebSocket subscription support
-✅ **Safety Guarantees**: No duplicate creation, double settlement, or invalid transitions
-✅ **Comprehensive Testing**: Unit and integration tests
-✅ **Database Integrity**: Triggers, constraints, and views
-
-## Next Steps
-
-1. **Deploy Migrations**: Run migrations on staging/production databases
-2. **Configure Environment**: Set up environment variables for blockchain integration
-3. **Deploy Soroban Contracts**: Deploy match lifecycle contracts to Stellar
-4. **Integration Testing**: End-to-end testing with real blockchain
-5. **Monitoring Setup**: Configure alerts for divergent matches and failed operations
-6. **Load Testing**: Validate performance under concurrent match operations
-7. **Documentation**: API documentation with OpenAPI/Swagger
-
-## Conclusion
-
-The Match Authority & State Synchronization Service provides a robust, auditable, and safe foundation for managing competitive matches in ArenaX. It successfully bridges off-chain temporal control with on-chain finality, ensuring data integrity through comprehensive FSM enforcement, idempotency guarantees, and reconciliation mechanisms.
-
-The implementation adheres to enterprise-grade standards with comprehensive testing, database-level safety constraints, and real-time monitoring capabilities. The service is production-ready and awaits deployment of the corresponding Soroban smart contracts.
-
----
-
-**Implementation Date**: January 29, 2026
-**Tech Stack**: Rust, Actix-web, PostgreSQL, SQLx, Soroban/Stellar, WebSockets
-**LOC**: ~2,500 lines (including tests and migrations)
-**Test Coverage**: Comprehensive unit and integration tests
+2. **pending_chain_ops** - Operations awaiting chain confirmation

@@ -165,7 +165,38 @@ pub async fn reconcile_match(&self, match_id: Uuid) -> Result<bool, ApiError> {
 }
 ```
 
-### 6. WebSocket Protocol
+### 6. Atomic Party Matchmaking
+
+The matchmaking queue treats a party as a single reservation unit. The canonical
+service boundary (`MatchmakingService`) is the only authoritative write path for
+queue insertion and reservation; HTTP/WS handlers delegate to it and never mutate
+queue state directly.
+
+#### Reservation Rules
+- A party is inserted into the queue only if **every** member is eligible
+  (connected, not already reserved, not in an active match). If any member is
+  ineligible the whole party is rejected and **no** partial membership is written.
+- Reservation is performed in a single transaction: the party is claimed as one
+  unit with a bounded eligibility window. Concurrent matchmaking attempts on the
+  same party are serialized via a per-party lock / `SELECT ... FOR UPDATE`, so a
+  party can never be reserved by two matches.
+- Reservation carries an expiry (`reservation_expires_at`). Expired reservations
+  are released back to the queue by the sweeper, never silently dropped.
+
+#### Cancellation & Leader Departure
+- Cancelling a queued party removes the entire reservation atomically.
+- If the party leader departs, the reservation is released (or transferred per
+  the party leader-transfer flow) before any match is formed; a party without a
+  leader is never matched.
+- Match formation re-validates the full party inside the same transaction that
+  creates the match, preventing duplicate matches from concurrent workers.
+
+#### Metrics
+- `matchmaking.party.rejected` (reason: ineligible member, size bounds)
+- `matchmaking.party.reservation_expired`
+- `matchmaking.party.reservation_conflict` (concurrent claim lost)
+
+### 7. WebSocket Protocol
 
 #### Client → Server
 ```json
@@ -224,6 +255,11 @@ Comprehensive test coverage includes:
    - Message serialization
    - Connection lifecycle
 
+5. **Matchmaking Party Tests**
+   - Property tests over group-size bounds (min/max party size)
+   - Race boundaries: concurrent reservation attempts yield exactly one match
+   - Cancellation and leader-departure release reservations without stranding
+
 ## Database Schema
 
 ### Key Tables
@@ -261,141 +297,4 @@ Comprehensive test coverage includes:
 ### Database Views
 
 1. **active_matches** - Non-finalized matches with stats
-2. **pending_chain_ops** - Operations awaiting blockchain confirmation
-3. **divergent_matches** - Matches needing reconciliation
-
-## Security Considerations
-
-### Access Control
-- Protocol-controlled signing key for blockchain operations
-- Player validation for dispute raising
-- Winner validation (must be one of the match players)
-
-### Data Integrity
-- Database-level constraints
-- FSM validation triggers
-- Unique constraints on critical fields
-
-### Blockchain Safety
-- Pre-submission validation
-- Transaction hash persistence
-- Operation retry tracking
-- Reconciliation mechanisms
-
-## Operational Notes
-
-### Running Migrations
-```bash
-cd backend
-sqlx migrate run
-```
-
-### Environment Variables Required
-```env
-DATABASE_URL=postgresql://user:pass@localhost:5432/arenax
-SOROBAN_RPC_URL=https://soroban-testnet.stellar.org:443
-MATCH_LIFECYCLE_CONTRACT=C123...
-PROTOCOL_SIGNER_SECRET=S123...
-```
-
-### Monitoring Queries
-
-**Check pending operations:**
-```sql
-SELECT * FROM pending_chain_ops;
-```
-
-**Find divergent matches:**
-```sql
-SELECT * FROM divergent_matches;
-```
-
-**View match history:**
-```sql
-SELECT * FROM match_transitions WHERE match_id = $1 ORDER BY timestamp ASC;
-```
-
-## Integration Guide
-
-### Creating a Match
-```rust
-let dto = CreateMatchDTO {
-    player_a: "GAAAAA...".to_string(),
-    player_b: "GBBBBB...".to_string(),
-    idempotency_key: Some("unique-key".to_string()),
-};
-
-let match_response = service
-    .create_match(dto, &signer_secret)
-    .await?;
-```
-
-### Subscribing to Match Updates (WebSocket)
-```javascript
-const ws = new WebSocket('ws://localhost:8080/ws/matches/{match_id}');
-
-ws.send(JSON.stringify({
-  type: 'subscribe',
-  match_id: match_id
-}));
-
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data);
-  if (msg.type === 'match_state_changed') {
-    console.log(`Match transitioned: ${msg.from_state} → ${msg.to_state}`);
-  }
-};
-```
-
-## Files Created/Modified
-
-### New Files
-1. `backend/migrations/20240930000001_create_match_authority.up.sql`
-2. `backend/migrations/20240930000001_create_match_authority.down.sql`
-3. `backend/src/models/match_authority.rs`
-4. `backend/src/service/match_authority_service.rs`
-5. `backend/src/service/match_authority_service_test.rs`
-6. `backend/src/http/match_authority_handler.rs`
-7. `backend/src/http/match_ws_handler.rs`
-
-### Modified Files
-1. `backend/src/models/mod.rs` - Added match_authority module
-2. `backend/src/service/mod.rs` - Added match_authority_service module
-3. `backend/src/http/mod.rs` - Added match_authority_handler and match_ws_handler modules
-4. `backend/Cargo.toml` - Added actix and actix-web-actors dependencies
-
-## Key Features Delivered
-
-✅ **Temporal Authority**: Backend controls when actions happen
-✅ **FSM Enforcement**: Strict state machine validation
-✅ **Blockchain Integration**: Full Soroban contract lifecycle
-✅ **Idempotency**: Duplicate prevention with unique keys
-✅ **State Reconciliation**: Detect and resolve divergence
-✅ **Audit Trail**: Complete transition history
-✅ **Real-time Updates**: WebSocket subscription support
-✅ **Safety Guarantees**: No duplicate creation, double settlement, or invalid transitions
-✅ **Comprehensive Testing**: Unit and integration tests
-✅ **Database Integrity**: Triggers, constraints, and views
-
-## Next Steps
-
-1. **Deploy Migrations**: Run migrations on staging/production databases
-2. **Configure Environment**: Set up environment variables for blockchain integration
-3. **Deploy Soroban Contracts**: Deploy match lifecycle contracts to Stellar
-4. **Integration Testing**: End-to-end testing with real blockchain
-5. **Monitoring Setup**: Configure alerts for divergent matches and failed operations
-6. **Load Testing**: Validate performance under concurrent match operations
-7. **Documentation**: API documentation with OpenAPI/Swagger
-
-## Conclusion
-
-The Match Authority & State Synchronization Service provides a robust, auditable, and safe foundation for managing competitive matches in ArenaX. It successfully bridges off-chain temporal control with on-chain finality, ensuring data integrity through comprehensive FSM enforcement, idempotency guarantees, and reconciliation mechanisms.
-
-The implementation adheres to enterprise-grade standards with comprehensive testing, database-level safety constraints, and real-time monitoring capabilities. The service is production-ready and awaits deployment of the corresponding Soroban smart contracts.
-
----
-
-**Implementation Date**: January 29, 2026
-**Tech Stack**: Rust, Actix-web, PostgreSQL, SQLx, Soroban/Stellar, WebSockets
-**LOC**: ~2,500 lines (including tests and migrations)
-**Test Coverage**: Comprehensive unit and integration tests
+2. **pending_chain_ops** - Opera

@@ -52,3 +52,15 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-215 -->
+- #215: Represent chargebacks and reversals as immutable ledger adjustments
+
+<!-- handsoff-issue-216 -->
+- #216: Add verified withdrawal destination changes with a cooling period
+
+<!-- handsoff-issue-217 -->
+- #217: Route high-risk withdrawals through a dual-control review queue
+
+<!-- handsoff-issue-218 -->
+- #218: Create an aged payment-reconciliation exception queue

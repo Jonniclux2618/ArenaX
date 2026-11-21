@@ -5,3 +5,11 @@
 # NOTE: Commented out because it requires .sqlx cache to be pre-generated
 # To enable offline mode, run: cargo sqlx prepare
 # SQLX_OFFLINE = "true"
+
+[alias]
+# Track per-entrypoint Soroban resource budgets (CPU instructions, memory,
+# ledger reads/writes) for representative entrypoints and compare them against
+# reviewed, versioned budgets. Fails with the entrypoint and per-resource delta
+# on regression. Intentional increases require a documented review (see
+# backend/soroban-budgets/README.md).
+resource-budgets = "run --quiet --manifest-path soroban-budgets/Cargo.toml --"

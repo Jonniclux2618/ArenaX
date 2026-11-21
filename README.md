@@ -45,6 +45,30 @@ Retain a report per drill containing:
 
 A drill passes only when measured RTO and RPO are within the objectives above and application validation succeeds.
 
+## Economic Simulation
+
+The token and marketplace economics are exercised by a deterministic simulation that models multiple user archetypes, adversarial behavior, emission schedules, and liquidity shocks. It is a decision aid, not proof of safety.
+
+### Scenario Inputs
+
+Scenarios are checked in under `simulation/scenarios/` as versioned JSON. Each scenario pins the seed, archetype mix, adversarial actors, emission schedule, and liquidity-shock timeline so a run is reproducible from the checked-in inputs alone. Changing a scenario is a reviewed change to that file.
+
+### Report Thresholds
+
+The simulation report surfaces three classes of thresholds:
+
+- **Solvency** — treasury/emission runway must stay positive across the full horizon under every scenario.
+- **Concentration** — no single actor or archetype may exceed the reviewed share of supply or marketplace volume.
+- **Sensitivity** — the report flags parameters whose small perturbation flips a solvency or concentration outcome.
+
+### CI Smoke Scenarios
+
+CI runs a small set of smoke scenarios with reviewed bounds. A smoke run fails when a scenario breaches its reviewed solvency, concentration, or sensitivity bounds. Focused tests cover retry, failure, and duplicate-delivery cases so the simulation harness itself is trusted.
+
+### Updating Assumptions
+
+Maintainers update assumptions by editing the checked-in scenario inputs and the reviewed bounds, then re-running the simulation and attaching the report to the change. Simulation results inform review; they do not replace audits, monitoring, or on-chain invariants.
+
 ## Handsoff notes
 
 <!-- handsoff-issue-19 -->
@@ -52,3 +76,9 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
+
+<!-- handsoff-issue-232 -->
+- #232: Reconcile off-chain settlement records with finalized contract events
+
+<!-- handsoff-issue-234 -->
+- #234: Simulate token and marketplace economics under adversarial demand

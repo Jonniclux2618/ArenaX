@@ -1,0 +1,26 @@
+{
+  "_comment": "Scheduled database failover drill — issue #284.",
+  "_doc": "This file is consumed by the CI/CD scheduler (e.g. GitHub Actions cron or a Kubernetes CronJob). It wires run-dr-failover-drill.sh to a regular isolated staging drill so the RPO/RTO targets are measured, not just documented.",
+  "schedule": {
+    "cron": "0 3 * * 1",
+    "timezone": "UTC",
+    "description": "Every Monday at 03:00 UTC — outside peak hours, inside the documented maintenance window"
+  },
+  "environment": "staging",
+  "command": "bash backend/scripts/run-dr-failover-drill.sh --environment staging",
+  "report_dir": "dr-drill-reports",
+  "retention_days": 90,
+  "targets": {
+    "rpo_seconds": 900,
+    "rto_seconds": 3600
+  },
+  "failure_policy": {
+    "on_missed_target": "open_remediation_issue",
+    "notify": ["on-call"],
+    "block_production_promotion": true
+  },
+  "safety": {
+    "production_target_allowed": false,
+    "require_explicit_environment_flag": true
+  }
+}

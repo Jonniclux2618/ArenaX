@@ -1,4 +1,17 @@
 //! Centralized outbound HTTP destination policy for provider integrations.
+//!
+//! # Security properties
+//! - Allowed hosts and schemes are explicit per integration via [`OutboundPolicy::https`].
+//! - DNS results are checked against prohibited private/link-local/metadata ranges before
+//!   any connection is attempted ([`is_prohibited_address`]).
+//! - Redirects are disabled at the HTTP client level; callers that need to follow a redirect
+//!   must call [`OutboundPolicy::validate_redirect`] first so the target is re-validated.
+//! - Credentials (`Authorization`, `Cookie`) are never forwarded across origins; they must
+//!   be supplied per-request by the caller after redirect validation.
+//! - Connection and response sizes are bounded: [`OutboundPolicy`] carries a
+//!   `response_limit` and [`send_bounded`] enforces it.
+//! - Failures are logged without secrets: error strings never include bearer tokens,
+//!   API keys, or response body fragments that may contain sensitive values.
 
 use reqwest::{redirect::Policy as RedirectPolicy, Client, Method, Url};
 use std::{
@@ -97,6 +110,15 @@ pub fn is_prohibited_address(address: IpAddr) -> bool {
     }
 }
 
+/// Credential headers that must never be forwarded to a redirect target.
+///
+/// When following a redirect that changes the origin, these headers must be
+/// stripped.  [`send_bounded`] disables redirects entirely at the HTTP client
+/// level, so callers that need redirect support must call
+/// [`OutboundPolicy::validate_redirect`] and then issue a new request — without
+/// copying these headers unless they explicitly re-authorise the new target.
+pub const CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
+
 pub async fn send_bounded(
     policy: &OutboundPolicy,
     method: Method,
@@ -109,9 +131,15 @@ pub async fn send_bounded(
         .request(method, parsed)
         .send()
         .await
+        // Intentionally omit the reqwest error message: it may contain the URL
+        // (which could include API-key query parameters) or provider error body.
         .map_err(|_| "outbound provider request failed".to_string())?;
     let status = response.status();
     if status.is_redirection() {
+        // Redirects are never followed automatically.  The caller must call
+        // validate_redirect, obtain a new validated URL, and issue a fresh
+        // request — without forwarding CREDENTIAL_HEADERS unless the new
+        // origin has been explicitly re-authorised.
         return Err("outbound provider redirects must be revalidated".to_string());
     }
     let bytes = response

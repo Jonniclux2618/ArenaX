@@ -39,6 +39,7 @@ impl NotificationChannel {
 /// single DB row per notification, not an external send.
 pub const PUSH_LIMIT_PER_HOUR: i64 = 5;
 pub const EMAIL_LIMIT_PER_HOUR: i64 = 2;
+const ACCOUNT_SECURITY_EMAIL_LIMIT_PER_HOUR: i64 = 5;
 
 #[derive(Debug)]
 pub struct ChannelDeliveryError(pub String);
@@ -259,6 +260,100 @@ impl NotificationService {
         });
 
         Ok(row)
+    }
+
+    /// Sends an account-security notification through email regardless of the
+    /// user's optional notification preferences.
+    pub async fn send_security_notice(
+        &self,
+        user_id: Uuid,
+        title: &str,
+        message: &str,
+    ) -> Result<(), ApiError> {
+        let sent: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM notification_deliveries delivery
+            JOIN notifications notification ON notification.id = delivery.notification_id
+            WHERE delivery.user_id = $1 AND delivery.channel = 'email'
+              AND delivery.status = 'sent' AND notification.type = 'account_security'
+              AND delivery.attempted_at > NOW() - INTERVAL '1 hour'
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(ApiError::database_error)?;
+        if sent >= ACCOUNT_SECURITY_EMAIL_LIMIT_PER_HOUR {
+            return Err(ApiError::too_many_requests(
+                "Account-security email limit reached; wait before retrying",
+            ));
+        }
+
+        let notification = NewNotification {
+            user_id,
+            typ: "account_security".to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+            link: None,
+            link_label: None,
+        };
+        let row = sqlx::query_as::<_, NotificationRow>(
+            r#"
+            INSERT INTO notifications (user_id, type, title, message)
+            VALUES ($1, 'account_security', $2, $3)
+            RETURNING id, user_id, type, title, message, link, link_label, read, created_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(title)
+        .bind(message)
+        .fetch_one(&self.db)
+        .await
+        .map_err(ApiError::database_error)?;
+        Self::record_delivery_static(
+            &self.db,
+            row.id,
+            user_id,
+            NotificationChannel::InApp,
+            "sent",
+            None,
+        )
+        .await;
+
+        match self.email_sender.send(&self.db, &notification).await {
+            Ok(()) => {
+                Self::record_delivery_static(
+                    &self.db,
+                    row.id,
+                    user_id,
+                    NotificationChannel::Email,
+                    "sent",
+                    None,
+                )
+                .await;
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    user_id = %user_id,
+                    notification_id = %row.id,
+                    error = %error,
+                    "Account-security email delivery failed"
+                );
+                Self::record_delivery_static(
+                    &self.db,
+                    row.id,
+                    user_id,
+                    NotificationChannel::Email,
+                    "failed",
+                    Some("security email delivery failed"),
+                )
+                .await;
+                Err(ApiError::ServiceUnavailable(
+                    "Security notification could not be delivered; retry the request".to_string(),
+                ))
+            }
+        }
     }
 
     /// Runs on the spawned background task: loads the user's channel

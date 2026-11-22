@@ -17,6 +17,45 @@
  */
 
 import { v4 as uuid } from 'uuid';
+import {
+    DataAccessGrant,
+    DatasetContract,
+    PurgeResult,
+    QualityCheckResult,
+    QualityThreshold,
+    RetentionPolicy,
+    evaluateDataQuality,
+    getRetentionPolicy,
+    grantDatasetAccess,
+    isDatasetAccessGranted,
+    listRetentionPolicies,
+    publishDatasetContract,
+    registerQualityThreshold,
+    registerRetentionPolicy,
+    revokeDatasetAccess,
+    runRetentionPurge,
+} from './data-governance.service';
+
+export {
+    evaluateDataQuality,
+    getRetentionPolicy,
+    grantDatasetAccess,
+    isDatasetAccessGranted,
+    listRetentionPolicies,
+    publishDatasetContract,
+    registerQualityThreshold,
+    registerRetentionPolicy,
+    revokeDatasetAccess,
+    runRetentionPurge,
+};
+export type {
+    DataAccessGrant,
+    DatasetContract,
+    PurgeResult,
+    QualityCheckResult,
+    QualityThreshold,
+    RetentionPolicy,
+};
 
 export type AnalyticsEventType =
     | 'match_started'

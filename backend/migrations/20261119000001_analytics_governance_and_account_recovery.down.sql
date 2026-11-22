@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS analytics_retention_exceptions;
+DROP TABLE IF EXISTS analytics_retention_runs;
+DROP TABLE IF EXISTS analytics_retention_policies;
+DROP TABLE IF EXISTS analytics_match_aggregation_receipts;
+DROP TABLE IF EXISTS analytics_quality_events;
+DROP TABLE IF EXISTS analytics_quality_thresholds;
+DROP TABLE IF EXISTS analytics_dataset_access_grants;
+DROP TABLE IF EXISTS analytics_dataset_contracts;
+DROP TABLE IF EXISTS account_recovery_case_audit;
+DROP TABLE IF EXISTS account_recovery_cases;
+DROP TABLE IF EXISTS account_recovery_codes;
+ALTER TABLE analytics_game_metrics DROP COLUMN IF EXISTS data_quality_status;

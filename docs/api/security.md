@@ -68,45 +68,29 @@ for attempt in 0.5.5:
 
 Admin-only endpoints (`/api/auth/analytics`, `/api/reputation/bad-actors`) check for the `admin` role in JWT claims. Requests from non-admin users receive `403 Forbidden`.
 
-## Operator Sessions
+## Account recovery
 
-Privileged operator actions (admin actions, contract submissions, and other privileged mutations) require a short-lived **operator session** in addition to the normal access token. Long-lived operator authorization is not accepted.
-
-### Session Binding
-
-Every operator session binds the following attributes, and all of them are validated on each privileged request:
-
-| Attribute | Description |
-|-----------|-------------|
-| `actor` | The authenticated operator identity (user ID) that created the session. |
-| `purpose` | The declared reason for the session (e.g. `match-reconcile`, `contract-upgrade`). |
-| `scope` | The exact set of privileged actions the session may perform. Actions outside the scope are rejected. |
-| `expiry` | Absolute expiry timestamp. Operator sessions are short-lived (minutes, not hours) and cannot be extended in place -- create a new session instead. |
-| `approval_ref` | Reference to the approval record that authorized the session (e.g. a change ticket or second-operator approval ID). |
-
-A session missing any of these attributes, or whose `actor` does not match the caller, is rejected with `403 Forbidden`.
-
-### Pre-Submission Checks
-
-The session is re-validated **immediately before submission** of the privileged action -- not only when the request is accepted or queued. The check verifies that the session is unexpired, unrevoked, still bound to the same `actor`, and that the requested action is within `scope`. If any check fails, the action is rejected and never submitted.
-
-### Revocation
-
-- Revoking an operator session (`POST /api/auth/revoke-sessions` or the operator session revocation endpoint) takes effect immediately.
-- Revocation **prevents queued but not-yet-submitted actions**: an action that was accepted into a queue but has not yet been submitted is rejected at the pre-submission check. Queued actions are never submitted under a revoked session.
-- Revocation is idempotent; revoking an already-revoked session returns success.
-
-### Signing Keys
-
-Signing keys (e.g. `STELLAR_ADMIN_SECRET`) are **never** stored in the operator session store. The session store holds only the binding attributes above; key material is loaded from the environment at submission time and is not readable through session APIs.
-
-### Retry, Failure, and Duplicate Delivery
-
-- A rejected privileged action (expired or revoked session, wrong scope) is **not** retried automatically. The operator must create a new session and resubmit.
-- Retries of a privileged action must reuse the same idempotency key so duplicate delivery cannot double-submit. Replaying a key with a different payload returns `409`.
-- Duplicate delivery of an already-submitted action returns the original result rather than submitting again.
-- Every rejected privileged request is recorded as audit evidence: actor, purpose, scope, `approval_ref`, rejection reason (expired / revoked / wrong-scope / actor-mismatch), and timestamp.
-=======
+- While signed in, create ten one-use recovery codes with `POST
+  /api/auth/recovery/codes`. Password-backed accounts must re-enter the current
+  password; OAuth-only accounts must have a valid signed-in session. Store the
+  returned codes offline. Only hashes are persisted, and issuing a new set
+  invalidates the unused codes from the previous set.
+- `POST /api/auth/recovery/start` accepts a recovery code and creates or reuses
+  a case, and consumes that code for any new case. The same proof is bound to
+  that case for completion or appeal. Recovery is independent of email, device,
+  and OAuth access.
+  The existing account email receives a mandatory security notice; delivery
+  failures are recorded and returned explicitly.
+- Password recovery cannot complete until 24 hours after the request and the
+  case expires after 72 hours. `POST /api/auth/recovery/complete` updates the
+  password and audit record in one database transaction,
+  and revokes existing sessions before commit. If the database transaction
+  fails after session revocation, sessions remain revoked (fail closed).
+- A user with the recovery proof can appeal at
+  `POST /api/auth/recovery/appeal`; an administrator reviews appeals at
+  `POST /api/auth/recovery/appeal/review`. Users who no longer have a recovery
+  code can contact `security@arenax.gg` with the case reference for human
+  review. Never send recovery codes or passwords to support.
 
 ## Stellar / Blockchain
 

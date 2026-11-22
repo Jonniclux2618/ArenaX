@@ -29,6 +29,8 @@ pub mod staking_handler;
 pub mod analytics_handler;
 pub mod analytics_ingestion_handler;
 pub mod analytics_identity_handler;
+pub mod analytics_governance_handler;
+pub mod recovery_handler;
 pub mod batch_handler;
 pub mod experiment_handler;
 pub mod privacy_deletion_handler;

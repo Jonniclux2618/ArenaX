@@ -4,6 +4,8 @@ pub mod analytics_budget_service;
 pub mod analytics_catalog_service;
 pub mod analytics_identity_service;
 pub mod analytics_service;
+pub mod analytics_governance;
+pub mod account_recovery;
 pub mod api_key_service;
 pub mod audit_service;
 pub mod auth_service;

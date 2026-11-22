@@ -530,11 +530,37 @@ pub async fn redeem_evidence_download(
             "Stored dispute evidence has an unsupported file type".to_string(),
         ));
     };
+
+    // Filename safety: the capability's object key must not contain path
+    // traversal sequences, null bytes, or any component that could resolve
+    // outside the evidence prefix.  The key is embedded in the HMAC-signed
+    // capability, but we validate again at redemption so a compromised signing
+    // secret cannot be used to serve arbitrary objects.
+    let safe_key = claims.object_key.as_str();
+    if safe_key.contains("..") || safe_key.contains('\0') || safe_key.starts_with('/') {
+        return Err(ApiError::forbidden(
+            "Evidence capability contains an unsafe object key",
+        ));
+    }
+
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "private, no-store"))
         .insert_header(("Content-Disposition", "attachment"))
         .content_type(content_type)
         .body(bytes))
+}
+    cfg.service(
+        web::scope("/matches").service(
+            web::scope("/{id}/dispute")
+                .route("", web::get().to(get_match_dispute))
+                .route("/evidence", web::post().to(upload_dispute_evidence))
+                .route("/evidence", web::get().to(get_dispute_evidence))
+                .route("/evidence/download-link", web::post().to(issue_evidence_download_link))
+                .route("/evidence/download", web::post().to(redeem_evidence_download))
+                .route("/evidence/custody", web::get().to(get_evidence_custody))
+                .route("/evidence/legal-hold", web::put().to(set_evidence_legal_hold)),
+        ),
+    );
 }
 
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {

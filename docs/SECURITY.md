@@ -25,6 +25,21 @@ If you receive a security notification you do not recognize:
 3. Review payout destinations and revert any changes you did not make.
 4. Contact the maintainers through the private reporting channel above.
 
+## Account recovery
+
+Account recovery challenges are time-bounded and rate-limited. A challenge
+cannot be replayed after it expires or exhausts its attempts. Successful
+high-risk recovery starts a 24-hour cooling period before another recovery
+challenge can be completed, and existing refresh-token and password-reset
+credentials are invalidated in the same database transaction.
+
+Recovery outcomes are recorded in the account audit trail without exposing
+verification codes or other secret values. Existing email/session channels
+must receive an explicit notification of a recovery event. Users who did not
+authorize a recovery may appeal through the maintainer private reporting
+channel and should leave the cooling period in place until the case is
+reviewed.
+
 ## Contributor guidance
 
 When adding or changing code that emits security notifications:

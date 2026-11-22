@@ -10,6 +10,7 @@ import walletAuditService from './wallet-audit.service';
 const RECOVERY_CODE_DIGITS = 6;
 const RECOVERY_CODE_TTL_MS = 10 * 60 * 1000;
 const RECOVERY_CODE_MAX_ATTEMPTS = 5;
+const RECOVERY_COOLING_PERIOD_MS = 24 * 60 * 60 * 1000;
 
 const hashRecoveryCode = (code: string): string =>
     crypto.createHash('sha256').update(code).digest('hex');
@@ -65,6 +66,20 @@ export class WalletRecoveryService {
 
         if (!wallet) {
             throw new HttpError(404, 'Wallet not found');
+        }
+
+        const recentChallenge = await prisma.walletRecoveryChallenge.findFirst({
+            where: {
+                userId,
+                status: 'COMPLETED',
+                completedAt: {
+                    gte: new Date(Date.now() - RECOVERY_COOLING_PERIOD_MS)
+                }
+            },
+            orderBy: { completedAt: 'desc' }
+        });
+        if (recentChallenge) {
+            throw new HttpError(429, 'Account recovery cooling period is active');
         }
 
         const verificationCode = generateRecoveryCode();
@@ -232,16 +247,36 @@ export class WalletRecoveryService {
             }
         });
 
-        await prisma.walletRecoveryChallenge.update({
-            where: { id: challenge.id },
-            data: {
-                status: 'COMPLETED',
-                completedAt: new Date(),
-                attempts: {
-                    increment: 1
+        await prisma.$transaction(async (tx) => {
+            await tx.walletRecoveryChallenge.update({
+                where: { id: challenge.id },
+                data: {
+                    status: 'COMPLETED',
+                    completedAt: new Date(),
+                    attempts: {
+                        increment: 1
+                    },
+                    lastAttemptAt: new Date()
+                }
+            });
+
+            await tx.refreshToken.updateMany({
+                where: {
+                    userId,
+                    revokedAt: null
                 },
-                lastAttemptAt: new Date()
-            }
+                data: {
+                    revokedAt: new Date()
+                }
+            });
+
+            await tx.user.update({
+                where: { id: userId },
+                data: {
+                    passwordResetToken: null,
+                    passwordResetExpires: null
+                }
+            });
         });
 
         await walletAuditService.record({

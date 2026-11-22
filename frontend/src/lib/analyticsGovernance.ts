@@ -71,3 +71,42 @@ export function validatePayload(payload: {
   }
   return { isValid: true };
 }
+
+export interface DataSetContract {
+  name: string;
+  owner: string;
+  schema: Record<string, "string" | "number" | "boolean" | "date" | "object">;
+  approvedPurpose: string;
+  accessTier: "PUBLIC" | "INTERNAL" | "CONFIDENTIAL" | "RESTRICTED";
+  retention: string;
+  deIdentificationRule: string;
+  approvedFields?: string[];
+  approvedBy?: string;
+}
+
+const SENSITIVE_FIELD =
+  /(?:^|[_-])(email|password|secret|privatekey|walletaddress|userid|phone|ipaddress|token)(?:$|[_-])/i;
+
+export function validateDatasetContract(contract: DataSetContract): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!contract.owner) errors.push("Missing dataset owner");
+  if (!contract.approvedPurpose) errors.push("Missing approved purpose");
+  if (!contract.retention) errors.push("Missing retention rule");
+  if (!contract.deIdentificationRule) errors.push("Missing de-identification rule");
+  const approved = new Set(contract.approvedFields ?? []);
+  for (const field of Object.keys(contract.schema)) {
+    if (SENSITIVE_FIELD.test(field) && !approved.has(field)) {
+      errors.push(`Sensitive field ${field} lacks approval metadata`);
+    }
+  }
+  if (Object.keys(contract.schema).some((field) => SENSITIVE_FIELD.test(field)) && !contract.approvedBy) {
+    errors.push("Sensitive fields require approval metadata");
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+export function assertDatasetContract(contract: DataSetContract): DataSetContract {
+  const result = validateDatasetContract(contract);
+  if (!result.valid) throw new Error(result.errors.join("; "));
+  return contract;
+}

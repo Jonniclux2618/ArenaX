@@ -97,7 +97,11 @@ impl PaymentProvider for FlutterwaveProvider {
         let secret = std::env::var("FLUTTERWAVE_SECRET")
             .map_err(|_| PaymentError::Provider("FLUTTERWAVE_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure flutterwave client".into()))?;
 
         // Flutterwave uses major units in its API (naira, not kobo).
         let amount_major = amount as f64 / 100.0;
@@ -186,7 +190,11 @@ impl PaymentProvider for FlutterwaveProvider {
             reference
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure flutterwave client".into()))?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -279,7 +287,11 @@ impl PaymentProvider for FlutterwaveProvider {
         let secret = std::env::var("FLUTTERWAVE_SECRET")
             .map_err(|_| PaymentError::Provider("FLUTTERWAVE_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure flutterwave client".into()))?;
         // destination is expected to be the bank account number; bank code
         // should be supplied as FLUTTERWAVE_BANK_CODE env var.
         let bank_code = std::env::var("FLUTTERWAVE_BANK_CODE").unwrap_or_else(|_| "044".to_string());
@@ -331,7 +343,11 @@ impl PaymentProvider for FlutterwaveProvider {
             "https://api.flutterwave.com/v3/transfers?reference={}",
             reference
         );
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure flutterwave client".into()))?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))

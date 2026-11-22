@@ -17,6 +17,12 @@ on:
       canary_bake_seconds:
         description: "Seconds to hold the canary split before full cutover"
         default: "60"
+      canary_max_error_rate_percent:
+        description: "Maximum canary HTTP error rate percent"
+        default: "1"
+      canary_max_p95_latency_ms:
+        description: "Maximum canary p95 latency in milliseconds"
+        default: "500"
       rehearsal_network:
         description: "Testnet network for the contract rehearsal (testnet only)"
         default: "testnet"
@@ -141,10 +147,69 @@ jobs:
           echo "frontend digest: ${{ steps.frontend.outputs.digest }}"
           echo "source revision: ${{ github.sha }}"
 
+  contract-manifest:
+    name: Contract deployment manifest
+    runs-on: ubuntu-latest
+    needs: release-checklist
+    permissions:
+      contents: read
+    outputs:
+      manifest_hash: ${{ steps.manifest.outputs.manifest_hash }}
+      wasm_hash: ${{ steps.manifest.outputs.wasm_hash }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Reproducible contract build
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path contracts/Cargo.toml \
+            --target wasm32-unknown-unknown --release --locked
+
+      - name: Compute WASM hash and assemble manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          wasm="contracts/target/wasm32-unknown-unknown/release/payments.wasm"
+          test -f "$wasm" || { echo "::error::Contract artifact $wasm not found."; exit 1; }
+          wasm_hash="$(sha256sum "$wasm" | awk '{print $1}')"
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          manifest="deploy/contract-manifest.json"
+          test -f "$manifest" || { echo "::error::Approved manifest $manifest is missing."; exit 1; }
+          approved_hash="$(jq -r '.wasm_hash' "$manifest")"
+          approved_commit="$(jq -r '.source_commit' "$manifest")"
+          if [ "$approved_hash" != "$wasm_hash" ]; then
+            echo "::error::WASM hash mismatch: approved=$approved_hash rebuilt=$wasm_hash"
+            exit 1
+          fi
+          if [ "$approved_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::Source commit mismatch: approved=$approved_commit current=$GITHUB_SHA"
+            exit 1
+          fi
+          manifest_hash="$(sha256sum "$manifest" | awk '{print $1}')"
+          echo "wasm_hash=$wasm_hash" >> "$GITHUB_OUTPUT"
+          echo "manifest_hash=$manifest_hash" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Contract deployment manifest"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            echo "- Toolchain: \`$rustc_version\` / \`$cargo_version\`"
+            echo "- WASM hash: \`$wasm_hash\` (matches approved manifest)"
+            echo "- Manifest hash: \`$manifest_hash\`"
+            echo "- Network: \`$(jq -r '.network' "$manifest")\`"
+            echo "- Contract ID: \`$(jq -r '.contract_id' "$manifest")\`"
+            echo "- Approvers: $(jq -r '.approvers | join(", ")' "$manifest")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Blue/green deploy
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-and-push, contract-manifest]
     permissions:
       contents: read
       attestations: read
@@ -193,6 +258,26 @@ jobs:
             echo "- Frontend: \`$frontend\` — verified"
             echo "- Signer workflow: \`$workflow\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify approved contract manifest hash
+        env:
+          APPROVED_MANIFEST_HASH: ${{ needs.contract-manifest.outputs.manifest_hash }}
+          APPROVED_WASM_HASH: ${{ needs.contract-manifest.outputs.wasm_hash }}
+        run: |
+          set -euo pipefail
+          manifest="deploy/contract-manifest.json"
+          test -f "$manifest" || { echo "::error::Approved manifest $manifest is missing."; exit 1; }
+          current_hash="$(sha256sum "$manifest" | awk '{print $1}')"
+          if [ "$current_hash" != "$APPROVED_MANIFEST_HASH" ]; then
+            echo "::error::Manifest hash mismatch: approved=$APPROVED_MANIFEST_HASH current=$current_hash"
+            exit 1
+          fi
+          current_wasm="$(jq -r '.wasm_hash' "$manifest")"
+          if [ "$current_wasm" != "$APPROVED_WASM_HASH" ]; then
+            echo "::error::WASM hash mismatch: approved=$APPROVED_WASM_HASH manifest=$current_wasm"
+            exit 1
+          fi
+          echo "Approved manifest hash $APPROVED_MANIFEST_HASH verified against artifact $APPROVED_WASM_HASH."
 
       - name: Validate production origin policy
         run: |
@@ -250,6 +335,9 @@ jobs:
             git checkout origin/main -- deploy scripts/deploy
             export CANARY_WEIGHT=${{ github.event.inputs.canary_weight || '10' }}
             export CANARY_BAKE_SECONDS=${{ github.event.inputs.canary_bake_seconds || '60' }}
+            export CANARY_MAX_ERROR_RATE_PERCENT=${{ github.event.inputs.canary_max_error_rate_percent || '1' }}
+            export CANARY_MAX_P95_LATENCY_MS=${{ github.event.inputs.canary_max_p95_latency_ms || '500' }}
+            export CANARY_CRITICAL_JOURNEY_URL="http://localhost:8080/api/health/ready"
             # Transactional rollout: the deploy script must gate traffic shift on
             # migration compatibility and readiness. If either gate fails it
             # exits non-zero BEFORE shifting traffic, leaving the prior release

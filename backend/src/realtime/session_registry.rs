@@ -57,6 +57,7 @@ pub struct ReconnectMetrics {
 /// enforcing per-user connection limits, and preserving session state during reconnects.
 pub struct SessionRegistry {
     user_to_sessions: RwLock<HashMap<Uuid, HashSet<Uuid>>>,
+    auth_session_to_ws: RwLock<HashMap<String, Uuid>>,
     channel_to_sessions: RwLock<HashMap<String, HashSet<Uuid>>>,
     session_to_channels: RwLock<HashMap<Uuid, HashSet<String>>>,
     session_heartbeats: RwLock<HashMap<Uuid, Instant>>,
@@ -70,6 +71,7 @@ impl SessionRegistry {
     pub fn new() -> Self {
         Self {
             user_to_sessions: RwLock::new(HashMap::new()),
+            auth_session_to_ws: RwLock::new(HashMap::new()),
             channel_to_sessions: RwLock::new(HashMap::new()),
             session_to_channels: RwLock::new(HashMap::new()),
             session_heartbeats: RwLock::new(HashMap::new()),
@@ -99,6 +101,14 @@ impl SessionRegistry {
         let mut hb_map = self.session_heartbeats.write().unwrap();
         hb_map.insert(session_id, Instant::now());
         true
+    }
+
+    /// Bind an authentication session to its local WebSocket actor session.
+    pub fn bind_auth_session(&self, auth_session_id: &str, ws_session_id: Uuid) {
+        self.auth_session_to_ws
+            .write()
+            .unwrap()
+            .insert(auth_session_id.to_string(), ws_session_id);
     }
 
     /// Register a new session returning a structured Result.
@@ -295,6 +305,66 @@ impl SessionRegistry {
         map.get(user_id)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Remove every local WebSocket session for a user after credential revocation.
+    /// Unlike disconnect/reconnect, revoked sessions must not be preserved.
+    pub fn revoke_user(&self, user_id: &Uuid) -> Vec<Uuid> {
+        let session_ids = {
+            let mut map = self.user_to_sessions.write().unwrap();
+            map.remove(user_id).unwrap_or_default().into_iter().collect::<Vec<_>>()
+        };
+        for session_id in &session_ids {
+            self.revoke_session(session_id);
+        }
+        session_ids
+    }
+
+    /// Remove one local session and all subscriptions permanently.
+    pub fn revoke_session(&self, session_id: &Uuid) {
+        self.session_heartbeats.write().unwrap().remove(session_id);
+        self.preserved_sessions.write().unwrap().remove(session_id);
+        self.auth_session_to_ws
+            .write()
+            .unwrap()
+            .retain(|_, ws_session_id| ws_session_id != session_id);
+
+        let channels = {
+            let mut map = self.session_to_channels.write().unwrap();
+            map.remove(session_id).unwrap_or_default()
+        };
+        for channel in channels {
+            let remove_channel = {
+                let mut map = self.channel_to_sessions.write().unwrap();
+                let Some(sessions) = map.get_mut(&channel) else {
+                    continue;
+                };
+                sessions.remove(session_id);
+                sessions.is_empty()
+            };
+            if remove_channel {
+                self.channel_to_sessions.write().unwrap().remove(&channel);
+            }
+        }
+
+        let mut users = self.user_to_sessions.write().unwrap();
+        users.retain(|_, sessions| {
+            sessions.remove(session_id);
+            !sessions.is_empty()
+        });
+    }
+
+    /// Revoke the local WebSocket mapped to an authentication/session ID.
+    pub fn revoke_auth_session(&self, auth_session_id: &str) -> Option<Uuid> {
+        let ws_session_id = self
+            .auth_session_to_ws
+            .write()
+            .unwrap()
+            .remove(auth_session_id);
+        if let Some(ws_session_id) = ws_session_id {
+            self.revoke_session(&ws_session_id);
+        }
+        ws_session_id
     }
 
     /// Get all session IDs subscribed to a channel.

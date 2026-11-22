@@ -10,6 +10,18 @@ use uuid::Uuid;
 
 pub mod operator_session;
 
+/// Redis Pub/Sub channel used to propagate credential revocation to every
+/// backend instance. Payloads contain only opaque identifiers, never secrets.
+pub const CREDENTIAL_REVOCATION_CHANNEL: &str = "arenax:credential_revocation";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRevocation {
+    pub user_id: Uuid,
+    pub session_id: Option<String>,
+    pub reason: String,
+    pub revoked_at: i64,
+}
+
 /// JWT-related errors
 #[derive(Debug, Error)]
 pub enum JwtError {
@@ -790,6 +802,16 @@ impl JwtService {
         let refresh_count = self.revoke_all_refresh_tokens(user_id).await?;
 
         let total = session_count.max(refresh_count);
+        let payload = serde_json::to_string(&CredentialRevocation {
+            user_id,
+            session_id: None,
+            reason: "all_sessions_revoked".into(),
+            revoked_at: Utc::now().timestamp(),
+        })
+        .unwrap_or_else(|_| "{}".into());
+        let _: Result<(), redis::RedisError> = conn
+            .publish::<_, _, ()>(CREDENTIAL_REVOCATION_CHANNEL, payload)
+            .await;
         info!(user_id = %user_id, session_count, refresh_count, "User sessions revoked");
 
         Ok(total)
@@ -862,6 +884,17 @@ impl JwtService {
             .arg(session_id)
             .invoke_async(&mut conn)
             .await?;
+
+        let payload = serde_json::to_string(&CredentialRevocation {
+            user_id,
+            session_id: Some(session_id.to_string()),
+            reason: "session_revoked".into(),
+            revoked_at: Utc::now().timestamp(),
+        })
+        .unwrap_or_else(|_| "{}".into());
+        let _: Result<(), redis::RedisError> = conn
+            .publish::<_, _, ()>(CREDENTIAL_REVOCATION_CHANNEL, payload)
+            .await;
 
         info!(user_id = %user_id, session_id = %session_id, "User session revoked");
         Ok(())

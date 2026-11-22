@@ -97,7 +97,11 @@ impl PaymentProvider for PaystackProvider {
         let secret = std::env::var("PAYSTACK_SECRET")
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure paystack client".into()))?;
         let body = serde_json::json!({
             "reference": reference,
             "amount":    amount,       // kobo
@@ -171,7 +175,11 @@ impl PaymentProvider for PaystackProvider {
             reference
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure paystack client".into()))?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))
@@ -257,7 +265,11 @@ impl PaymentProvider for PaystackProvider {
         let secret = std::env::var("PAYSTACK_SECRET")
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure paystack client".into()))?;
         // Paystack transfer: create a transfer recipient then initiate.
         // Here we initiate a transfer directly using a pre-created recipient_code
         // (destination is expected to be the recipient_code from Paystack).
@@ -303,7 +315,11 @@ impl PaymentProvider for PaystackProvider {
             .map_err(|_| PaymentError::Provider("PAYSTACK_SECRET not set".into()))?;
 
         let url = format!("https://api.paystack.co/transfer/{}", reference);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| PaymentError::Provider("could not create secure paystack client".into()))?;
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", secret))

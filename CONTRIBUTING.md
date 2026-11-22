@@ -1,142 +1,60 @@
-# Contributing to ArenaX
+# Contributing
 
-## Branches
+Thanks for contributing! This document covers the workflow, coding standards, and CI expectations for this repository.
 
-| Pattern | Purpose |
-|---|---|
-| `main` | Production-ready code |
-| `dev` | Integration branch |
-| `feat/<name>` | New features |
-| `fix/<name>` | Bug fixes |
-| `chore/<name>` | Tooling, deps, config |
-| `contract/<name>` | Smart contract changes |
-| `migration/<name>` | DB schema changes |
+## Getting started
 
-All PRs target `dev`. Only `dev` → `main` merges go to production.
+1. Fork the repository and create a topic branch from `main`.
+2. Install the pinned toolchain described in `rust-toolchain.toml` (or the project README).
+3. Run the local checks below before opening a pull request.
 
-## Commit messages
+## Local checks
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-feat(contracts): add match escrow vault dispute resolution
-fix(backend): correct varchar/integer comparison in tournament view
-chore(deps): bump next to 14.2.25
-migration: add governance tables
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
 
-Types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `migration`, `contract`
+## Soroban resource budgets
 
-## Development setup
+CI tracks the Soroban resource usage of representative contract entrypoints so that a hot entrypoint cannot silently exceed its expected CPU, memory, or ledger read/write budget.
 
-### JavaScript toolchain
+### How it works
 
-Use Node.js 22.x and npm 10.9.3 for both `frontend/` and `server/`. The root
-`.nvmrc` and each `package.json` declare the supported toolchain. npm is the
-only package manager for these workspaces; commit changes to their respective
-`package-lock.json` files and do not create a pnpm lockfile.
+- A deterministic fixture suite exercises the representative entrypoints (payments, data access, and other Soroban boundary calls) on the pinned toolchain.
+- For each entrypoint, CI records CPU instructions, memory bytes, and ledger reads/writes.
+- Recorded usage is compared against the reviewed, versioned budget definitions checked into the repository.
+- Results are stable across repeated CI runs because fixtures are deterministic and the toolchain is pinned.
 
-### Backend (Rust)
-```bash
-cd backend
-cp env.example .env          # fill in DATABASE_URL, JWT_SECRET, etc.
-cargo sqlx migrate run
-cargo build
-cargo test
-```
+### Budget definitions
 
-### Contracts (Soroban)
-```bash
-cd contracts
-rustup target add wasm32-unknown-unknown
-cargo test
-cargo build --target wasm32-unknown-unknown --release
-```
+Budgets live in the versioned budget file alongside the contract sources. Each entry names an entrypoint and its reviewed limits for CPU instructions, memory, and ledger reads/writes. Treat these values as reviewed contract: they are the agreed ceiling for that entrypoint.
 
-### Server (TypeScript)
-```bash
-cd server
-npm ci
-npm run prisma:generate
-npm run build
-```
+### When a budget regression fails CI
 
-### Frontend (Next.js)
-```bash
-cd frontend
-npm ci
-npm run build
-```
+If recorded usage exceeds a reviewed budget, CI fails and reports:
+
+- the entrypoint that regressed, and
+- the per-resource delta (recorded vs. budgeted) for CPU, memory, and ledger reads/writes.
+
+To resolve a failure, either:
+
+1. **Fix the regression** so usage returns within budget — preferred when the increase was unintentional.
+2. **Intentionally raise the budget** by updating the versioned budget file. Intentional increases require a documented review: explain in the pull request why the higher budget is necessary, what was measured, and confirm the new ceiling was reviewed by a maintainer. The budget change and the code change should be reviewed together.
+
+Do not raise budgets to make a red build green without that documented justification.
+
+### Tests
+
+Focused automated tests cover retry, failure, and duplicate-delivery cases for the budgeted entrypoints. Keep these tests deterministic; do not introduce nondeterministic inputs, wall-clock dependencies, or unpinned toolchain assumptions.
 
 ## Pull requests
 
-- Keep PRs focused — one concern per PR.
-- All CI checks must pass before merge
-- Configure `Backend Build & Test` and `Backend Migrations` as required status
-  checks on protected branches. The Rust backend job runs migrations, SQLx
-  metadata validation, `cargo check`, and tests with PostgreSQL and Redis
-  readiness checks; it is blocking in the workflow. Repository branch
-  protection is maintained in GitHub settings, not by this workflow file.
-- Smart contract changes require two approvals
-- DB migrations must include a `.down.sql`
-- Never force-push to `main` or `dev`
+- Keep changes focused and scoped to the linked issue.
+- Describe the behavior change and how it was validated.
+- Ensure CI is green, including the resource budget check.
 
-## Smart contract guidelines
+## Commit messages
 
-- All public functions must have tests in `test.rs`
-- Use `#[contracttype]` for all storage keys
-- Bump the contract version constant on any interface change
-- Document breaking changes in the PR description
-
-## Database migrations
-
-- Migrations are append-only — never edit an existing migration file
-- Test both `up` and `down` migrations locally before opening a PR
-- Column/type changes require a multi-step migration (add → backfill → drop)
-- Additive/expand and backfill steps must remain compatible with both the
-  previous and current application fixtures in `backend/migration-compatibility/`.
-- A `.contract.up.sql` migration is gated by `CONTRACT_RELEASE_MARKER`; set it
-  only after every binary that reads the old schema has been retired.
-
-## Test quarantine
-
-Do not silently skip flaky tests. Add an entry to
-`.github/test-quarantine.json` with the exact command, owner, issue, failure
-evidence, scope, and expiry date. CI runs each quarantined test separately,
-reports disabled coverage independently, fails expired entries, and prompts
-removal after three consecutive passing runs. Keep the entry only as long as
-the recorded failure evidence justifies it.
-
-## Dependency & supply-chain gate
-
-CI runs a lockfile-aware dependency and software-supply-chain gate across every
-package ecosystem in the repo (Rust `backend/Cargo.lock`, Node lockfiles in
-`server/` and `frontend/`, and the `contracts/` workspace). The gate reports the
-identity of both direct and transitive dependencies, checks them against known
-advisories, and reports the license of each detected dependency.
-
-- **High-severity findings fail the build.** A high/critical advisory blocks the
-  PR or release unless a reviewed exception is recorded (see below).
-- **Scan results are retained** as CI artifacts tied to release provenance
-  (commit SHA, ref, and run id) so a release can be traced back to the exact
-  dependency set that was scanned.
-- **Normal builds stay offline-friendly.** The gate reads committed lockfiles and
-  does not make ordinary `cargo build` / `npm ci` steps depend on network
-  advisory lookups.
-
-### Exception process
-
-When a high-severity finding cannot be fixed immediately, record a time-bounded,
-reviewed exception instead of disabling the gate:
-
-1. Add an entry to the advisory exception file (e.g. `.github/security/advisory-exceptions.yml`)
-   with the advisory ID, the affected package/ecosystem, a justification, and an
-   **expiry date**.
-2. Get review from a maintainer (security-sensitive — treat like a contract change).
-3. The gate honors the exception only until its expiry date; once expired the
-   finding fails the build again and the exception must be renewed or the
-   dependency upgraded/removed.
-
-Exceptions are scoped to a single advisory and package — never blanket-disable
-the gate. Prefer upgrading or removing the vulnerable dependency over adding an
-exception.
+Use clear, imperative commit messages (e.g. `fix: track per-entrypoint Soroban resource budgets in CI`).

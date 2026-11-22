@@ -1,87 +1,173 @@
-use chrono::{DateTime, Utc};
+use crate::models::tournament::{Tournament, TournamentConfig, TournamentStatus};
+use crate::services::bracket_service::{self, BracketShape};
+use crate::services::fee_service;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::tournament::{Tournament, TournamentStatus};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RosterLockBoundary {
-    /// Roster is mutable until registration closes.
-    RegistrationClose,
-    /// Roster is mutable until the bracket is seeded / rounds assigned.
-    RoundAssignment,
-    /// Roster is mutable until the first match starts.
-    MatchStart,
+#[derive(Debug)]
+pub enum TournamentError {
+    NotFound,
+    InvalidConfig(Vec<ConfigIssue>),
+    Conflict(String),
+    Internal(String),
 }
 
-impl RosterLockBoundary {
-    pub fn from_rules(rules: &TournamentRules) -> Self {
-        rules.roster_lock_boundary
-    }
-
-    /// Returns true when the roster is immutable for the given tournament state.
-    pub fn is_locked(&self, status: TournamentStatus) -> bool {
-        match self {
-            RosterLockBoundary::RegistrationClose => matches!(
-                status,
-                TournamentStatus::RegistrationClosed
-                    | TournamentStatus::Seeded
-                    | TournamentStatus::InProgress
-                    | TournamentStatus::Completed
-            ),
-            RosterLockBoundary::RoundAssignment => matches!(
-                status,
-                TournamentStatus::Seeded
-                    | TournamentStatus::InProgress
-                    | TournamentStatus::Completed
-            ),
-            RosterLockBoundary::MatchStart => matches!(
-                status,
-                TournamentStatus::InProgress | TournamentStatus::Completed
-            ),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigIssue {
+    pub field: String,
+    pub message: String,
 }
 
+/// Read-only result of validating a proposed tournament configuration.
+/// Mirrors exactly what the create path would compute, without persisting anything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TournamentRules {
-    pub roster_lock_boundary: RosterLockBoundary,
+pub struct TournamentConfigPreview {
+    pub valid: bool,
+    pub issues: Vec<ConfigIssue>,
+    pub bracket: Option<BracketShape>,
+    pub fee_cents: Option<i64>,
+    pub capacity: Option<i64>,
 }
 
-impl Default for TournamentRules {
+/// Lifecycle state of a tournament result dispute. Transitions are strictly
+/// forward-only; a closed dispute unlocks only the next valid transition.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DisputeState {
+    /// Opened, awaiting evidence within the deadline.
+    Open,
+    /// Evidence deadline passed; escalated to a reviewer.
+    Escalated,
+    /// Reviewer has resolved the dispute with a recorded reason.
+    Resolved,
+    /// Dispute closed; the underlying result may advance.
+    Closed,
+}
+
+/// Versioned deadline and escalation policy for result disputes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisputePolicy {
+    /// Bumped whenever deadline/escalation semantics change.
+    pub version: u32,
+    /// Window after opening during which evidence may be submitted.
+    pub evidence_window: Duration,
+    /// Window after the evidence deadline before auto-escalation.
+    pub escalation_grace: Duration,
+}
+
+impl Default for DisputePolicy {
     fn default() -> Self {
         Self {
-            roster_lock_boundary: RosterLockBoundary::MatchStart,
+            version: 1,
+            evidence_window: Duration::hours(48),
+            escalation_grace: Duration::hours(24),
         }
     }
 }
 
+/// A dispute record capturing opening time, evidence deadline, reviewer
+/// assignment, and resolution reason.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RosterSubstitution {
+pub struct Dispute {
     pub id: Uuid,
-    pub team_id: Uuid,
-    pub match_id: Uuid,
-    pub outgoing_participant_id: Uuid,
-    pub incoming_participant_id: Uuid,
-    pub reason: String,
-    pub recorded_at: DateTime<Utc>,
-    pub recorded_by: Uuid,
+    pub tournament_id: Uuid,
+    pub policy_version: u32,
+    pub state: DisputeState,
+    pub opened_at: DateTime<Utc>,
+    pub evidence_deadline: DateTime<Utc>,
+    pub reviewer_id: Option<Uuid>,
+    pub resolution_reason: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug)]
-pub enum RosterError {
-    RosterLocked,
-    MatchActiveOrFinalized,
-    ParticipantIdentityChange,
-    NotFound,
-    Db(sqlx::Error),
-}
+impl Dispute {
+    /// Open a new dispute, stamping the evidence deadline from the policy.
+    pub fn open(tournament_id: Uuid, policy: &DisputePolicy, now: DateTime<Utc>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            tournament_id,
+            policy_version: policy.version,
+            state: DisputeState::Open,
+            opened_at: now,
+            evidence_deadline: now + policy.evidence_window,
+            reviewer_id: None,
+            resolution_reason: None,
+            resolved_at: None,
+        }
+    }
 
-impl From<sqlx::Error> for RosterError {
-    fn from(err: sqlx::Error) -> Self {
-        RosterError::Db(err)
+    /// Whether evidence submitted at `at` is still within the deadline.
+    pub fn accepts_evidence_at(&self, at: DateTime<Utc>) -> bool {
+        self.state == DisputeState::Open && at <= self.evidence_deadline
+    }
+
+    /// Escalate a dispute whose evidence deadline (plus grace) has passed.
+    /// Escalation never resolves or accepts the claim; it only assigns review.
+    pub fn escalate(
+        &mut self,
+        policy: &DisputePolicy,
+        reviewer_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), TournamentError> {
+        if self.state != DisputeState::Open {
+            return Err(TournamentError::Conflict(
+                "only open disputes can be escalated".into(),
+            ));
+        }
+        if now < self.evidence_deadline + policy.escalation_grace {
+            return Err(TournamentError::Conflict(
+                "escalation grace period has not elapsed".into(),
+            ));
+        }
+        self.state = DisputeState::Escalated;
+        self.reviewer_id = Some(reviewer_id);
+        Ok(())
+    }
+
+    /// Reassign the reviewer without changing lifecycle state.
+    pub fn reassign_reviewer(&mut self, reviewer_id: Uuid) -> Result<(), TournamentError> {
+        if self.state != DisputeState::Escalated {
+            return Err(TournamentError::Conflict(
+                "reviewer can only be reassigned while escalated".into(),
+            ));
+        }
+        self.reviewer_id = Some(reviewer_id);
+        Ok(())
+    }
+
+    /// Resolve an escalated dispute with a mandatory reason. Repeated
+    /// resolution requests are rejected so the record stays immutable.
+    pub fn resolve(
+        &mut self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), TournamentError> {
+        if self.state != DisputeState::Escalated {
+            return Err(TournamentError::Conflict(
+                "only escalated disputes can be resolved".into(),
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(TournamentError::Conflict(
+                "resolution reason is required".into(),
+            ));
+        }
+        self.state = DisputeState::Resolved;
+        self.resolution_reason = Some(reason.to_string());
+        self.resolved_at = Some(now);
+        Ok(())
+    }
+
+    /// Close a resolved dispute, unlocking the next lifecycle transition.
+    pub fn close(&mut self) -> Result<(), TournamentError> {
+        if self.state != DisputeState::Resolved {
+            return Err(TournamentError::Conflict(
+                "only resolved disputes can be closed".into(),
+            ));
+        }
+        self.state = DisputeState::Closed;
+        Ok(())
     }
 }
 
@@ -94,172 +180,115 @@ impl TournamentService {
         Self { pool }
     }
 
-    /// Canonical boundary for roster mutations. All roster writes must go through here.
-    pub async fn update_roster(
-        &self,
-        tournament_id: Uuid,
-        team_id: Uuid,
-        match_id: Option<Uuid>,
-        participant_id: Uuid,
-        actor_id: Uuid,
-    ) -> Result<(), RosterError> {
-        let mut tx = self.pool.begin().await?;
+    /// Shared validation used by both preview and create so they cannot diverge.
+    fn validate_config(config: &TournamentConfig) -> Vec<ConfigIssue> {
+        let mut issues = Vec::new();
 
-        let tournament = self.load_tournament_for_update(&mut tx, tournament_id).await?;
-        let rules = TournamentRules::default();
-        let boundary = RosterLockBoundary::from_rules(&rules);
-
-        if boundary.is_locked(tournament.status) {
-            return Err(RosterError::RosterLocked);
+        if config.max_participants <= 0 {
+            issues.push(ConfigIssue {
+                field: "max_participants".into(),
+                message: "must be greater than zero".into(),
+            });
         }
 
-        if let Some(match_id) = match_id {
-            let match_status = self.load_match_status(&mut tx, match_id).await?;
-            if matches!(match_status.as_str(), "active" | "finalized") {
-                return Err(RosterError::MatchActiveOrFinalized);
-            }
+        if config.min_participants <= 0 {
+            issues.push(ConfigIssue {
+                field: "min_participants".into(),
+                message: "must be greater than zero".into(),
+            });
         }
 
-        self.apply_roster_update(&mut tx, team_id, participant_id).await?;
-        self.record_audit(&mut tx, tournament_id, team_id, match_id, actor_id)
-            .await?;
+        if config.min_participants > config.max_participants {
+            issues.push(ConfigIssue {
+                field: "min_participants".into(),
+                message: "cannot exceed max_participants".into(),
+            });
+        }
 
-        tx.commit().await?;
-        Ok(())
+        if config.entry_fee_cents < 0 {
+            issues.push(ConfigIssue {
+                field: "entry_fee_cents".into(),
+                message: "cannot be negative".into(),
+            });
+        }
+
+        if config.starts_at >= config.ends_at {
+            issues.push(ConfigIssue {
+                field: "starts_at".into(),
+                message: "must be before ends_at".into(),
+            });
+        }
+
+        issues
     }
 
-    /// Records an allowed substitution against a team and match. Rejects any
-    /// substitution that would change a participant identity in an active or
-    /// finalized match.
-    pub async fn record_substitution(
+    /// Dry-run preview for organizers. Performs no reservation, payment,
+    /// notification, or persistent mutation.
+    pub async fn preview_config(
         &self,
-        tournament_id: Uuid,
-        team_id: Uuid,
-        match_id: Uuid,
-        outgoing_participant_id: Uuid,
-        incoming_participant_id: Uuid,
-        reason: String,
-        actor_id: Uuid,
-    ) -> Result<RosterSubstitution, RosterError> {
-        let mut tx = self.pool.begin().await?;
+        config: &TournamentConfig,
+    ) -> Result<TournamentConfigPreview, TournamentError> {
+        let issues = Self::validate_config(config);
 
-        let tournament = self.load_tournament_for_update(&mut tx, tournament_id).await?;
-        let rules = TournamentRules::default();
-        let boundary = RosterLockBoundary::from_rules(&rules);
-
-        if boundary.is_locked(tournament.status) {
-            return Err(RosterError::RosterLocked);
+        if !issues.is_empty() {
+            return Ok(TournamentConfigPreview {
+                valid: false,
+                issues,
+                bracket: None,
+                fee_cents: None,
+                capacity: None,
+            });
         }
 
-        let match_status = self.load_match_status(&mut tx, match_id).await?;
-        if matches!(match_status.as_str(), "active" | "finalized") {
-            return Err(RosterError::MatchActiveOrFinalized);
-        }
+        let bracket = bracket_service::compute_shape(config.max_participants);
+        let fee_cents = fee_service::calculate_entry_fee(config);
 
-        let substitution = RosterSubstitution {
-            id: Uuid::new_v4(),
-            team_id,
-            match_id,
-            outgoing_participant_id,
-            incoming_participant_id,
-            reason,
-            recorded_at: Utc::now(),
-            recorded_by: actor_id,
-        };
-
-        sqlx::query(
-            r#"
-            INSERT INTO roster_substitutions
-                (id, tournament_id, team_id, match_id, outgoing_participant_id,
-                 incoming_participant_id, reason, recorded_at, recorded_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            "#,
-        )
-        .bind(substitution.id)
-        .bind(tournament_id)
-        .bind(substitution.team_id)
-        .bind(substitution.match_id)
-        .bind(substitution.outgoing_participant_id)
-        .bind(substitution.incoming_participant_id)
-        .bind(&substitution.reason)
-        .bind(substitution.recorded_at)
-        .bind(substitution.recorded_by)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(substitution)
+        Ok(TournamentConfigPreview {
+            valid: true,
+            issues: Vec::new(),
+            bracket: Some(bracket),
+            fee_cents: Some(fee_cents),
+            capacity: Some(config.max_participants),
+        })
     }
 
-    async fn load_tournament_for_update(
+    pub async fn create_tournament(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
-        tournament_id: Uuid,
-    ) -> Result<Tournament, RosterError> {
+        organizer_id: Uuid,
+        config: &TournamentConfig,
+    ) -> Result<Tournament, TournamentError> {
+        let issues = Self::validate_config(config);
+        if !issues.is_empty() {
+            return Err(TournamentError::InvalidConfig(issues));
+        }
+
+        let bracket = bracket_service::compute_shape(config.max_participants);
+        let fee_cents = fee_service::calculate_entry_fee(config);
+
+        let now: DateTime<Utc> = Utc::now();
         let tournament = sqlx::query_as::<_, Tournament>(
-            "SELECT * FROM tournaments WHERE id = $1 FOR UPDATE",
-        )
-        .bind(tournament_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(RosterError::NotFound)?;
-        Ok(tournament)
-    }
-
-    async fn load_match_status(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        match_id: Uuid,
-    ) -> Result<String, RosterError> {
-        let status = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM matches WHERE id = $1 FOR UPDATE",
-        )
-        .bind(match_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(RosterError::NotFound)?;
-        Ok(status)
-    }
-
-    async fn apply_roster_update(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        team_id: Uuid,
-        participant_id: Uuid,
-    ) -> Result<(), RosterError> {
-        sqlx::query(
-            "UPDATE team_rosters SET participant_id = $1 WHERE team_id = $2",
-        )
-        .bind(participant_id)
-        .bind(team_id)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
-    async fn record_audit(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        tournament_id: Uuid,
-        team_id: Uuid,
-        match_id: Option<Uuid>,
-        actor_id: Uuid,
-    ) -> Result<(), RosterError> {
-        sqlx::query(
             r#"
-            INSERT INTO roster_audit_log
-                (id, tournament_id, team_id, match_id, actor_id, recorded_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO tournaments
+                (id, organizer_id, status, max_participants, min_participants,
+                 entry_fee_cents, bracket_size, starts_at, ends_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+            RETURNING *
             "#,
         )
         .bind(Uuid::new_v4())
-        .bind(tournament_id)
-        .bind(team_id)
-        .bind(match_id)
-        .bind(actor_id)
-        .bind(Utc::now())
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
+        .bind(organizer_id)
+        .bind(TournamentStatus::Draft)
+        .bind(config.max_participants)
+        .bind(config.min_participants)
+        .bind(fee_cents)
+        .bind(bracket.size)
+        .bind(config.starts_at)
+        .bind(config.ends_at)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| TournamentError::Internal(e.to_string()))?;
+
+        Ok(tournament)
     }
 }

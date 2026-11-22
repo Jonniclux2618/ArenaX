@@ -1,6 +1,6 @@
 # ArenaX Development Makefile
 
-.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down
+.PHONY: help install build test clean lint format check-all docker-build docker-up docker-down bindings bindings-check
 
 # Default target
 help:
@@ -33,6 +33,10 @@ help:
 	@echo "  lint             Lint all code"
 	@echo "  format           Format all code"
 	@echo "  check-all        Run all checks (lint, format, test)"
+	@echo ""
+	@echo "Bindings:"
+	@echo "  bindings         Generate typed Rust + TypeScript client bindings"
+	@echo "  bindings-check   Verify generated bindings are current (CI)"
 	@echo ""
 	@echo "Docker:"
 	@echo "  docker-build     Build Docker images"
@@ -88,6 +92,24 @@ build-contracts:
 	@echo "Building contracts..."
 	cd contracts && cargo build --target wasm32-unknown-unknown --release
 
+# Typed client bindings (Issue #226)
+# Generated from the checked-in interface artifact at contracts/interface.json.
+# Bindings are versioned and pin the network + contract version so consumers
+# cannot accidentally mix versions.
+BINDINGS_ARTIFACT ?= contracts/interface.json
+BINDINGS_OUT ?= bindings
+
+bindings:
+	@echo "Generating typed client bindings from $(BINDINGS_ARTIFACT)..."
+	@if [ ! -f "$(BINDINGS_ARTIFACT)" ]; then echo "Missing interface artifact: $(BINDINGS_ARTIFACT)"; exit 1; fi
+	@python3 scripts/generate_bindings.py --artifact "$(BINDINGS_ARTIFACT)" --out "$(BINDINGS_OUT)"
+	@echo "Bindings written to $(BINDINGS_OUT)/"
+
+bindings-check:
+	@echo "Verifying generated bindings are current..."
+	@if [ ! -f "$(BINDINGS_ARTIFACT)" ]; then echo "Missing interface artifact: $(BINDINGS_ARTIFACT)"; exit 1; fi
+	@python3 scripts/generate_bindings.py --artifact "$(BINDINGS_ARTIFACT)" --out "$(BINDINGS_OUT)" --check
+
 # Testing
 test: test-issue-1158
 
@@ -124,7 +146,7 @@ format:
 	@echo "Formatting contracts..."
 	cd contracts && cargo fmt
 
-check-all: lint format test
+check-all: lint format test bindings-check
 	@echo "All checks completed!"
 
 # Docker
@@ -137,7 +159,7 @@ docker-up:
 	@docker-compose up -d
 
 docker-down:
-	@echo "Stopping Docker services..."
+	@echo "Stopping services with Docker Compose..."
 	@docker-compose down
 
 # Utilities

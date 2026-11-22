@@ -101,3 +101,21 @@ and alerts over time.
 | `ROLLBACK_WINDOW_SECONDS` | 120 | how long the old slot stays warm post-cutover before being stopped |
 | `HEALTH_CHECK_RETRIES` | 10 | readiness probe attempts before giving up |
 | `HEALTH_CHECK_INTERVAL_SECONDS` | 3 | delay between readiness probes |
+
+### Canary promotion guardrails
+
+Canary promotion is bounded and fails closed. Set these variables explicitly
+for production deployments:
+
+| Env var | Default | Purpose |
+|---|---:|---|
+| `CANARY_MAX_ERROR_RATE_PERCENT` | 1 | Maximum HTTP error rate during the bake |
+| `CANARY_MAX_P95_LATENCY_MS` | 500 | Maximum p95 request latency during the bake |
+| `CANARY_CRITICAL_JOURNEY_URL` | `/api/health/ready` | Required user-critical journey check |
+| `CANARY_TELEMETRY_URL` | unset | Prometheus/text endpoint exposing `arenax_http_error_rate_percent` and `arenax_http_p95_latency_ms` |
+| `CANARY_TELEMETRY_REQUIRED` | false | Fail when telemetry or required samples are unavailable |
+
+On threshold breach, telemetry loss (when required), or critical-journey failure,
+the deploy script reloads nginx back to 100% of the active slot and stops the
+idle slot. Database migrations must be backward-compatible: rollbacks restore
+application artifacts and never reverse migrations or irreversible effects.

@@ -1,6 +1,6 @@
 use crate::auth::jwt_service::{Claims, JwtService};
 use crate::realtime::auth::RealtimeAuth;
-use crate::realtime::events::{channels, ClientMessage, DeliverEvent, WsEnvelope};
+use crate::realtime::events::{channels, ClientMessage, CredentialRevoked, DeliverEvent, WsEnvelope};
 use crate::realtime::rate_limiter::{ConnectionRateLimiter, RateLimitOutcome, RATE_LIMIT_CLOSE_CODE};
 use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::ws_broadcaster::WsAddressBook;
@@ -151,6 +151,8 @@ impl Actor for UserWebSocket {
 
         // Register this actor's address so the broadcaster can deliver events.
         self.address_book.insert(self.session_id, ctx.address());
+        self.registry
+            .bind_auth_session(&self.claims.session_id, self.session_id);
 
         // Automatically subscribe to own user channel
         let user_channel = channels::user_channel(self.user_id);
@@ -368,6 +370,32 @@ impl Handler<DeliverEvent> for UserWebSocket {
                     error = %e,
                     "Failed to serialize event"
                 );
+            }
+        }
+
+        impl Handler<CredentialRevoked> for UserWebSocket {
+            type Result = ();
+
+            fn handle(&mut self, msg: CredentialRevoked, ctx: &mut Self::Context) {
+                if msg.0 != self.user_id {
+                    return;
+                }
+                if let Some(session_id) = msg.1 {
+                    if Uuid::parse_str(&session_id).ok() != Some(self.session_id) {
+                        return;
+                    }
+                }
+
+                warn!(
+                    user_id = %self.user_id,
+                    session_id = %self.session_id,
+                    "Closing WebSocket after credential revocation"
+                );
+                ctx.close(Some(ws::CloseReason {
+                    code: ws::CloseCode::Policy,
+                    description: Some("credential revoked".to_string()),
+                }));
+                ctx.stop();
             }
         }
     }

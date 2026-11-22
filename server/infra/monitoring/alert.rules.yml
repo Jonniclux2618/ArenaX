@@ -53,3 +53,85 @@ groups:
         annotations:
           summary: "High/critical application errors trending up"
           description: "More than 1/s of high or critical severity errors recorded via errors_total over the last 5 minutes."
+
+      - alert: FeatureJourneyFastBurn
+        expr: |
+          (
+            sum(rate(feature_journey_requests_total{outcome="failure",journey=~"login|match|payout"}[5m]))
+            /
+            clamp_min(sum(rate(feature_journey_requests_total{journey=~"login|match|payout"}[5m])), 1)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          slo: feature-journey
+        annotations:
+          summary: "Critical feature journey has a fast burn"
+          description: "Login, match, or payout user-impacting failure rate exceeded the 5% burn threshold for 5 minutes."
+
+      - alert: FeatureJourneyLatencyBurn
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(feature_journey_duration_seconds_bucket{journey=~"login|match|payout"}[5m])) by (le, journey)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          slo: feature-journey
+        annotations:
+          summary: "Critical feature journey p95 latency is burning"
+          description: "A login, match, or payout journey exceeded its 5-second p95 latency definition."
+
+      # Per-journey latency SLOs aligned to docs/observability/feature-journey-slos.md (issue #285).
+      # Login p95 target: 1 s — tighter than the shared 5 s threshold above.
+      - alert: LoginJourneyLatencyBurn
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(feature_journey_duration_seconds_bucket{journey="login"}[5m])) by (le)
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+          slo: feature-journey
+          journey: login
+        annotations:
+          summary: "Login journey p95 latency above 1 s SLO target"
+          description: "Login end-to-end p95 latency has exceeded the 1-second SLO target for 10 minutes. Check auth API, session store, Redis, and database component contributions."
+          runbook: "https://docs.example.com/runbooks/slo/login-latency"
+
+      # Match p95 target: 5 s — same as the shared threshold; kept explicit for per-journey attribution.
+      - alert: MatchJourneyLatencyBurn
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(feature_journey_duration_seconds_bucket{journey="match"}[5m])) by (le)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          slo: feature-journey
+          journey: match
+        annotations:
+          summary: "Match journey p95 latency above 5 s SLO target"
+          description: "Match end-to-end p95 latency has exceeded the 5-second SLO target for 10 minutes. Check match API, PostgreSQL, matchmaking, and WebSocket component contributions."
+          runbook: "https://docs.example.com/runbooks/slo/match-latency"
+
+      # Payout p95 target: 10 s — looser than the shared threshold; avoids false positives from
+      # expected provider and Stellar settlement latency.
+      - alert: PayoutJourneyLatencyBurn
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(feature_journey_duration_seconds_bucket{journey="payout"}[5m])) by (le)
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          slo: feature-journey
+          journey: payout
+        annotations:
+          summary: "Payout journey p95 latency above 10 s SLO target"
+          description: "Payout end-to-end p95 latency has exceeded the 10-second SLO target for 10 minutes. Check payout API, ledger, provider, and Stellar component contributions."
+          runbook: "https://docs.example.com/runbooks/slo/payout-latency"

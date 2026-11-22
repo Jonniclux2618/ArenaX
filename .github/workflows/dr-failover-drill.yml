@@ -1,0 +1,68 @@
+name: DR Failover Drill
+
+# Issue #284 — Automate database failover validation against recovery objectives.
+#
+# Runs a scheduled isolated drill on staging to measure detection, promotion,
+# connection recovery, and data loss against the documented RPO (≤900 s) and
+# RTO (≤3600 s) targets.  Production is never an automatic target — the script
+# rejects any environment that is not staging or staging-*.
+#
+# The drill report is retained as a workflow artifact for 90 days so there is
+# always a durable evidence trail.  Missed targets fail the job and are
+# surfaced via the existing on-call notification channel.
+
+on:
+  schedule:
+    # Every Monday at 03:00 UTC — outside peak hours, inside the documented
+    # maintenance window defined in dr-failover-drill-schedule.json.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (must be staging or staging-*)"
+        required: true
+        default: "staging"
+
+jobs:
+  dr-failover-drill:
+    name: DR Failover Drill (${{ github.event.inputs.environment || 'staging' }})
+    runs-on: ubuntu-latest
+    environment: staging
+
+    env:
+      DR_DRILL_REPORT_DIR: dr-drill-reports
+      # These values are injected from GitHub Actions secrets / environment
+      # variables wired to the isolated staging replica — never to production.
+      DR_DRILL_DETECTION_SECONDS:   ${{ vars.DR_DRILL_DETECTION_SECONDS }}
+      DR_DRILL_PROMOTION_SECONDS:   ${{ vars.DR_DRILL_PROMOTION_SECONDS }}
+      DR_DRILL_CONNECTION_SECONDS:  ${{ vars.DR_DRILL_CONNECTION_SECONDS }}
+      DR_DRILL_MEASURED_RPO_SECONDS: ${{ vars.DR_DRILL_MEASURED_RPO_SECONDS }}
+      DR_DRILL_MEASURED_RTO_SECONDS: ${{ vars.DR_DRILL_MEASURED_RTO_SECONDS }}
+      DR_DRILL_INTEGRITY_STATUS:    ${{ vars.DR_DRILL_INTEGRITY_STATUS }}
+      DR_DRILL_REMEDIATION_OWNER:   ${{ vars.DR_DRILL_REMEDIATION_OWNER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run DR failover drill
+        id: drill
+        run: |
+          target="${{ github.event.inputs.environment || 'staging' }}"
+          bash backend/scripts/run-dr-failover-drill.sh \
+            --environment "$target" \
+            --report-dir "$DR_DRILL_REPORT_DIR"
+
+      - name: Upload drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-failover-report-${{ github.run_id }}
+          path: dr-drill-reports/
+          retention-days: 90
+
+      - name: Fail on missed targets
+        if: failure()
+        run: |
+          echo "::error::DR failover drill failed or missed RPO/RTO targets. Review the uploaded report and assign remediation."
+          exit 1

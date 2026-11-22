@@ -10,6 +10,20 @@ wss://api.arenax.gg/ws?token=<access_token>
 
 The JWT access token is passed as a query parameter. The connection is rejected with HTTP 401 if the token is missing or invalid.
 
+## Broker distribution and recovery
+
+ArenaX Redis Pub/Sub is the live cross-instance fan-out transport. Each publish
+also appends a bounded (1,000-entry), ordered Redis Stream tail so reconnecting
+subscribers can recover only from their last delivered sequence. Streams and
+Pub/Sub channels use the same monotonic per-match/per-user sequence.
+
+If Redis Pub/Sub or Redis Streams is unavailable:
+
+- HTTP and match state remain authoritative in PostgreSQL; realtime delivery is degraded.
+- Pub/Sub subscribers retry with a two-second backoff and do not perform client-side replay automatically.
+- Clients detect sequence gaps or broker reconnects, then refetch the authoritative snapshot and adopt its watermark.
+- Credential revocation still uses the Redis revocation channel; a Redis outage fails authorization to Redis-backed session checks closed. Revoked sessions are closed or lose privileged capabilities when distribution resumes.
+
 ### Heartbeat
 
 The server sends a WebSocket `ping` frame every **5 seconds**. If no `pong` is received within **10 seconds**, the connection is closed. Most WebSocket clients handle ping/pong automatically.

@@ -29,6 +29,8 @@ const SENSITIVE_FIELDS = new Set([
   'ssn',
   'verificationtoken',
   'resettoken',
+  'stepupproof',
+  'proof',
 ]);
 
 /**

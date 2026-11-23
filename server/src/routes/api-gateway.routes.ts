@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { authenticateJWT, restrictTo } from '../middleware/auth.middleware';
+import { requireStepUp } from '../middleware/step-up.middleware';
 import { apiKeyAuth, apiKeyRateLimiter, trackApiUsage } from '../middleware/api-gateway.middleware';
 import {
   createApiKey,
@@ -15,10 +16,10 @@ import {
 const router: Router = Router();
 
 // User-facing API key management
-router.post('/keys', authenticateJWT, createApiKey);
+router.post('/keys', authenticateJWT, requireStepUp('api_key.create'), createApiKey);
 router.get('/keys', authenticateJWT, listApiKeys);
-router.delete('/keys/:id', authenticateJWT, revokeApiKey);
-router.post('/keys/:id/rotate', authenticateJWT, rotateApiKey);
+router.delete('/keys/:id', authenticateJWT, requireStepUp('api_key.revoke'), revokeApiKey);
+router.post('/keys/:id/rotate', authenticateJWT, requireStepUp('api_key.rotate'), rotateApiKey);
 router.get('/keys/:id/usage', authenticateJWT, getApiKeyUsage);
 
 // Admin routes

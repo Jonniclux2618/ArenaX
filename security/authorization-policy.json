@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "operations": [
+    {
+      "principal": "admin",
+      "resource": "authentication_analytics",
+      "action": "read",
+      "backend": { "path_prefix": "/api/auth/analytics", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "analytics:admin" }
+    },
+    {
+      "principal": "admin",
+      "resource": "ip_list",
+      "action": "manage",
+      "backend": { "path_prefix": "/api/ip-list", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "system:write" }
+    },
+    {
+      "principal": "admin",
+      "resource": "feature_flags",
+      "action": "manage",
+      "backend": { "path_prefix": "/api/feature-flags", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "system:write" }
+    },
+    {
+      "principal": "admin",
+      "resource": "cache_controls",
+      "action": "manage",
+      "backend": { "path_prefix": "/api/cache", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "system:write" }
+    },
+    {
+      "principal": "admin",
+      "resource": "idempotency_administration",
+      "action": "manage",
+      "backend": { "path_prefix": "/api/idempotency", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "system:write" }
+    },
+    {
+      "principal": "admin",
+      "resource": "bad_actor_records",
+      "action": "manage",
+      "backend": { "path_prefix": "/api/reputation/bad-actors", "roles": ["admin", "super_admin"] },
+      "typescript": { "role": "ADMIN", "permission": "moderation:write" }
+    },
+    {
+      "principal": "moderator",
+      "resource": "player_suspensions",
+      "action": "review",
+      "backend": { "path_prefix": "/api/suspensions", "roles": ["admin", "super_admin", "moderator"] },
+      "typescript": { "role": "MODERATOR", "permission": "moderation:write" }
+    },
+    {
+      "principal": "moderator",
+      "resource": "disputes",
+      "action": "review",
+      "backend": { "path_prefix": "/api/disputes", "roles": ["admin", "super_admin", "moderator"] },
+      "typescript": { "role": "MODERATOR", "permission": "moderation:write" }
+    }
+  ]
+}

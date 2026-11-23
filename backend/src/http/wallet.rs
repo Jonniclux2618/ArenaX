@@ -193,6 +193,8 @@ pub async fn verify_deposit(
 
 pub async fn initiate_withdrawal(
     pool: web::Data<PgPool>,
+    redis: web::Data<redis::aio::ConnectionManager>,
+    step_up_secret: web::Data<crate::security::step_up::StepUpSecret>,
     req: actix_web::HttpRequest,
     body: web::Json<WithdrawalRequest>,
 ) -> Result<HttpResponse, ApiError> {
@@ -204,6 +206,42 @@ pub async fn initiate_withdrawal(
     if amount <= rust_decimal::Decimal::ZERO {
         return Err(ApiError::bad_request("Amount must be positive"));
     }
+
+    let proof = req
+        .headers()
+        .get("x-step-up-proof")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("Recent step-up proof required"))?;
+    let bearer_token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    if !req.query_string().is_empty() {
+        return Err(ApiError::bad_request("Withdrawal does not accept query parameters"));
+    }
+    let operation = serde_json::json!({
+        "method": "POST",
+        "path": req.path(),
+        "query": {},
+        "body": {
+            "amount": amount.to_string(),
+            "currency": body.currency,
+            "destination": body.destination,
+            "payment_method": body.payment_method
+        }
+    });
+    let mut redis_connection = redis.get_ref().clone();
+    crate::security::step_up::verify_withdrawal_proof(
+        proof,
+        &user_id.to_string(),
+        bearer_token,
+        &operation,
+        &step_up_secret.0,
+        &mut redis_connection,
+    )
+    .await?;
 
     let service = WalletService::new(pool.get_ref().clone().into(), None);
 

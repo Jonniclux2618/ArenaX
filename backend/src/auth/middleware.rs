@@ -7,6 +7,8 @@ use actix_web::{
     Error, HttpMessage,
 };
 use futures::future::LocalBoxFuture;
+use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::future::{ready, Ready};
 use std::rc::Rc;
 use tracing::{debug, warn};
@@ -73,22 +75,41 @@ fn required_operator_scope(method: &Method, path: &str) -> Option<&'static str> 
     None
 }
 
-fn required_roles(path: &str) -> Option<&'static [&'static str]> {
-    if path == "/api/auth/analytics"
-        || path.starts_with("/api/ip-list")
-        || path.starts_with("/api/feature-flags")
-        || path.starts_with("/api/cache")
-        || path.starts_with("/api/idempotency")
-        || path.starts_with("/api/reputation/bad-actors")
-    {
-        return Some(&["admin", "super_admin"]);
-    }
+#[derive(Debug, Deserialize)]
+struct AuthorizationMatrix {
+    operations: Vec<AuthorizationOperation>,
+}
 
-    if path.starts_with("/api/suspensions") || path.starts_with("/api/disputes") {
-        return Some(&["admin", "super_admin", "moderator"]);
-    }
+#[derive(Debug, Deserialize)]
+struct AuthorizationOperation {
+    backend: BackendPolicy,
+}
 
-    None
+#[derive(Debug, Deserialize)]
+struct BackendPolicy {
+    path_prefix: String,
+    roles: Vec<String>,
+}
+
+static AUTHORIZATION_MATRIX: Lazy<AuthorizationMatrix> = Lazy::new(|| {
+    serde_json::from_str(include_str!("../../../security/authorization-policy.json"))
+        .expect("shared authorization policy must be valid JSON")
+});
+
+fn required_roles(path: &str) -> Option<&'static [String]> {
+    AUTHORIZATION_MATRIX
+        .operations
+        .iter()
+        .find(|operation| path.starts_with(&operation.backend.path_prefix))
+        .map(|operation| operation.backend.roles.as_slice())
+}
+
+fn has_required_role(principal_roles: &[String], required_roles: &[String]) -> bool {
+    principal_roles.iter().any(|role| {
+        required_roles
+            .iter()
+            .any(|required| role.eq_ignore_ascii_case(required))
+    })
 }
 
 /// Authentication middleware for protecting routes
@@ -189,10 +210,7 @@ where
                         return Err(ErrorUnauthorized("Access token required"));
                     }
                     if let Some(allowed_roles) = required_roles(req.path()) {
-                        let has_role = claims.roles.iter().any(|role| {
-                            allowed_roles.iter().any(|allowed| role.eq_ignore_ascii_case(allowed))
-                        });
-                        if !has_role {
+                        if !has_required_role(&claims.roles, allowed_roles) {
                             return Err(ErrorForbidden("Insufficient permissions"));
                         }
                     }
@@ -341,6 +359,17 @@ mod tests {
                 approval_ref: "approval-123".to_string(),
             })
             .expect("session issued")
+    }
+
+    #[test]
+    fn shared_authorization_matrix_allows_and_denies_expected_principals() {
+        assert!(!AUTHORIZATION_MATRIX.operations.is_empty());
+        for operation in &AUTHORIZATION_MATRIX.operations {
+            let required = &operation.backend.roles;
+            assert!(has_required_role(required, required));
+            assert!(!has_required_role(&["player".to_string()], required));
+            assert!(required_roles(&operation.backend.path_prefix).is_some());
+        }
     }
 
     #[test]

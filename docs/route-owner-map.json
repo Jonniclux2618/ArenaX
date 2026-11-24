@@ -1,0 +1,1346 @@
+{
+  "owners": {
+    "POST /analytics/behaviour": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /analytics/game/{game_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /analytics/match": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /analytics/platform": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /analytics/player/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/audit-logs": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/audit-logs/verify": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/audit-logs/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/audit-logs/{resource_type}/{resource_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/admin/ip-list": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/ip-list": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/admin/ip-list": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/ip-list/check": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/admin/seasons/history": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/admin/seasons/{category}/snapshot": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/admin/seasons/{id}/close": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/analytics/governance/access": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "POST /api/analytics/governance/access/grant": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "POST /api/analytics/governance/access/revoke": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/analytics/governance/datasets": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "PUT /api/analytics/governance/datasets": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "POST /api/analytics/governance/events": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/analytics/governance/events/summary": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "POST /api/analytics/governance/retention/purge": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/analytics/governance/retention/runs": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "PUT /api/analytics/governance/thresholds": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/anti-bot/metrics": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/anti-bot/status": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api-keys": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api-keys": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api-keys/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/api-keys/{key_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api-keys/{key_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/api-keys/{key_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api-keys/{key_id}/rotate": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api-keys/{key_id}/usage": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/cache/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/email/preferences": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/api/email/preferences": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/email/unsubscribe/{token}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api/suspensions": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/suspensions/appeals": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/suspensions/check": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/suspensions/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/api/suspensions/user/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api/suspensions/{id}/appeal": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api/suspensions/{id}/appeal/review": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/api/suspensions/{id}/lift": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/auth/analytics": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/change-password": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/login": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/logout": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/auth/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/auth/oauth/callback": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/recovery/appeal": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/recovery/appeal/review": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/recovery/codes": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/recovery/complete": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/recovery/start": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/refresh": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/register": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/auth/revoke-sessions": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/auth/sessions": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/auth/sessions/{session_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/auth/ws-token": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/batch": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/batch/{batch_id}/progress": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/csrf-token": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/appeals": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/appeals/{id}/review": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/mine": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/{id}/appeal": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/appeal": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/assign": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/escalate": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/{id}/evidence": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/evidence": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/disputes/{id}/history": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/reject": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/resolve": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/disputes/{id}/review": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/docs": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/docs/openapi.json": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/feature-flags": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/evaluate": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/evaluate/{key}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/feature-flags/evaluate/{key}/events": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/feature-flags/{key}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/{key}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/feature-flags/{key}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/{key}/analysis": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/{key}/analytics": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/feature-flags/{key}/assign": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/feature-flags/{key}/exposure": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/feature-flags/{key}/overrides": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/feature-flags/{key}/overrides/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/health": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/health/live": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/health/ready": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "GET /api/matches": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/matches/evidence": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/evidence": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/matches/evidence/custody": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/evidence/download": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/evidence/download-link": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/matches/evidence/legal-hold": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/matches/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/{id}/complete": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/{id}/dispute": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/{id}/finalize": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/{id}/reconcile": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/matches/{id}/start": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/otp/send": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/otp/verify": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/reputation/bad-actors": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/reputation/bad-actors/{user_id}/remove": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/reputation/history/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/reputation/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/reputation/player/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/reputation/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/stats/player/{user_id}/daily": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/stats/player/{user_id}/head-to-head": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/stats/player/{user_id}/summary": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/stats/player/{user_id}/win-rate-by-mode": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/reports/monthly-revenue": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/reports/tax": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/tournaments/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments/{id}/advance": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments/{id}/distribute-prizes": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/financial-report": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments/{id}/generate-bracket": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/participants": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/prize-distribution": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/prize-pool": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments/{id}/register": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/revenue": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/tournaments/{id}/start": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/tournaments/{id}/statistics": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /api/users/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /api/users/me": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/users/me/avatar": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/me/avatar/status": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/users/me/delete": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/me/delete/{job_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/me/export": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/me/export/{job_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/users/{id}/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/v1": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "DELETE /api/v1/:key": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/:key": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "PUT /api/v1/:key": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/:key/audit": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/:key/evaluate": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/analytics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit-logs": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/audit/anchor": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit/compliance-report": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit/export": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/audit/redact/:userId": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit/replay": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit/search": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/audit/verify": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/confirmations": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/disputes": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/disputes/:id/resolve": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/games/config": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "PUT /api/v1/admin/games/config": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/keys": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "PUT /api/v1/admin/keys/:id/permissions": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/kyc": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/kyc/:id": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/kyc/:id/process": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/maintenance/disable": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/maintenance/enable": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/maintenance/schedule": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/maintenance/status": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/moderation/queue": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/moderation/review": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/payments/:id/replay": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/refunds": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/refunds": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "PATCH /api/v1/admin/refunds/:id/status": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/status": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/admin/system/health": {
+      "owner": "typescript-server",
+      "type": "cross-service-read"
+    },
+    "GET /api/v1/admin/users": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/users/:id/ban": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/admin/users/bulk": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "DELETE /api/v1/analytics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/analytics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/analyze": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/forgot-password": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/guest": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/login": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/logout": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/refresh": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/register": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/resend-verification-email": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/reset-password": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/social/:provider": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/step-up": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/auth/verify-email": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "DELETE /api/v1/cache": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/cache": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/dashboard": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/flutterwave": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/flutterwave": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/governance": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/governance": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/governance/:id": {
+      "owner": "typescript-server",
+      "type": "cross-service-read"
+    },
+    "POST /api/v1/governance/:id/execute": {
+      "owner": "typescript-server",
+      "type": "cross-service-read"
+    },
+    "POST /api/v1/governance/:id/start-voting": {
+      "owner": "typescript-server",
+      "type": "cross-service-read"
+    },
+    "POST /api/v1/governance/:id/vote": {
+      "owner": "typescript-server",
+      "type": "cross-service-read"
+    },
+    "GET /api/v1/index-suggestions": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/keys": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/keys": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "DELETE /api/v1/keys/:id": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/keys/:id/rotate": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/keys/:id/usage": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/matches": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/matches/:id/dispute": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/matches/:id/report": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/metrics/metrics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/metrics/summary": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/paystack": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/paystack": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/profiles/:username": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "PATCH /api/v1/profiles/me": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/proxy/:endpoint": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "DELETE /api/v1/slow-queries": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/slow-queries": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/soroban/invoke": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/soroban/simulate": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/soroban/tx/:txHash": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/achievements": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/achievements/:id/progress": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/achievements/:id/stats": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/achievements/player/:playerId": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/achievements/share/:id": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/cache/analytics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/cache/config": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/cache/purge": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/cache/purge/all": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/cache/purge/history": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/cache/warming/status": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/cache/warming/trigger": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/i18n/locales": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/i18n/locales/:locale": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/search": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/search/analytics": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/search/autocomplete": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/search/index": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/tournaments": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/tournaments": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/tournaments/:id": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/tournaments/:id/bracket": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/tournaments/:id/check-in": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/tournaments/:id/register": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/v1/tournaments/:id/report-result": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/v1/tournaments/:id/standings": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/escrow/lock": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/escrow/release": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/escrow/slash": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/wallet/ledger": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/wallet/me": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/me/recovery/challenges": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/me/recovery/export": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/me/rotate-encryption": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/rotate-encryption": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "GET /api/v1/wallet/transactions": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/v1/wallet/transfer": {
+      "owner": "typescript-server",
+      "type": "canonical"
+    },
+    "POST /api/webhooks/flutterwave": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /api/webhooks/paystack": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /api/ws/matches/{id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /gas/estimate": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /idempotency/cleanup": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "PUT /idempotency/config": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /idempotency/config/{route}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /idempotency/generate-key": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /idempotency/info": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /idempotency/invalidate/{key}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /idempotency/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /idempotency/user-keys": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /idempotency/validate": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}/history/{player_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}/player/{player_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}/player/{player_id}/elo-history": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /leaderboards/{category}/refresh": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}/season/{season}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /leaderboards/{category}/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /matchmaking/elo/{game}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /matchmaking/elo/{game}/{page}/{limit}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /matchmaking/join": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /matchmaking/leave": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /matchmaking/metrics": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /matchmaking/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /matchmaking/status/{game}/{game_mode}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /metrics": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "DELETE /push/devices": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /push/devices": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /push/send/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /staking/claim": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /staking/position/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /staking/stake": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /staking/stats": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /staking/unstake/{user_id}": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "DELETE /test/cleanup": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /test/config": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /test/conflict": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /test/deposit": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /test/health": {
+      "owner": "rust-backend",
+      "type": "cross-service-read"
+    },
+    "POST /test/idempotency": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /test/payment": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /test/performance": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /test/refund": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /wallet/deposit": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /wallet/deposit/verify": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "GET /wallet/transactions": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    },
+    "POST /wallet/withdraw": {
+      "owner": "rust-backend",
+      "type": "canonical"
+    }
+  },
+  "cross_service_read_allowlist": [
+    "GET /api/analytics/governance/access",
+    "GET /api/analytics/governance/datasets",
+    "GET /api/analytics/governance/events/summary",
+    "GET /api/analytics/governance/retention/runs",
+    "GET /api/health",
+    "GET /api/health/live",
+    "GET /api/health/ready",
+    "GET /api/v1/admin/system/health",
+    "GET /api/v1/governance/:id",
+    "GET /metrics",
+    "GET /test/health",
+    "POST /api/analytics/governance/access/grant",
+    "POST /api/analytics/governance/access/revoke",
+    "POST /api/analytics/governance/events",
+    "POST /api/analytics/governance/retention/purge",
+    "POST /api/v1/governance/:id/execute",
+    "POST /api/v1/governance/:id/start-voting",
+    "POST /api/v1/governance/:id/vote",
+    "PUT /api/analytics/governance/datasets",
+    "PUT /api/analytics/governance/thresholds"
+  ]
+}

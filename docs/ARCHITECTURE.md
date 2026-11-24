@@ -9,6 +9,31 @@ canonical way to keep the route table in sync with the live registries.
   services. It owns the routes listed under *API server* below.
 - **Worker server** — processes asynchronous jobs and exposes an internal
   control surface. It owns the routes listed under *Worker server* below.
+- **Rust backend** — canonical Rust HTTP registry mounted by
+  `backend/src/main.rs` and handler modules under `backend/src/http/`.
+- **TypeScript server** — canonical Express registry mounted by
+  `server/src/routes/index.ts` and route modules under
+  `server/src/routes/`.
+
+## Route ownership and inventory
+
+`docs/route-owner-map.json` is the canonical owner map for public routes. It
+must assign every live Rust or Express route to exactly one owner. A route that
+is intentionally exposed as a cross-service read projection may instead be
+listed in `cross_service_read_allowlist` as an explicit, reviewed exception.
+
+After adding or changing a route:
+
+1. Add or update the route registration at the canonical server boundary.
+2. Run `python3 scripts/check_route_inventory.py` to identify unowned or
+   duplicated routes.
+3. Add exactly one owner entry for the route in `docs/route-owner-map.json`.
+   Use `cross_service_read_allowlist` only for a read-only cross-service
+   projection, and document why in the owner entry's `type` field.
+4. Run `python3 -m unittest scripts/tests/test_check_route_inventory.py`.
+
+The CI route-inventory job fails closed for duplicate route registrations,
+duplicate owner-map keys, unowned routes, and malformed owner maps.
 
 ## Route ownership
 

@@ -28,6 +28,19 @@ jobs:
       - name: Test quarantine policy edge cases
         run: python3 -m unittest scripts/tests/test_check_test_quarantine.py
 
+  route-inventory:
+    name: Route inventory ownership
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test route inventory fixtures
+        run: python3 -m unittest scripts/tests/test_check_route_inventory.py
+
+      - name: Compare live registries with owner map
+        run: python3 scripts/check_route_inventory.py
+
   secret-scan:
     name: Secret scan (current content + history)
     runs-on: ubuntu-latest

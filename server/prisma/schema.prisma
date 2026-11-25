@@ -1134,3 +1134,135 @@ model MetricCatalogEntry {
   @@index([deprecationState])
 }
 
+// ---------------------------------------------------------------------------
+// Organizer workspace isolation & authoritative membership (#174)
+// ---------------------------------------------------------------------------
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  OPERATOR
+  MODERATOR
+  VIEWER
+}
+
+enum WorkspaceMembershipStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+model OrganizerWorkspace {
+  id          String                @id @default(uuid())
+  name        String
+  slug        String                @unique
+  ownerId     String
+  isActive    Boolean               @default(true)
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  memberships WorkspaceMembership[]
+  resources   WorkspaceResource[]
+
+  @@index([ownerId])
+  @@index([isActive])
+}
+
+model WorkspaceMembership {
+  id          String                    @id @default(uuid())
+  workspaceId String
+  userId      String
+  role        WorkspaceRole             @default(VIEWER)
+  status      WorkspaceMembershipStatus @default(ACTIVE)
+  createdAt   DateTime                  @default(now())
+  updatedAt   DateTime                  @updatedAt
+
+  workspace OrganizerWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId, status])
+  @@index([workspaceId, status])
+}
+
+model WorkspaceResource {
+  id           String   @id @default(uuid())
+  workspaceId  String
+  resourceType String
+  resourceId   String
+  createdAt    DateTime @default(now())
+
+  workspace OrganizerWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([resourceType, resourceId])
+  @@index([workspaceId, resourceType])
+}
+
+// ---------------------------------------------------------------------------
+// Safe OAuth identity linking, revocation, and audited recovery (#172)
+// ---------------------------------------------------------------------------
+
+enum OAuthIdentityStatus {
+  ACTIVE
+  UNLINKED
+  REVOKED
+}
+
+enum OAuthRecoveryStatus {
+  PENDING
+  COMPLETED
+  EXPIRED
+  FAILED
+}
+
+model OAuthIdentity {
+  id             String              @id @default(uuid())
+  userId         String
+  provider       String
+  providerId     String
+  providerEmail  String?
+  status         OAuthIdentityStatus @default(ACTIVE)
+  linkedAt       DateTime            @default(now())
+  lastVerifiedAt DateTime            @default(now())
+  unlinkedAt     DateTime?
+  revokedAt      DateTime?
+  revokeReason   String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@unique([provider, providerId])
+  @@index([userId, status])
+  @@index([provider, status])
+}
+
+model OAuthLinkChallenge {
+  id                 String    @id @default(uuid())
+  userId             String
+  provider           String
+  stateHash          String    @unique
+  nonceHash          String
+  sessionFingerprint String
+  expiresAt          DateTime
+  consumedAt         DateTime?
+  createdAt          DateTime  @default(now())
+
+  @@index([userId, provider])
+  @@index([expiresAt])
+}
+
+model OAuthRecoveryChallenge {
+  id          String              @id @default(uuid())
+  userId      String
+  provider    String?
+  codeHash    String
+  status      OAuthRecoveryStatus @default(PENDING)
+  attempts    Int                 @default(0)
+  maxAttempts Int                 @default(5)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@index([userId, status])
+  @@index([expiresAt])
+}
+
+

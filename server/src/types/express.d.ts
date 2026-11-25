@@ -1,4 +1,5 @@
 import { Logger } from 'winston';
+import type { WorkspaceContext } from '../services/workspace-context.service';
 
 declare global {
     namespace Express {
@@ -15,6 +16,8 @@ declare global {
             correlationId: string;
             log: Logger;
             user?: User;
+            /** Authoritatively verified organizer workspace context (#174). */
+            workspaceContext?: WorkspaceContext;
             /**
              * Raw request body captured by the JSON parser's `verify` hook.
              * Required to re-compute provider webhook signatures (Paystack /

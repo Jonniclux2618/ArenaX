@@ -6,16 +6,59 @@ import prisma from '../services/database.service';
 import { createAdminService, AdminService } from '../services/admin.service';
 import { confirmationService } from '../services/confirmation.service';
 import { MaintenanceService } from '../services/maintenance.service';
+import { isBaseError } from '../errors/base-error';
+import {
+    workspaceContextService,
+    type WorkspaceAuditMeta,
+} from '../services/workspace-context.service';
 
 const matchService = new MatchService();
 const adminService: AdminService = createAdminService();
 
-export const listDisputes = async (_req: Request, res: Response): Promise<void> => {
+const getAuditMeta = (req: Request): WorkspaceAuditMeta => ({
+    requestId: req.auditContext?.requestId ?? req.requestId,
+    correlationId: req.correlationId,
+    ipAddress: req.auditContext?.ipAddress ?? req.ip,
+    userAgent: req.auditContext?.userAgent ?? req.header('user-agent'),
+});
+
+const respondWithError = (res: Response, error: unknown, fallbackStatus = 500): void => {
+    if (isBaseError(error)) {
+        res.status(error.statusCode).json({
+            error: error.message,
+            code: error.code,
+            details: error.details,
+        });
+        return;
+    }
+    res.status(fallbackStatus).json({ error: (error as Error).message });
+};
+
+export const listDisputes = async (req: Request, res: Response): Promise<void> => {
     try {
+        const auditMeta = getAuditMeta(req);
+        let allowedDisputeIds: string[] | null = null;
+        if (req.workspaceContext) {
+            const verified = await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'disputes:read',
+                auditMeta
+            );
+            allowedDisputeIds = await workspaceContextService.listWorkspaceResourceIds(
+                verified,
+                'DISPUTE'
+            );
+        }
+
         const disputes = await matchService.listOpenDisputes();
-        res.status(200).json(disputes);
+        const scopedDisputes =
+            allowedDisputeIds !== null
+                ? disputes.filter((d: { id: string }) => allowedDisputeIds!.includes(d.id))
+                : disputes;
+
+        res.status(200).json(scopedDisputes);
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
@@ -23,6 +66,22 @@ export const resolveDispute = async (req: Request, res: Response): Promise<void>
     try {
         const { id } = req.params;
         const { status, resolution, winnerOverrideId } = req.body;
+        const auditMeta = getAuditMeta(req);
+
+        if (req.workspaceContext) {
+            const verified = await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'disputes:write',
+                auditMeta
+            );
+            await workspaceContextService.assertResourceInWorkspace(
+                verified,
+                'DISPUTE',
+                id,
+                auditMeta
+            );
+        }
+
         const result = await matchService.resolveDispute(id, req.user!.id, {
             status,
             resolution,
@@ -35,7 +94,7 @@ export const resolveDispute = async (req: Request, res: Response): Promise<void>
             action: 'RESOLVE_DISPUTE',
             targetType: 'DISPUTE',
             targetId: id,
-            details: { status, resolution },
+            details: { status, resolution, workspaceId: req.workspaceContext?.workspaceId ?? null },
             requestId: req.auditContext?.requestId,
             ipAddress: req.auditContext?.ipAddress,
             userAgent: req.auditContext?.userAgent
@@ -43,22 +102,53 @@ export const resolveDispute = async (req: Request, res: Response): Promise<void>
 
         res.status(200).json(result);
     } catch (error) {
-        res.status(400).json({ error: (error as Error).message });
+        respondWithError(res, error, 400);
     }
 };
 
 export const listAuditLogs = async (req: Request, res: Response): Promise<void> => {
     try {
+        const auditMeta = getAuditMeta(req);
+        if (req.workspaceContext) {
+            await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'audit:read',
+                auditMeta
+            );
+        }
         const logs = await AuditService.listLogs(req.query as any);
-        res.status(200).json(logs);
+        const scopedLogs =
+            req.workspaceContext?.workspaceId
+                ? logs.filter((entry: any) => {
+                      const details = entry?.details as Record<string, unknown> | null | undefined;
+                      return details?.workspaceId === req.workspaceContext?.workspaceId;
+                  })
+                : logs;
+        res.status(200).json(scopedLogs);
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
 export const replayPayment = async (req: Request, res: Response): Promise<void> => {
     try {
         const { id } = req.params;
+        const auditMeta = getAuditMeta(req);
+
+        if (req.workspaceContext) {
+            const verified = await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'payments:write',
+                auditMeta
+            );
+            await workspaceContextService.assertResourceInWorkspace(
+                verified,
+                'PAYMENT',
+                id,
+                auditMeta
+            );
+        }
+
         const payment = await prisma.payment.findUnique({ where: { id } });
 
         if (!payment) {
@@ -84,7 +174,10 @@ export const replayPayment = async (req: Request, res: Response): Promise<void> 
             action: 'REPLAY_PAYMENT',
             targetType: 'PAYMENT',
             targetId: id,
-            details: { previousStatus: payment.status },
+            details: {
+                previousStatus: payment.status,
+                workspaceId: req.workspaceContext?.workspaceId ?? null
+            },
             requestId: req.auditContext?.requestId,
             ipAddress: req.auditContext?.ipAddress,
             userAgent: req.auditContext?.userAgent
@@ -92,14 +185,21 @@ export const replayPayment = async (req: Request, res: Response): Promise<void> 
 
         res.status(200).json({ message: 'Payment replay triggered successfully.' });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
 export const getAdminStatus = (req: Request, res: Response): void => {
     res.status(200).json({
         message: 'Admin access granted',
-        user: req.user
+        user: req.user,
+        workspaceContext: req.workspaceContext
+            ? {
+                  workspaceId: req.workspaceContext.workspaceId,
+                  role: req.workspaceContext.role,
+                  isPlatformAdmin: req.workspaceContext.isPlatformAdmin,
+              }
+            : null,
     });
 };
 
@@ -113,11 +213,15 @@ export const listUsers = async (req: Request, res: Response): Promise<void> => {
             offset: req.query.offset ? parseInt(req.query.offset as string, 10) : undefined,
         };
 
-        const result = await adminService.getUserList(filters as any);
+        const result = await adminService.getUserList(
+            filters as any,
+            req.workspaceContext,
+            getAuditMeta(req)
+        );
 
         res.status(200).json(result);
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
@@ -125,6 +229,7 @@ export const banUnbanUser = async (req: Request, res: Response): Promise<void> =
     try {
         const { id } = req.params;
         const { action, reason, duration } = req.body as { action: 'ban' | 'unban'; reason?: string; duration?: number };
+        const auditMeta = getAuditMeta(req);
 
         if (action === 'ban') {
             if (!reason) {
@@ -132,14 +237,22 @@ export const banUnbanUser = async (req: Request, res: Response): Promise<void> =
                 return;
             }
 
-            await adminService.banUser({ userId: id, reason, duration });
+            await adminService.banUser(
+                { userId: id, reason, duration },
+                req.workspaceContext,
+                auditMeta
+            );
 
             await AuditService.logAction({
                 adminId: req.user!.id,
                 action: 'BAN_USER',
                 targetType: 'USER',
                 targetId: id,
-                details: { reason, duration },
+                details: {
+                    reason,
+                    duration,
+                    workspaceId: req.workspaceContext?.workspaceId ?? null
+                },
                 requestId: req.auditContext?.requestId,
                 ipAddress: req.auditContext?.ipAddress,
                 userAgent: req.auditContext?.userAgent
@@ -150,14 +263,14 @@ export const banUnbanUser = async (req: Request, res: Response): Promise<void> =
         }
 
         if (action === 'unban') {
-            await adminService.unbanUser(id);
+            await adminService.unbanUser(id, req.workspaceContext, auditMeta);
 
             await AuditService.logAction({
                 adminId: req.user!.id,
                 action: 'UNBAN_USER',
                 targetType: 'USER',
                 targetId: id,
-                details: {},
+                details: { workspaceId: req.workspaceContext?.workspaceId ?? null },
                 requestId: req.auditContext?.requestId,
                 ipAddress: req.auditContext?.ipAddress,
                 userAgent: req.auditContext?.userAgent
@@ -169,13 +282,14 @@ export const banUnbanUser = async (req: Request, res: Response): Promise<void> =
 
         res.status(400).json({ error: 'invalid action' });
     } catch (error) {
-        res.status(400).json({ error: (error as Error).message });
+        respondWithError(res, error, 400);
     }
 };
 
 export const bulkUserOperation = async (req: Request, res: Response): Promise<void> => {
     try {
         const { action, userIds, reason, duration } = req.body as { action: 'ban' | 'unban'; userIds: string[]; reason?: string; duration?: number };
+        const auditMeta = getAuditMeta(req);
 
         if (!Array.isArray(userIds) || userIds.length === 0) {
             res.status(400).json({ error: 'userIds must be a non-empty array' });
@@ -200,29 +314,25 @@ export const bulkUserOperation = async (req: Request, res: Response): Promise<vo
             }
         }
 
-        const results: Record<string, boolean | string> = {};
-
-        for (const uid of userIds) {
-            try {
-                if (action === 'ban') {
-                    if (!reason) throw new Error('reason required to ban');
-                    await adminService.banUser({ userId: uid, reason, duration });
-                    results[uid] = true;
-                } else {
-                    await adminService.unbanUser(uid);
-                    results[uid] = true;
-                }
-            } catch (err) {
-                results[uid] = (err as Error).message;
-            }
-        }
+        const results = await adminService.executeBulkUserOperation(
+            { action, userIds, reason, duration },
+            req.workspaceContext,
+            auditMeta
+        );
 
         await AuditService.logAction({
             adminId: req.user!.id,
             action: 'BULK_USER_OPERATION',
             targetType: 'USER_BULK',
             targetId: `bulk-${Date.now()}`,
-            details: { action, userIds, reason, duration, results },
+            details: {
+                action,
+                userIds,
+                reason,
+                duration,
+                results,
+                workspaceId: req.workspaceContext?.workspaceId ?? null
+            },
             requestId: req.auditContext?.requestId,
             ipAddress: req.auditContext?.ipAddress,
             userAgent: req.auditContext?.userAgent
@@ -230,21 +340,35 @@ export const bulkUserOperation = async (req: Request, res: Response): Promise<vo
 
         res.status(200).json({ results });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
 export const getGameConfig = async (req: Request, res: Response): Promise<void> => {
     try {
+        if (req.workspaceContext) {
+            await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'games:read',
+                getAuditMeta(req)
+            );
+        }
         const cfg = await adminService.getGameConfig();
         res.status(200).json(cfg);
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
 export const updateGameConfig = async (req: Request, res: Response): Promise<void> => {
     try {
+        if (req.workspaceContext) {
+            await workspaceContextService.assertAuthorized(
+                req.workspaceContext,
+                'games:write',
+                getAuditMeta(req)
+            );
+        }
         const updated = await adminService.updateGameConfig(req.body as any);
 
         await AuditService.logAction({
@@ -252,7 +376,7 @@ export const updateGameConfig = async (req: Request, res: Response): Promise<voi
             action: 'UPDATE_GAME_CONFIG',
             targetType: 'GAME_CONFIG',
             targetId: 'GAME_CONFIG',
-            details: { updated },
+            details: { updated, workspaceId: req.workspaceContext?.workspaceId ?? null },
             requestId: req.auditContext?.requestId,
             ipAddress: req.auditContext?.ipAddress,
             userAgent: req.auditContext?.userAgent
@@ -260,16 +384,19 @@ export const updateGameConfig = async (req: Request, res: Response): Promise<voi
 
         res.status(200).json(updated);
     } catch (error) {
-        res.status(400).json({ error: (error as Error).message });
+        respondWithError(res, error, 400);
     }
 };
 
 export const getModerationQueue = async (req: Request, res: Response): Promise<void> => {
     try {
-        const queue = await adminService.getModerationQueue();
+        const queue = await adminService.getModerationQueue(
+            req.workspaceContext,
+            getAuditMeta(req)
+        );
         res.status(200).json(queue);
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error, 500);
     }
 };
 
@@ -282,14 +409,19 @@ export const reviewContent = async (req: Request, res: Response): Promise<void> 
             return;
         }
 
-        await adminService.reviewContent(contentId, action);
+        await adminService.reviewContent(
+            contentId,
+            action,
+            req.workspaceContext,
+            getAuditMeta(req)
+        );
 
         await AuditService.logAction({
             adminId: req.user!.id,
             action: 'REVIEW_CONTENT',
             targetType: 'CONTENT',
             targetId: contentId,
-            details: { action },
+            details: { action, workspaceId: req.workspaceContext?.workspaceId ?? null },
             requestId: req.auditContext?.requestId,
             ipAddress: req.auditContext?.ipAddress,
             userAgent: req.auditContext?.userAgent
@@ -297,7 +429,7 @@ export const reviewContent = async (req: Request, res: Response): Promise<void> 
 
         res.status(200).json({ message: 'review processed' });
     } catch (error) {
-        res.status(400).json({ error: (error as Error).message });
+        respondWithError(res, error, 400);
     }
 };
 

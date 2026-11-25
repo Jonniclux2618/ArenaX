@@ -1,4 +1,6 @@
 import type { Request } from 'express'
+import { createGraphQLLoaders, type GraphQLLoaders } from './loaders'
+import { DEFAULT_GRAPHQL_LIMIT_POLICY } from './query-guard'
 
 /**
  * Request-scoped context every GraphQL resolver receives. Keeping the
@@ -14,6 +16,8 @@ export interface GraphQLContext {
     role: string | null
     /** Stable per-request id for tracing across the schema. */
     requestId: string
+    /** Per-request batched DataLoaders & runtime fan-out tracker (#173). */
+    loaders: GraphQLLoaders
 }
 
 /**
@@ -31,8 +35,12 @@ export function buildGraphQLContext(req: Request): GraphQLContext {
         typeof locals.requestId === 'string'
             ? locals.requestId
             : (req.headers['x-request-id'] as string | undefined) ?? cryptoRequestId()
+    const loaders = createGraphQLLoaders(
+        DEFAULT_GRAPHQL_LIMIT_POLICY.maxBatchSize,
+        DEFAULT_GRAPHQL_LIMIT_POLICY.maxFanOut
+    )
 
-    return { req, userId, role, requestId }
+    return { req, userId, role, requestId, loaders }
 }
 
 function cryptoRequestId(): string {

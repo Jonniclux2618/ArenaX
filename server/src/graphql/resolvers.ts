@@ -186,8 +186,12 @@ export const resolvers = {
 
         // Federation entity resolver: lets other subgraphs reference a
         // `User` by `id` (e.g. `{ __typename: "User", id }`) and have this
-        // subgraph resolve the remaining fields it owns.
-        async __resolveReference(reference: { id: string }) {
+        // subgraph resolve the remaining fields it owns. Uses per-request
+        // batched loader when available to bound DB fan-out (#173).
+        async __resolveReference(reference: { id: string }, ctx?: GraphQLContext) {
+            if (ctx?.loaders?.userById) {
+                return ctx.loaders.userById.load(reference.id);
+            }
             const prisma = getDatabaseClient();
             const user = await (prisma as any).user.findUnique({
                 where: { id: reference.id },
@@ -204,7 +208,10 @@ export const resolvers = {
     },
 
     Match: {
-        async __resolveReference(reference: { id: string }) {
+        async __resolveReference(reference: { id: string }, ctx?: GraphQLContext) {
+            if (ctx?.loaders?.matchById) {
+                return ctx.loaders.matchById.load(reference.id);
+            }
             const prisma = getDatabaseClient();
             const match = await (prisma as any).match.findUnique({ where: { id: reference.id } });
             if (!match) return null;
@@ -219,7 +226,10 @@ export const resolvers = {
     },
 
     Tournament: {
-        async __resolveReference(reference: { id: string }) {
+        async __resolveReference(reference: { id: string }, ctx?: GraphQLContext) {
+            if (ctx?.loaders?.tournamentById) {
+                return ctx.loaders.tournamentById.load(reference.id);
+            }
             const prisma = getDatabaseClient();
             const t = await (prisma as any).tournament.findUnique({
                 where: { id: reference.id },

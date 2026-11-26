@@ -46,6 +46,11 @@ export interface SystemHealth {
 import { getDatabaseClient } from './database.service'
 import ModerationService from './moderation.service'
 import { NotificationService } from './notification.service'
+import {
+  workspaceContextService,
+  type WorkspaceAuditMeta,
+  type WorkspaceContext,
+} from './workspace-context.service'
 
 export class AdminService {
   private inMemoryGameConfig: GameConfig = {
@@ -60,7 +65,11 @@ export class AdminService {
   private bannedUsers = new Map<string, { reason: string; unbannedAt?: Date }>()
   private moderationQueue: ModerationItem[] = []
 
-  async getUserList(filters: UserListFilters = {}): Promise<{
+  async getUserList(
+    filters: UserListFilters = {},
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
+  ): Promise<{
     users: any[]
     total: number
   }> {
@@ -72,9 +81,22 @@ export class AdminService {
       search,
     } = filters
 
+    let allowedUserIds: string[] | null = null
+    if (workspaceContext) {
+      const verified = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'users:read',
+        auditMeta
+      )
+      allowedUserIds = await workspaceContextService.listWorkspaceResourceIds(verified, 'USER')
+    }
+
     const prisma = getDatabaseClient()
 
     const where: any = {}
+    if (allowedUserIds !== null) {
+      where.id = { in: allowedUserIds }
+    }
     if (role) where.role = role
 
     if (search) {
@@ -110,8 +132,26 @@ export class AdminService {
     return { users, total }
   }
 
-  async banUser(payload: BanUserPayload): Promise<boolean> {
+  async banUser(
+    payload: BanUserPayload,
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
+  ): Promise<boolean> {
     const { userId, reason, duration } = payload
+
+    if (workspaceContext) {
+      const verified = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'users:write',
+        auditMeta
+      )
+      await workspaceContextService.assertResourceInWorkspace(
+        verified,
+        'USER',
+        userId,
+        auditMeta
+      )
+    }
 
     if (!userId || !reason) {
       throw new Error('userId and reason are required')
@@ -153,14 +193,36 @@ export class AdminService {
     this.bannedUsers.set(userId, { reason, unbannedAt })
 
     // Audit and notify
-    await this.auditLog('system', 'ban_user', userId, { reason, durationHours: duration ?? null }).catch(() => null)
+    await this.auditLog('system', 'ban_user', userId, {
+      reason,
+      durationHours: duration ?? null,
+      workspaceId: workspaceContext?.workspaceId ?? null
+    }).catch(() => null)
     NotificationService.notifyWebhook({ type: 'USER_BANNED', payload: { userId, reason, unbannedAt } }).catch(() => null)
 
     console.log('[Admin] User banned (db):', { userId, reason, unbannedAt })
     return true
   }
 
-  async unbanUser(userId: string): Promise<boolean> {
+  async unbanUser(
+    userId: string,
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
+  ): Promise<boolean> {
+    if (workspaceContext) {
+      const verified = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'users:write',
+        auditMeta
+      )
+      await workspaceContextService.assertResourceInWorkspace(
+        verified,
+        'USER',
+        userId,
+        auditMeta
+      )
+    }
+
     const prisma = getDatabaseClient()
     const activeBan = await prisma.ban.findFirst({
       where: { userId, OR: [{ unbannedAt: null }, { unbannedAt: { gt: new Date() } }] },
@@ -175,12 +237,67 @@ export class AdminService {
     this.bannedUsers.delete(userId)
 
     // Audit and notify
-    await this.auditLog('system', 'unban_user', userId, {}).catch(() => null)
+    await this.auditLog('system', 'unban_user', userId, {
+      workspaceId: workspaceContext?.workspaceId ?? null
+    }).catch(() => null)
     NotificationService.notifyWebhook({ type: 'USER_UNBANNED', payload: { userId } }).catch(() => null)
 
     console.log('[Admin] User unbanned (db):', { userId })
 
     return true
+  }
+
+  /**
+   * Execute a bulk user ban/unban operation with atomic pre-flight workspace
+   * boundary enforcement: if any userId belongs to another workspace, the
+   * entire batch is rejected before any mutation runs (#174).
+   */
+  async executeBulkUserOperation(
+    params: {
+      action: 'ban' | 'unban'
+      userIds: string[]
+      reason?: string
+      duration?: number
+    },
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
+  ): Promise<Record<string, boolean | string>> {
+    let verifiedContext = workspaceContext
+    if (workspaceContext) {
+      verifiedContext = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'users:write',
+        auditMeta
+      )
+      await workspaceContextService.assertBatchResourcesInWorkspace(
+        verifiedContext,
+        'USER',
+        params.userIds,
+        auditMeta
+      )
+    }
+
+    const results: Record<string, boolean | string> = {}
+    for (const uid of params.userIds) {
+      try {
+        if (params.action === 'ban') {
+          if (!params.reason) throw new Error('reason required to ban')
+          await this.banUser(
+            { userId: uid, reason: params.reason, duration: params.duration },
+            verifiedContext,
+            auditMeta
+          )
+          results[uid] = true
+        } else {
+          await this.unbanUser(uid, verifiedContext, auditMeta)
+          results[uid] = true
+        }
+      } catch (err) {
+        results[uid] = (err as Error).message
+      }
+    }
+
+    return results
   }
 
   async getGameConfig(): Promise<GameConfig> {
@@ -253,9 +370,29 @@ export class AdminService {
     return true
   }
 
-  async getModerationQueue(): Promise<ModerationItem[]> {
+  async getModerationQueue(
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
+  ): Promise<ModerationItem[]> {
+    let allowedIds: string[] | null = null
+    if (workspaceContext) {
+      const verified = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'moderation:read',
+        auditMeta
+      )
+      allowedIds = await workspaceContextService.listWorkspaceResourceIds(
+        verified,
+        'MODERATION_ITEM'
+      )
+    }
+
     const prisma = getDatabaseClient()
-    const rows = await prisma.moderationItem.findMany({ where: { status: 'PENDING' }, orderBy: { reportedAt: 'desc' } })
+    const where: any = { status: 'PENDING' }
+    if (allowedIds !== null) {
+      where.id = { in: allowedIds }
+    }
+    const rows = await prisma.moderationItem.findMany({ where, orderBy: { reportedAt: 'desc' } })
     return rows.map(r => ({
       id: r.id,
       type: r.type as any,
@@ -268,8 +405,24 @@ export class AdminService {
 
   async reviewContent(
     contentId: string,
-    action: 'approve' | 'reject' | 'remove'
+    action: 'approve' | 'reject' | 'remove',
+    workspaceContext?: WorkspaceContext,
+    auditMeta?: WorkspaceAuditMeta
   ): Promise<boolean> {
+    if (workspaceContext) {
+      const verified = await workspaceContextService.assertAuthorized(
+        workspaceContext,
+        'moderation:write',
+        auditMeta
+      )
+      await workspaceContextService.assertResourceInWorkspace(
+        verified,
+        'MODERATION_ITEM',
+        contentId,
+        auditMeta
+      )
+    }
+
     const prisma = getDatabaseClient()
     const existing = await prisma.moderationItem.findUnique({ where: { id: contentId } })
     if (!existing) throw new Error('Content not found in moderation queue')

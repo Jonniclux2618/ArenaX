@@ -1,7 +1,6 @@
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
-import axios from 'axios';
 import { authConfig } from '../config/auth.config';
 import {
     DatabaseTransactionClient,
@@ -12,9 +11,10 @@ import stellarWalletService from './stellar-wallet.service';
 import emailService from './email.service';
 import { logger } from './logger.service';
 import {
-    resolveTwitchProfileFromAuthorizationCode,
-    validateTwitchToken
-} from './twitch-oauth.service';
+    resolveSafeOAuthLogin,
+    verifyExternalIdentityProof,
+    type OAuthAuditMeta
+} from './oauth-identity.service';
 
 const BCRYPT_ROUNDS = 12;
 const MAX_USERNAME_LENGTH = 24;
@@ -458,119 +458,18 @@ export interface SocialAuthInput {
     redirectUri?: string;
 }
 
-const requireAccessToken = (accessToken: string | undefined, provider: string): string => {
-    if (!accessToken) {
-        throw new HttpError(400, `${provider} login requires an accessToken`);
-    }
-    return accessToken;
-};
-
-/**
- * Resolve the Twitch profile for a login attempt (#1160).
- *
- * Prefers the Authorization Code flow: the client sends a short-lived code
- * that we redeem server-side with our client secret, so a token obtained by
- * another Twitch application can never be substituted for ours. The legacy
- * access-token path is kept for existing clients but is now introspected and
- * rejected unless Twitch confirms the token was issued to our client_id.
- */
-const resolveTwitchProfile = async (
-    input: SocialAuthInput
-): Promise<{ email: string; username: string; providerId: string }> => {
-    if (input.code) {
-        if (!input.redirectUri) {
-            throw new HttpError(400, 'redirectUri is required to complete Twitch login');
-        }
-        return resolveTwitchProfileFromAuthorizationCode(input.code, input.redirectUri);
-    }
-
-    if (input.accessToken) {
-        return validateTwitchToken(input.accessToken);
-    }
-
-    throw new HttpError(
-        400,
-        'Twitch login requires either an authorization code or an access token'
-    );
-};
-
-export const authenticateSocial = async (input: SocialAuthInput) => {
-    const prisma = getDatabaseClient();
-
-    let userProfile: { email: string; username: string; providerId: string };
-    switch (input.provider) {
-        case 'google':
-            userProfile = await validateGoogleToken(requireAccessToken(input.accessToken, 'Google'));
-            break;
-        case 'discord':
-            userProfile = await validateDiscordToken(
-                requireAccessToken(input.accessToken, 'Discord')
-            );
-            break;
-        case 'twitch':
-            userProfile = await resolveTwitchProfile(input);
-            break;
-        default:
-            throw new HttpError(400, 'Unsupported provider');
-    }
-
-    const normalizedEmail = normalizeEmail(userProfile.email);
-
-    // Try to find user by provider id first
-    let user = await prisma.user.findFirst({
-        where: {
-            provider: input.provider.toUpperCase(),
-            providerId: userProfile.providerId
-        }
+export const authenticateSocial = async (
+    input: SocialAuthInput,
+    auditMeta?: OAuthAuditMeta
+) => {
+    const verifiedProfile = await verifyExternalIdentityProof({
+        provider: input.provider,
+        accessToken: input.accessToken,
+        code: input.code,
+        redirectUri: input.redirectUri
     });
 
-    if (!user) {
-        // Try to find by email to link accounts
-        user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
-
-        if (user) {
-            user = await prisma.user.update({
-                where: { id: user.id },
-                data: {
-                    provider: input.provider.toUpperCase(),
-                    providerId: userProfile.providerId,
-                    isVerified: true
-                }
-            });
-        } else {
-            const usernameBase = buildUsernameBase(normalizedEmail, userProfile.username);
-
-            for (let attempt = 0; attempt < MAX_USERNAME_ATTEMPTS; attempt += 1) {
-                const candidate = buildCandidateUsername(usernameBase, attempt);
-                try {
-                    user = await prisma.$transaction(async (tx) => {
-                        const newUser = await tx.user.create({
-                            data: {
-                                email: normalizedEmail,
-                                username: candidate,
-                                passwordHash: '',
-                                isVerified: true,
-                                provider: input.provider.toUpperCase(),
-                                providerId: userProfile.providerId
-                            }
-                        });
-
-                        await stellarWalletService.registerUserWallet(newUser.id, tx);
-                        return newUser;
-                    });
-                    break;
-                } catch (error) {
-                    if (isUniqueConstraintError(error, 'email')) {
-                        throw new HttpError(409, 'Email already in use');
-                    }
-                    if (isUniqueConstraintError(error, 'username')) {
-                        continue;
-                    }
-                    throw error;
-                }
-            }
-        }
-    }
+    const user = await resolveSafeOAuthLogin(verifiedProfile, auditMeta);
 
     if (!user) {
         throw new HttpError(500, 'Unable to create user from social login');
@@ -588,33 +487,6 @@ export const authenticateSocial = async (input: SocialAuthInput) => {
         }
     };
 };
-
-// OAuth validation functions
-async function validateGoogleToken(accessToken: string): Promise<{ email: string; username: string; providerId: string }> {
-    const response = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` }
-    });
-    
-    const { email, sub, name } = response.data;
-    return {
-        email,
-        username: name || email.split('@')[0],
-        providerId: sub
-    };
-}
-
-async function validateDiscordToken(accessToken: string): Promise<{ email: string; username: string; providerId: string }> {
-    const response = await axios.get('https://discord.com/api/users/@me', {
-        headers: { Authorization: `Bearer ${accessToken}` }
-    });
-    
-    const { email, id, username: discordUsername, global_name } = response.data;
-    return {
-        email: email || `${id}@discord.local`,
-        username: global_name || discordUsername || `discord_${id}`,
-        providerId: id
-    };
-}
 
 export const createGuestSession = async () => {
     const prisma = getDatabaseClient();

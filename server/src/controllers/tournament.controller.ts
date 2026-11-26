@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { TournamentService } from '../services/tournament.service';
 import { TournamentFormat, TournamentStatus } from '@prisma/client';
+import { workspaceContextService } from '../services/workspace-context.service';
 
 const tournamentService = new TournamentService();
 
@@ -53,6 +54,27 @@ export class TournamentController {
         return;
       }
 
+      const requestedWorkspaceId =
+        (req.headers['x-workspace-id'] as string | undefined) ??
+        (req.body.workspaceId as string | undefined) ??
+        req.workspaceContext?.workspaceId ??
+        null;
+
+      if (requestedWorkspaceId) {
+        const verifiedCtx = await workspaceContextService.resolveWorkspaceContext({
+          actorId: organizerId,
+          workspaceId: requestedWorkspaceId,
+          requiredPermission: 'tournaments:write',
+          requireWorkspace: true,
+          auditMeta: {
+            requestId: req.auditContext?.requestId ?? req.requestId,
+            ipAddress: req.auditContext?.ipAddress ?? req.ip,
+            userAgent: req.auditContext?.userAgent,
+          },
+        });
+        req.workspaceContext = verifiedCtx;
+      }
+
       const tournament = await tournamentService.createTournament(organizerId, {
         name,
         description,
@@ -71,6 +93,14 @@ export class TournamentController {
         checkInWindow,
         settings,
       });
+
+      if (req.workspaceContext?.workspaceId && tournament?.id) {
+        await workspaceContextService.registerResource(
+          req.workspaceContext.workspaceId,
+          'TOURNAMENT',
+          tournament.id
+        );
+      }
 
       res.status(201).json({
         success: true,
@@ -219,6 +249,37 @@ export class TournamentController {
         });
         return;
       }
+
+      const actorId = req.user?.id;
+      if (!actorId) {
+        res.status(401).json({ error: 'Authentication required' });
+        return;
+      }
+
+      const requestedWorkspaceId =
+        (req.headers['x-workspace-id'] as string | undefined) ??
+        (req.body.workspaceId as string | undefined) ??
+        req.workspaceContext?.workspaceId ??
+        null;
+
+      const auditMeta = {
+        requestId: req.auditContext?.requestId ?? req.requestId,
+        ipAddress: req.auditContext?.ipAddress ?? req.ip,
+        userAgent: req.auditContext?.userAgent,
+      };
+      const verifiedCtx = await workspaceContextService.resolveWorkspaceContext({
+        actorId,
+        workspaceId: requestedWorkspaceId,
+        requiredPermission: 'tournaments:write',
+        requireWorkspace: requestedWorkspaceId !== null,
+        auditMeta,
+      });
+      await workspaceContextService.assertResourceInWorkspace(
+        verifiedCtx,
+        'TOURNAMENT',
+        id,
+        auditMeta
+      );
 
       const match = await tournamentService.handleMatchResult(id, matchId, {
         matchId,
